@@ -22,6 +22,7 @@ gcc --version
 make --version
 "$py" --version
 if [[ "$platform" == linux ]]; then lscpu; free -h; fi
+"$py" .github/validation/environment.py "$platform" "$out/environment.json"
 sha256sum -c .github/validation/qwen36-sources.sha256
 cp .github/validation/qwen36-sources.sha256 "$out/reviewed-sources.sha256"
 
