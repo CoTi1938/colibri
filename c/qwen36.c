@@ -619,11 +619,14 @@ typedef struct {
 /* pw: the expert as expert_ffn.h wants it (planar int4, gate|up|down), the
  * only weight copy a slot holds when the shared kernel is active; g/u/d and
  * g4/u4/d4 are then NULL. */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
+/* pinned is advisory retention; borrows protects BOTH weights and scales from
+ * overwrite. All changes to these lifetime fields hold g_pilot_mx. */
+typedef struct { int eid; int pinned; unsigned borrows; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
     int n, cap;
+    unsigned demand_gathers;             /* priority claim per computational batch, not a slot reservation */
 } LCache;
 
 typedef struct {
@@ -658,6 +661,7 @@ typedef struct {
 } Model;
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cache_available = PTHREAD_COND_INITIALIZER;
 static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
@@ -1676,51 +1680,42 @@ static void ehit_mark(Model *m, int layer, int eid){
     }
     if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
 }
-static void expert_get(Model *m, int layer, int eid, Slot **out) {
+/* g_pilot_mx held. Every victim scan, including demand's pinned fallback and
+ * waiter rescan, excludes loading and borrowed storage. Prefetch passes 0:
+ * unlike demand, it must never reclaim even an unborrowed advisory pin. */
+static int expert_victim(const LCache *lc, int allow_pinned) {
+    int lru = -1;
+    for (int i = 0; i < lc->n; i++) {
+        const Slot *s = &lc->slots[i];
+        if (s->eid < 0 || s->borrows || (!allow_pinned && s->pinned)) continue;
+        if (lru < 0 || s->used < lc->slots[lru].used) lru = i;
+    }
+    return lru;
+}
+static void expert_get_impl(Model *m, int layer, int eid, Slot **out, int borrow) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
+        if (borrow) hit->borrows++;       /* acquire before returning the pointer */
         pthread_mutex_unlock(&g_pilot_mx); return;
     }
     m->miss++;
     Cfg *c = &m->c; Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) {
-            if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
-            if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-        }
-        if (lru < 0) {
-            /* All slots are pinned or in-flight; find the oldest non-in-flight
-             * slot (may be pinned, but never one currently being loaded). */
-            for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
-        }
-        while (lru < 0) {
-            /* EVERY slot is in flight: each buffer is owned by an unlocked pread
-             * in the pilot worker (or a demand load) that will publish into it.
-             * The old last resort (lru=0) stole such a slot mid-load — two writers
-             * racing the same slab, then whichever published last decided the
-             * expert id the resident bytes answered to. Wait for a publish instead
-             * and rescan; in-flight always drains because a load either finishes
-             * or the process is already dead in the water.
-             *
-             * Taken verbatim from olmoe.c, which this cache derives from and
-             * where this exact fallback was deleted for exactly this reason.
-             * Reachable whenever cap is smaller than the number of candidates a
-             * layer has in flight — PILOT queues up to 128 per layer — i.e. on
-             * any small-RAM box, and it corrupts silently rather than crashing. */
-            pthread_mutex_unlock(&g_pilot_mx);
-            sleep_ms(1);
-            pthread_mutex_lock(&g_pilot_mx);
-            for (int i = 0; i < lc->n; i++) {
-                if (lc->slots[i].eid < 0) continue;
-                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
-            }
+        int lru;
+        for (;;) {
+            lru = expert_victim(lc, 0);
+            if (lru < 0) lru = expert_victim(lc, 1);
+            if (lru >= 0) break;
+            /* The bounded foreground batch cannot occupy every slot while
+             * still needing another distinct expert. Admitted I/O may occupy
+             * the remaining slots: let it publish, then repeat BOTH scans. */
+            int rc = pthread_cond_wait(&g_cache_available, &g_pilot_mx);
+            if (rc) { fprintf(stderr, "expert cache wait: %s\n", strerror(rc)); abort(); }
         }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -1732,7 +1727,39 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
-    *out = s; pthread_mutex_unlock(&g_pilot_mx);
+    if (borrow) s->borrows++;             /* publication and borrowing are atomic */
+    *out = s;
+    pthread_cond_broadcast(&g_cache_available);
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+/* Legacy access remains unborrowed: no new release obligation for callers such
+ * as CUDA warmstart, which has its own full-residency lifetime requirement. */
+static void expert_get(Model *m, int layer, int eid, Slot **out) {
+    expert_get_impl(m, layer, eid, out, 0);
+}
+static void expert_borrow(Model *m, int layer, int eid, Slot **out) {
+    expert_get_impl(m, layer, eid, out, 1);
+}
+static void expert_gather_begin(Model *m, int layer) {
+    pthread_mutex_lock(&g_pilot_mx);
+    m->cache[layer].demand_gathers++;
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+static void expert_gather_end(Model *m, int layer) {
+    pthread_mutex_lock(&g_pilot_mx);
+    if (!m->cache[layer].demand_gathers) abort();
+    m->cache[layer].demand_gathers--;
+    pthread_mutex_unlock(&g_pilot_mx);
+}
+static void expert_release_batch(Slot **slots, int n) {
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = 0; i < n; i++) if (slots[i]) {
+        if (!slots[i]->borrows) abort();
+        slots[i]->borrows--;              /* one release per acquisition, including repeats */
+        slots[i] = NULL;
+    }
+    pthread_cond_broadcast(&g_cache_available);
+    pthread_mutex_unlock(&g_pilot_mx);
 }
 
 static void pin_hot_experts(Model *m) {
@@ -2005,33 +2032,40 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     int n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
+    Slot **borrowed = calloc((size_t)n, sizeof(Slot *));
     int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
     float *tmp = kper < K ? falloc(D) : NULL;
     void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
-    if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
+    if (!ex || !exp || !borrowed || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
     for (int s0 = 0; s0 < S; s0 += per) {
         for (int k0 = 0; k0 < K; k0 += kper) {
             double t0 = timed ? tm_now() : 0;
+            /* One foreground gatherer, at most cap acquisitions per unchanged
+             * partition. New prefetch misses cannot overtake this gather; reads
+             * already admitted may still finish and publish while we wait. */
+            expert_gather_begin(m, layer);
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
                 int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
                 ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL;
                 if (idx[src] < 0) continue;
-                Slot *e; expert_get(m, layer, idx[src], &e);
+                Slot *e; expert_borrow(m, layer, idx[src], &e); borrowed[dst] = e;
                 ex[dst].g4 = e->pw; ex[dst].u4 = e->pw + gp; ex[dst].d4 = e->pw + 2 * gp;
                 ex[dst].gs = e->gs; ex[dst].us = e->us; ex[dst].ds = e->ds;
                 exp[dst] = &ex[dst];
             }
+            expert_gather_end(m, layer);  /* priority ends; read protection lasts through compute */
             double t1 = timed ? tm_now() : 0;
             if (kper == K) xf_moe_run(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, K, D, F, ridx, rval, exp, 0, scratch);
             else {
                 xf_moe_run(tmp, x + (int64_t)s0 * D, 1, 1, D, F, ridx, rval, exp, 0, scratch);
                 float *os = out + (int64_t)s0 * D; for (int d = 0; d < D; d++) os[d] += tmp[d];
             }
+            expert_release_batch(borrowed, n);
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
         }
     }
-    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+    free(ex); free(exp); free(borrowed); free(ridx); free(rval); free(tmp); free(scratch);
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
@@ -2441,11 +2475,14 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_lock(&g_pilot_mx);
     if (!m->is_queued[layer * c->n_experts + eid]) { pthread_mutex_unlock(&g_pilot_mx); return; }
     if (slot_indexed(m, layer, eid)) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
+    /* Best effort: consume this queue attempt, without retrying or reserving
+     * capacity ahead of a foreground gather. Publication of an admitted read
+     * below is deliberately NOT gated on demand_gathers. */
+    if (lc->demand_gathers) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
     Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
-        int lru = -1;
-        for (int i = 0; i < lc->n; i++) { if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
+        int lru = expert_victim(lc, 0);
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
     }
@@ -2457,7 +2494,9 @@ static void pilot_realload(Model *m, int layer, int eid) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer*c->n_experts+eid]; s->used = ++m->clock;
-    m->is_queued[layer*c->n_experts+eid] = 0; pthread_mutex_unlock(&g_pilot_mx);
+    m->is_queued[layer*c->n_experts+eid] = 0;
+    pthread_cond_broadcast(&g_cache_available);
+    pthread_mutex_unlock(&g_pilot_mx);
 }
 
 static void *pilot_worker(void *arg) {

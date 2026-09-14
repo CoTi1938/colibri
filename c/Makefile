@@ -1324,6 +1324,10 @@ tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h 
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Production gather, real cache/loader, synthetic experts; no model inference or GPU.
+tests/test_qwen36_borrow$(EXE): tests/test_qwen36_borrow.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h cli_args.h serve_poll.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

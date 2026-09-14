@@ -128,3 +128,12 @@ budget.
 which contradicted the description at the top of the page and was wrong for the
 CPU path: `c/qwen36.c` reads experts on demand with `pread` plus
 `posix_fadvise(DONTNEED)` and caches them LRU. Reported in #1444.)
+
+## Packed-expert cache lifetime
+
+The packed CPU runner borrows each partition's expert weights and scales until
+computation finishes. Advisory pins remain reclaimable by demand; prefetch may
+use unborrowed, unpinned capacity after gathering. The existing computational
+partitions and arithmetic are unchanged. See [the borrowing contract and
+model-free validation](qwen36-borrowing.md) for the eviction-path audit, progress
+assumptions, reproduction commands and explicit exclusions.
