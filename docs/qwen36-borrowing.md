@@ -21,6 +21,14 @@ Reproducer: cap=8, K=8, an unrelated advisory-pinned expert already resident, fo
 
 This is a dated finding at the identified revision, not a claim about future upstream HEAD. Refresh it again before submission if upstream moves.
 
+### Post-CI refresh on current integration tip
+
+A further fetch at **2026-09-14 20:06:55 UTC** resolved `origin/dev` to **`9b4eb1afbddecc47f9b12055a8f4bb9b9993ff93`**. The Qwen engine, expert helper, tier and relevant common headers were byte-identical to the original tested base; the shared Makefile had gained unrelated targets.
+
+In a disposable export of that new tip, the unmodified production-gather reproducer again failed with the expected exit 1. The original five-file implementation patch applied cleanly, compiled with `-Werror`, and passed the complete model-free borrowing regression on the M1 with two-thread OpenMP. No model inference ran.
+
+[Supplemental refresh log and exact commands](https://github.com/CoTi1938/colibri/blob/6ee21113ff66d32f34ba6e09753bb22d0ef0b99b/.github/validation/evidence/upstream-refresh-9b4eb1a.log) ([SHA-256](https://github.com/CoTi1938/colibri/blob/6ee21113ff66d32f34ba6e09753bb22d0ef0b99b/.github/validation/evidence/upstream-refresh-9b4eb1a.log.sha256)). This establishes the refreshed finding and local patch compatibility. It does **not** relabel the earlier Linux/Windows runs as validation of the entire newer upstream tree, and the published implementation history has not been rewritten.
+
 ## Frozen contract
 
 - `Slot.pinned` remains an advisory retention preference.
@@ -120,6 +128,10 @@ All normal partition paths release their acquisitions, including repeated refere
 
 ## Validation performed
 
+The tested implementation is commit **`e2a0868ef57630883f1269e765ee4a69a366409d`**, based on `1efb7c82a0c473984cc0258bfc9e12c0cae94914`. The subsequent documentation-only completion records additional evidence without changing the engine, build rules or regression test. The recorded run IDs and source hashes identify the implementation actually tested; they must not be presented as runs of a later documentation commit.
+
+### Local macOS validation
+
 Platform: **Apple M1, 8 GiB RAM, macOS 26.6.2 (25G83)**. Compiler: **Apple clang 21.0.0 (clang-2100.3.34.2)**, macOS SDK **27.0**. OpenMP: **Homebrew libomp 23.1.1**, installed for this validation.
 
 | Check | Result |
@@ -154,9 +166,85 @@ Temporary copies of the patched source were deliberately broken; the working sou
 
 The minimal pinned reproducer alone is not a sufficient test of the fallback predicate: its unrelated pin is oldest, so that particular weakened fallback may still choose the correct victim. The full contention suite detects the mutation.
 
+### Linux and native Windows validation
+
+Both platforms passed the isolated [GitHub Actions run 34888121651](https://github.com/CoTi1938/colibri/actions/runs/34888121651), using CI commit `bd41870edf052576b0e7be5aeb1a9086aa4c4fd5`. The earlier [run 34886600927](https://github.com/CoTi1938/colibri/actions/runs/34886600927) also passed; the hardware details below belong specifically to the later run, not retroactively to the earlier VM.
+
+| Property | Linux guest | Native Windows guest, not WSL |
+|---|---|---|
+| OS | Ubuntu 24.04.5 LTS | Windows Server 2022 Datacenter, 10.0.20348 |
+| Kernel/build | 6.17.0-1022-azure | Build 20348 |
+| Exposed CPU model | AMD EPYC 7763 64-Core Processor | Intel Xeon Platinum 8573C |
+| Allocated logical CPUs | 4 (2 exposed cores × 2 threads) | 4 (2 exposed cores × 2 threads) |
+| Reported guest RAM | 16,766,414,848 bytes | 17,174,360,064 bytes |
+| Runner image | ubuntu24 / 20260907.300.1 | win22 / 20260907.297.1 |
+| GCC | Ubuntu GCC 13.3.0 | MSYS2 UCRT64 GCC 16.1.0 |
+| Sanitizer compiler | Ubuntu Clang 18.1.3 | Not run |
+| Compiled ISA | x86-64-v3, AVX2/FMA | x86-64-v3, AVX2/FMA |
+
+These are virtual-machine guest observations, not a claim to all physical cores named in the CPU brand string or a measurement of the underlying SSD. Each `environment.json` preserves OS/kernel, CPU/topology, RAM, VM identity, guest filesystem, runner image, toolchain, compiler macros and run/source identity. Physical disk type, live CPU frequency and peak process RSS were not measured.
+
+On **both platforms**:
+
+- The five reviewed file hashes matched before and after validation.
+- Three complete serial and three complete two-thread OpenMP regressions passed. Serial used `-fno-openmp` to disable code generation; the platform Makefile still linked the OpenMP runtime.
+- Engine and adapter compilation with `-Werror` passed; engine binaries were not executed.
+- All nine explicitly whitelisted related model-free unit/component tests passed, including the fake-CUDA tests.
+- The production-gather negative control failed on the identified upstream base with the expected exit 1.
+- All four defect mutations were detected: pinned-fallback mutation exited 2; the other three exited 1.
+
+Linux additionally passed **ASan/UBSan and TSan**, without OpenMP in those sanitizer builds. Leak detection was disabled. TSan alone used per-process ASLR disabling through `setarch -R`; no global kernel settings were changed. No Windows sanitizer result is claimed.
+
+A non-blocking Actions annotation reports that the pinned artifact-upload action declares Node 20 and was forced by the runner to execute on Node 24. This is recorded tooling provenance, not a failed C test.
+
+The validation workflow, collector and scripts are separate from the implementation commit. Exact platform commands and setup are preserved at the tested CI revision:
+
+- [Workflow and native Windows setup](https://github.com/CoTi1938/colibri/blob/bd41870edf052576b0e7be5aeb1a9086aa4c4fd5/.github/workflows/qwen36-cache-validation.yml).
+- [Whitelisted builds, repetitions, upstream control and mutations](https://github.com/CoTi1938/colibri/blob/bd41870edf052576b0e7be5aeb1a9086aa4c4fd5/.github/validation/qwen36-cache.sh).
+- [Linux sanitizer commands](https://github.com/CoTi1938/colibri/blob/bd41870edf052576b0e7be5aeb1a9086aa4c4fd5/.github/validation/qwen36-sanitizers.sh).
+- [Environment collector](https://github.com/CoTi1938/colibri/blob/bd41870edf052576b0e7be5aeb1a9086aa4c4fd5/.github/validation/environment.py).
+
+### Requirement-to-evidence matrix
+
+The following are passes on the recorded macOS, Linux and Windows configurations, not a proof over every possible execution.
+
+| Requirement | Production-runner evidence | Result on all three platforms |
+|---|---|---|
+| Borrowed weights and scales remain unchanged throughout computation | `case_compute_lifetime()`: check, pause, attempt replacement, recheck; equal weights but different scales for experts 1/17 | Pass |
+| Demand normal/fallback/rescan never overwrites borrowed storage | Pinned self-eviction case; `case_waiter_rescan(0/1)`; ordinary demand blocked during compute | Pass |
+| Admitted I/O can publish; later prefetch cannot starve a claimed gather | Seven borrows plus a paused read, publication-before-rescan barriers, 32 repeated prefetch attempts | Pass |
+| Claims apply to each unchanged computational partition | `case_gather_priority(16/8)`, including unused capacity and the second partition | Pass |
+| Repeated-reference acquisition/release remains balanced | Repeated experts across S=2/cap=16; both disjoint cap-sized replacement working sets fit after release | Pass |
+| Partial/empty routing does not leak previous borrows or claims | `case_routing_holes(0/1)` plus subsequent prefetch and complete reuse | Pass |
+| Retention preferences and legacy access remain distinct from borrowing | Pinned-only prefetch rejection, demand pin reclamation, legacy access requiring no release | Pass; no broader unborrowed lifetime guarantee |
+| Partitions and computation remain unchanged | Actual invocation sizes/counts and same-build bitwise comparisons against the real helper on independently owned inputs | Pass |
+| Tests detect the intended failures, not just successful execution | Upstream negative control and all four deliberately defective variants | Expected failures detected |
+
+## Durable evidence bundle
+
+Raw local and cross-platform records are archived in the fork, separately from the implementation patch, so they do not depend solely on Actions' 30-day artifact retention:
+
+- [Immutable evidence archive](https://github.com/CoTi1938/colibri/blob/e465cb78a2b7f7c3a5d154d29a4d477dc2458c21/.github/validation/evidence/qwen36-borrowing-2026-09-14.tar.gz).
+- [SHA-256 sidecar](https://github.com/CoTi1938/colibri/blob/e465cb78a2b7f7c3a5d154d29a4d477dc2458c21/.github/validation/evidence/qwen36-borrowing-2026-09-14.tar.gz.sha256).
+
+Archive SHA-256:
+
+```text
+313183535c0ec7e1d77b62b2d07ebc3edec2f47a0256227504097c844b1cb0dd
+```
+
+The archive includes 51 original evidence files, raw compiler/test and negative-control logs, environment/run JSON, source hashes, and a `MANIFEST.json` with per-file SHA-256. Historical logs are preserved unchanged, including descriptions of the pre-commit workspace; their hashes identify the tested source snapshot. The later documentation completion does not change that snapshot's runtime/build/test files.
+
+To retrieve and verify it without running tests or inference:
+
+```sh
+curl -fL 'https://raw.githubusercontent.com/CoTi1938/colibri/e465cb78a2b7f7c3a5d154d29a4d477dc2458c21/.github/validation/evidence/qwen36-borrowing-2026-09-14.tar.gz' -o evidence.tar.gz
+printf '%s  %s\n' '313183535c0ec7e1d77b62b2d07ebc3edec2f47a0256227504097c844b1cb0dd' 'evidence.tar.gz' | shasum -a 256 -c -
+```
+
 ## Reproduction commands
 
-Run from the repository root in Bash. All executions below are model-free tests. `qwen36` itself is only compiled.
+The following are the **local macOS** commands, run from the repository root in Bash. `OMPC`/`OMPL` override the macOS Makefile path; they are not a portable way to disable OpenMP on every platform. Use the pinned CI scripts above for Linux/native Windows. All executions below are model-free tests. `qwen36` itself is only compiled.
 
 ```sh
 # Serial and OpenMP, force rebuild because flags differ.
@@ -222,10 +310,21 @@ clang -std=gnu11 -O3 -Wall -Wextra -Wno-unused-function \
 - No checkpoint inference, real-activation replay, teacher-forced model comparison, quality benchmark, or full-model correctness claim.
 - No claim that the full model is practical on 8 GiB RAM; startup memory is unchanged.
 - No Metal implementation or real-GPU validation in this patch; fake-CUDA checks are not hardware-CUDA validation.
-- No numerical policy, quantization, batch-partition or SIMD redesign; no speedup claim.
-- No Linux or Windows execution results yet. The portable test target is included automatically in the existing C test discovery; cross-platform CI remains necessary.
+- No numerical policy, quantization, batch-partition or SIMD redesign; no speedup claim. Incremental locking/allocation overhead has not been benchmarked; CI job durations are not performance measurements.
+- Results cover only the recorded macOS, Ubuntu and native Windows Server environments, not every OS release, compiler or hardware configuration. Windows sanitizer coverage is not claimed.
 - No full `make check`/model-oracle campaign claimed. Only the explicitly listed builds and model-free tests were run.
 - No TSan claim for libomp, leak-checking claim, arbitrary concurrent foreground-gatherer guarantee, cancellation/timeout recovery, or concurrent-destruction guarantee.
 - Legacy unborrowed accesses retain their previous caller-specific lifetime requirements.
 
-Attach the raw validation logs when submitting the PR. This is reproducible evidence for the scoped contract, not a guarantee that every possible execution is error-free.
+## Required reassessment
+
+**This repair and its validation must be reassessed, and the implementation, tests and documentation updated if necessary, when model inference becomes feasible or additional validation methods become available.** The current results establish the scoped borrowing/progress contract under the recorded checks; they do not close broader validation permanently.
+
+Reassessment should:
+
+1. Identify the new method, exact source revision, platform/toolchain and inputs; obtain authorization before any model inference or real-activation replay.
+2. Repeat the existing model-free regressions, then apply the new checks. Once feasible, model-based checks may include real-activation replay, teacher-forced comparisons and cache-pressure scenarios against a separately verified reference. They are not reported as performed here.
+3. Investigate counterexamples or regressions, revise code/tests where warranted, and update the acceptance claims and exclusions to match the new evidence. A previous passing run is not grounds to dismiss a new failure.
+4. Preserve the earlier evidence and publish dated follow-up results rather than rewriting historical observations. Changes affecting the frozen contract require explicit review, not an unannounced scope expansion.
+
+Link or attach the evidence bundle when submitting the future PR. This documentation completion opens no PR and performs no inference. The report is reproducible evidence for a bounded contract, not a guarantee that every possible execution is error-free.
