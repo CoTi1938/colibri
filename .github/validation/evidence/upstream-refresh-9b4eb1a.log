@@ -1,0 +1,50 @@
++ date -u +%Y-%m-%dT%H:%M:%SZ
+2026-09-14T20:06:55Z
++ git rev-parse origin/dev
+9b4eb1afbddecc47f9b12055a8f4bb9b9993ff93
++ git diff --exit-code 1efb7c82a0c473984cc0258bfc9e12c0cae94914..origin/dev -- c/qwen36.c c/expert_ffn.h c/qwen36_tier.c c/qwen36_tier.h c/st.h c/compat.h c/cli_args.h c/json.h c/serve_poll.h
++ git archive origin/dev c docs/qwen36.md
++ tar -xf - -C /tmp/qwen36-final-refresh.1O6Byp
++ cp c/tests/test_qwen36_borrow.c /tmp/qwen36-final-refresh.1O6Byp/c/tests/
++ clang -std=gnu11 -O3 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-misleading-indentation /tmp/qwen36-final-refresh.1O6Byp/c/tests/test_qwen36_borrow.c -o /tmp/qwen36-final-refresh.1O6Byp/upstream-repro -lm -pthread
++ set +e
++ /tmp/qwen36-final-refresh.1O6Byp/upstream-repro --gather-only
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+FAIL: expert 1 has overwritten data: 24576 weights, 384 scales
+1 failure(s)
+partition S=1 K=8 cap=8 repeated=0 real-helper=0 checked
++ status=1
++ set -e
++ printf 'Current upstream negative-control exit=%s (expected 1)\n' 1
+Current upstream negative-control exit=1 (expected 1)
++ test 1 -eq 1
++ rm /tmp/qwen36-final-refresh.1O6Byp/c/tests/test_qwen36_borrow.c
++ git diff --binary 1efb7c82a0c473984cc0258bfc9e12c0cae94914 e2a0868ef57630883f1269e765ee4a69a366409d
++ git -C /tmp/qwen36-final-refresh.1O6Byp apply --check /tmp/qwen36-final-refresh.1O6Byp/implementation.patch
++ git -C /tmp/qwen36-final-refresh.1O6Byp apply /tmp/qwen36-final-refresh.1O6Byp/implementation.patch
++ make -B -C /tmp/qwen36-final-refresh.1O6Byp/c tests/test_qwen36_borrow EXTRA_CFLAGS=-Werror
+clang -O3 -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Werror tests/test_qwen36_borrow.c -o tests/test_qwen36_borrow -lm -L/opt/homebrew/opt/libomp/lib -lomp
++ OMP_NUM_THREADS=2
++ /tmp/qwen36-final-refresh.1O6Byp/c/tests/test_qwen36_borrow
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+partition S=1 K=8 cap=8 repeated=0 real-helper=0 checked
+partition S=2 K=8 cap=1 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=2 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=7 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=8 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=15 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=16 repeated=0 real-helper=1 checked
+partition S=2 K=8 cap=16 repeated=1 real-helper=1 checked
+compute-interval protection and reuse cap=8 checked
+compute-interval protection and reuse cap=16 checked
+seven borrows + paused read, publication, repeated prefetch and waiter rescan (pinned=0) checked
+seven borrows + paused read, publication, repeated prefetch and waiter rescan (pinned=1) checked
+per-batch priority with eligible capacity cap=16 checked
+per-batch priority with eligible capacity cap=8 checked
+legacy access adds no release obligation; demand/prefetch pin policies checked
+borrow cleanup across reused scratch with partial routing checked
+borrow cleanup across reused scratch with empty routing checked
+qwen36 production borrowing: ok
++ set +x
