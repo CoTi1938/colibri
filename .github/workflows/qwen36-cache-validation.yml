@@ -1,0 +1,73 @@
+name: Qwen36 CPU cache validation (no inference)
+
+# Validation branch only. The inherited CI/oracle/release workflows are removed
+# on this branch; they remain untouched in the five-file correctness commit.
+on:
+  push:
+    branches: [ci/qwen36-cache-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen36-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OMP_NUM_THREADS: '2'
+  PYTHONUTF8: '1'
+
+jobs:
+  cache:
+    if: github.repository == 'CoTi1938/colibri'
+    name: ${{ matrix.platform }} CPU-only
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            shell: bash
+          - os: windows-2022
+            platform: windows
+            shell: 'msys2 {0}'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - name: Preserve reviewed LF source bytes
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Native Windows toolchain (not WSL)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+      - name: Whitelisted model-free builds, regressions and negative controls
+        run: bash .github/validation/qwen36-cache.sh '${{ matrix.platform }}'
+      - name: Linux Clang sanitizers (synthetic cache test only)
+        if: runner.os == 'Linux'
+        run: bash .github/validation/qwen36-sanitizers.sh
+      - name: Upload commands, provenance and raw results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qwen36-cache-${{ matrix.platform }}-${{ github.run_id }}
+          path: |
+            evidence/**/*.log
+            evidence/**/*.sha256
+          if-no-files-found: warn
+          retention-days: 30
