@@ -47,10 +47,15 @@ LOAD_RE = re.compile(
 TUNE_RE = re.compile(r"TUNE decode:\s*(\d+)\s*tokens in\s*([\d.]+)s", re.IGNORECASE)
 FIRST_RE = re.compile(r"time_to_first_token=([\d.]+)s", re.IGNORECASE)
 V4_TOKENS_RE = re.compile(r"v4_tokens.*?generated=(\d+)", re.IGNORECASE)
-QWEN38_SPEED_RE = re.compile(
+QWEN_SPEED_RE = re.compile(
     r"Speed:\s*[\d.]+\s*tok/s\s*\(([\d.]+)s\s+for\s+(\d+)\s+tokens\)",
     re.IGNORECASE,
 )
+QWEN_PROMPT_RE = re.compile(
+    r"\[enc\] prompt tokens:\s*(\d+)\s*\|\s*generating \d+ new tokens")
+QWEN_TTFT_RE = re.compile(
+    r"TTFT:\s*([\d.]+)\s*s(?: \(time to first token\))?")
+QWEN_PEAK_RE = re.compile(r"PEAK RSS:\s*([\d.]+)\s*GB")
 RAM_RE = re.compile(r"(?:projected=|dense=resident\(|available=)([\d.]+)G[iI]?B", re.IGNORECASE)
 IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
 
@@ -420,6 +425,14 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
     }
 
 
+def _qwen_metric_line(pattern, lines, last=False):
+    for line in reversed(lines) if last else lines:
+        match = pattern.fullmatch(line)
+        if match:
+            return match
+    return None
+
+
 def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=None):
     results = []
     engine_name = os.path.basename(engine).lower()
@@ -477,38 +490,45 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
                 f"engine exited with status {proc.returncode}:\n{output[-400:]}"
             )
 
-        # 1. Try standard load & RSS regex
-        m = LOAD_RE.search(output)
-        if m:
-            load_s, rss = float(m.group(1)), float(m.group(2))
-            speed = QWEN38_SPEED_RE.search(output) if qwen_file_cli else None
-            if qwen_file_cli and not speed:
-                sys.exit(f"could not parse Qwen generation count/speed:\n{output[-400:]}")
-            gen_s = float(speed.group(1)) if speed else wall - load_s
-            tok_count = int(speed.group(2)) if speed else max_new
-        else:
-            # 2. Fallback parser for engines like deepseek_v4 that output TUNE decode / timing lines
-            m_tune = TUNE_RE.search(output)
-            m_first = FIRST_RE.search(output)
-            m_tokens = V4_TOKENS_RE.search(output)
-            m_ram = RAM_RE.search(output)
-
-            if not m_tune and not m_first:
-                sys.exit(f"could not parse engine load/decode line from stdout/stderr:\n{output[-400:]}")
-
-            tok_count = int(m_tune.group(1)) if m_tune else (int(m_tokens.group(1)) if m_tokens else max_new)
-            gen_s = float(m_tune.group(2)) if m_tune else wall
-            load_s = float(m_first.group(1)) if m_first else max(0.0, wall - gen_s)
-            rss = float(m_ram.group(1)) if m_ram else (float(memory_gb) if memory_gb is not None else 0.0)
-
         prompt_tokens, ttft = 0, None
         if qwen_file_cli:
-            encoded = re.search(r"\[enc\] prompt tokens:\s*(\d+)", output)
-            first = re.search(r"TTFT:\s*([\d.]+)\s*s", output)
-            peak = re.search(r"PEAK RSS:\s*([\d.]+)\s*GB", output)
+            # Qwen's text CLI reports measurements on stderr. NOSTREAM qwen38
+            # also writes generated text there, between its startup headers
+            # and final footer: match whole lines, first headers, last footer.
+            lines = proc.stderr.splitlines()
+            load = _qwen_metric_line(LOAD_RE, lines)
+            speed = _qwen_metric_line(QWEN_SPEED_RE, lines, last=True)
+            if not load or not speed:
+                sys.exit(f"could not parse Qwen load/generation metrics from stderr:\n{output[-400:]}")
+            load_s, rss = float(load.group(1)), float(load.group(2))
+            gen_s, tok_count = float(speed.group(1)), int(speed.group(2))
+            encoded = _qwen_metric_line(QWEN_PROMPT_RE, lines)
+            first = _qwen_metric_line(QWEN_TTFT_RE, lines, last=True)
+            peak = _qwen_metric_line(QWEN_PEAK_RE, lines, last=True)
             if encoded: prompt_tokens = int(encoded.group(1))
             if first: ttft = float(first.group(1))
             if peak: rss = float(peak.group(1))
+        else:
+            # Standard load/RSS and the legacy TUNE/timing fallback are for
+            # other engines; neither can certify an incomplete Qwen run.
+            m = LOAD_RE.search(output)
+            if m:
+                load_s, rss = float(m.group(1)), float(m.group(2))
+                gen_s, tok_count = wall - load_s, max_new
+            else:
+                m_tune = TUNE_RE.search(output)
+                m_first = FIRST_RE.search(output)
+                m_tokens = V4_TOKENS_RE.search(output)
+                m_ram = RAM_RE.search(output)
+
+                if not m_tune and not m_first:
+                    sys.exit(f"could not parse engine load/decode line from stdout/stderr:\n{output[-400:]}")
+
+                tok_count = int(m_tune.group(1)) if m_tune else (int(m_tokens.group(1)) if m_tokens else max_new)
+                gen_s = float(m_tune.group(2)) if m_tune else wall
+                load_s = float(m_first.group(1)) if m_first else max(0.0, wall - gen_s)
+                rss = float(m_ram.group(1)) if m_ram else (float(memory_gb) if memory_gb is not None else 0.0)
+
         tok_s = tok_count / gen_s if gen_s > 0 else 0.0
         results.append({"tokens": tok_count, "prompt_tokens": prompt_tokens,
                         "wall_s": wall, "request_s": gen_s if qwen_file_cli else max(0.0, wall - load_s),

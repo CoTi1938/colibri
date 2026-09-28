@@ -361,12 +361,104 @@ class FreshDatapointTest(unittest.TestCase):
         self.assertEqual(rows[0]["request_s"], 2.0)
         self.assertFalse(rows[0]["length_limited"])
 
-    def test_qwen36_missing_speed_is_not_a_successful_measurement(self):
-        run = subprocess.CompletedProcess([], 0, stdout="", stderr=
-            "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n")
-        with mock.patch.object(datapoint.subprocess, "run", return_value=run), \
-             self.assertRaisesRegex(SystemExit, "could not parse Qwen"):
-            datapoint.run_fresh_engine("/tmp/qwen36", "/model", "hello", 7, 1, 8, 4)
+    def test_qwen_metrics_ignore_generated_stdout(self):
+        generated = (
+            "[enc] prompt tokens: 999 | generating 999 new tokens\n"
+            "resident weights loaded in 99.0s | RSS after load: 999.0 GB\n"
+            "TTFT: 99.0 s (time to first token)\n"
+            "PEAK RSS: 999.0 GB\n"
+            "Speed: 1.00 tok/s (99.0s for 999 tokens)\n")
+        diagnostics = (
+            "[enc] prompt tokens: 11 | generating 7 new tokens\n"
+            "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n"
+            "TTFT: 0.75 s (time to first token)\n"
+            "PEAK RSS: 2.0 GB\n"
+            "Speed: 2.00 tok/s (2.0s for 4 tokens)\n")
+        run = subprocess.CompletedProcess([], 0, stdout=generated,
+                                         stderr=diagnostics)
+        for name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe"):
+            with self.subTest(engine=name), \
+                 mock.patch.object(datapoint.subprocess, "run", return_value=run):
+                row, = datapoint.run_fresh_engine(
+                    f"/tmp/{name}", "/model", "hello", 7, 1, 8, 4)
+                self.assertEqual(
+                    {key: row[key] for key in
+                     ("tokens", "prompt_tokens", "load_s", "ttft_s", "rss",
+                      "gen_s", "request_s", "tok_s", "length_limited")},
+                    {"tokens": 4, "prompt_tokens": 11, "load_s": 1.5,
+                     "ttft_s": 0.75, "rss": 2.0, "gen_s": 2.0,
+                     "request_s": 2.0, "tok_s": 2.0, "length_limited": False})
+
+    def test_qwen38_nonstream_uses_headers_and_final_footer(self):
+        # NOSTREAM makes qwen38 write decoded model text to stderr between
+        # its startup diagnostics and its final measurement footer.
+        run = subprocess.CompletedProcess([], 0, stdout="", stderr=(
+            "[enc] prompt tokens: 11 | generating 7 new tokens\n"
+            "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n"
+            "Generated (7 new tokens):\nText      : example output:\n"
+            "[enc] prompt tokens: 999 | generating 999 new tokens\n"
+            "resident weights loaded in 99.0s | RSS after load: 999.0 GB\n"
+            "TTFT: 99.0 s (time to first token)\n"
+            "PEAK RSS: 999.0 GB\n"
+            "Speed: 1.00 tok/s (99.0s for 999 tokens)\n"
+            "TTFT: 0.75 s (time to first token)\n"
+            "diagnostic mentioning TTFT: 88.0 s\n"
+            "PEAK RSS: 2.0 GB\n"
+            "diagnostic mentioning PEAK RSS: 888.0 GB\n"
+            "Speed: 2.00 tok/s (2.0s for 4 tokens)\n"
+            "diagnostic mentioning Speed: 1.00 tok/s (88.0s for 888 tokens)\n"))
+        with mock.patch.dict(os.environ, {"NOSTREAM": "1"}), \
+             mock.patch.object(datapoint.subprocess, "run", return_value=run):
+            row, = datapoint.run_fresh_engine(
+                "/tmp/qwen38", "/model", "hello", 7, 1, 8, 4)
+        self.assertEqual(row["prompt_tokens"], 11)
+        self.assertEqual(row["load_s"], 1.5)
+        self.assertEqual(row["ttft_s"], 0.75)
+        self.assertEqual(row["rss"], 2.0)
+        self.assertEqual(row["tokens"], 4)
+        self.assertEqual(row["request_s"], 2.0)
+
+    def test_qwen_incomplete_stderr_metrics_are_not_a_successful_measurement(self):
+        load = "resident weights loaded in 1.5s | RSS after load: 1.0 GB\n"
+        cases = (
+            ("load only", "", load),
+            ("TUNE only", "", "TUNE decode: 4 tokens in 2.0s\n"),
+            ("stdout Speed", "Speed: 2.00 tok/s (2.0s for 4 tokens)\n", load),
+            ("stderr Speed without load", "", "Speed: 2.00 tok/s (2.0s for 4 tokens)\n"),
+        )
+        for name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe"):
+            for case, stdout, stderr in cases:
+                run = subprocess.CompletedProcess([], 0, stdout=stdout,
+                                                  stderr=stderr)
+                with self.subTest(engine=name, case=case), \
+                     mock.patch.object(datapoint.subprocess, "run", return_value=run), \
+                     self.assertRaisesRegex(SystemExit, "could not parse Qwen"):
+                    datapoint.run_fresh_engine(
+                        f"/tmp/{name}", "/model", "hello", 7, 1, 8, 4)
+
+    def test_non_qwen_standard_and_tune_measurements_are_preserved(self):
+        cases = (
+            ("/tmp/olmoe",
+             "resident weights loaded in 1.5s | RSS after load: 19.0 GB\n",
+             "", 7, 3.5, 1.5, 19.0),
+            ("/tmp/deepseek_v4", "TUNE decode: 4 tokens in 2.0s\n",
+             "time_to_first_token=1.5s available=19.0GiB\n", 4, 2.0, 1.5, 19.0),
+        )
+        for name, stdout, stderr, tokens, gen_s, load_s, rss in cases:
+            run = subprocess.CompletedProcess([], 0, stdout=stdout,
+                                              stderr=stderr)
+            with self.subTest(engine=name), \
+                 mock.patch.object(datapoint.subprocess, "run", return_value=run), \
+                 mock.patch.object(datapoint.time, "monotonic", side_effect=(10.0, 15.0)):
+                row, = datapoint.run_fresh_engine(
+                    name, "/model", "hello", 7, 1, 8, 4)
+                self.assertEqual(row["tokens"], tokens)
+                self.assertEqual(row["gen_s"], gen_s)
+                self.assertEqual(row["load_s"], load_s)
+                self.assertEqual(row["rss"], rss)
+                self.assertEqual(row["request_s"], 3.5)
+                self.assertEqual(row["prompt_tokens"], 0)
+                self.assertIsNone(row["ttft_s"])
 
     def test_qwen38_receives_a_temporary_prompt_file_and_exact_generation_cap(self):
         observed = {}
@@ -394,8 +486,11 @@ class FreshDatapointTest(unittest.TestCase):
         self.assertEqual(observed["env"]["N_NEW"], "7")
         self.assertFalse(observed["path"].exists())
         self.assertEqual(rows[0]["tokens"], 7)
+        self.assertEqual(rows[0]["prompt_tokens"], 0)
+        self.assertIsNone(rows[0]["ttft_s"])
         self.assertEqual(rows[0]["rss"], 19.0)
         self.assertEqual(rows[0]["gen_s"], 3.5)
+        self.assertEqual(rows[0]["request_s"], 3.5)
 
     def test_qwen38_fresh_measurement_refuses_a_failed_engine(self):
         failed = subprocess.CompletedProcess(
