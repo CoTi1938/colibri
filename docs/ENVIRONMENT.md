@@ -140,7 +140,8 @@ What each engine can do:
 | `deepseek_v4` | Automatic: when the dense trunk or the BF16 head does not fit in `RAM_GB`, it is read from disk again on every use. The `ram_tiers` line on stderr says `dense=streamed`. | Cache of at least the top-k slots per layer. |
 | `glm53` | Resident (`GLM53_BITS` picks 4, 8 or 32 bits). | `COLI_MAP_EXPERTS=1`: views of a per-shard mapping, CPU runs only. |
 | `qwen38` | Resident (`Q38_TRUNK_CPU_INT8` keeps it as int8). | `COLI_MAP_EXPERTS=1`, native FP8 experts. |
-| `qwen36`, `inkling`, `deepseek_v41`, `olmoe` | Resident. | Cache of at least one slot per layer. |
+| `qwen36` | Resident, except the token embedding: mapped from disk and read one row per token (`COLI_EMBED_MMAP`). | Cache of at least one slot per layer. |
+| `inkling`, `deepseek_v41`, `olmoe` | Resident. | Cache of at least one slot per layer. |
 
 A mapped weight costs a disk read whenever the OS has evicted it, so in the
 worst case every token reads every mapped byte: this is how a model runs at
@@ -148,6 +149,11 @@ all, not how it runs fast. Mapped bytes also do not count as resident, and the
 engine hands the RAM they free to the expert cache; to lower the total, lower
 `RAM_GB` (`coli --ram`) or `CAP` too. For GLM-5.2 on a machine where not even
 the trunk fits: `TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1 RAM_GB=2`.
+
+`qwen36` maps only its token embedding, and each token reads one row of it
+(4 KiB on Qwen3.6-35B-A3B), not the whole table. The pages it has read count
+in the process's RSS until the OS reclaims them, and its expert cache stays at
+the `cap` slots it was given.
 
 ## The `.coli_ssd` probe cache
 
@@ -420,6 +426,7 @@ and the CPU/GPU execution split.
 | Variable | Default | Effect |
 |---|---|---|
 | `COLI_DENSE_I8` | `1` (on) | Quantize resident dense matrices to per-row int8 at startup. `=0` keeps the f32 reference path for quality A/Bs. |
+| `COLI_EMBED_MMAP` | `1` (on) | `qwen36`: keep the token embedding (`model.embed_tokens.weight`) in the checkpoint, mapped read-only, and widen to f32 only the rows a prompt uses. The values are those of the f32 table, without its allocation (2 GB on Qwen3.6-35B-A3B); the rows read stay in the page cache, and a row the OS has evicted is read from disk again. The mapping reads the checkpoint while the engine runs, so the file must not change until it exits: a truncated shard can end the process with SIGBUS on Linux and macOS. `=0` loads the whole table into RAM as f32. An MLX affine (qpack) embedding is always loaded as f32. |
 | `COLI_DENSE_IDOT` | `1` (on) | The dense trunk's GEMVs (DeltaNet projections and out_proj, attention q/k/v/o, shared expert, lm_head) quantize the activation to int8 once per call and run integer dot products (maddubs on AVX2, vpdpbusd on AVX-VNNI / AVX-512 VNNI) instead of converting every int8 weight to f32. Not bit-identical to the f32 path; measured +1.0% perplexity, lm_head 12.6 to 10.2 ms/token. `=0` restores the f32-activation kernel. |
 | `QWEN_EXPERT_ACT` | `i8` | The routed experts' activation quantized to int8 once per row (expert_ffn.h mode 1). Measured +0.1% perplexity, expert compute 22.7 to 15.9 ms/token. `=f32` restores f32 activations and the bit-identical contract with the pair kernels. |
 | `COLI_DENSE_BITS` | `8` | `=4` stores the dense trunk as int4 in blocks of 64 with one scale per block (the K1b planar layout, half the bytes), served by the grouped integer kernel; implies the integer dot. Opt-in: on the 35B it costs +10% perplexity on the whole trunk, +2.4% on lm_head alone (see `COLI_DENSE_INT4`). |

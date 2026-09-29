@@ -777,6 +777,11 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *final_norm;
+    /* model.embed_tokens.weight as stored, mapped read-only (see
+     * q36_embed_map): embed_row widens only the rows a prompt indexes, and
+     * `embed` stays NULL. When embed_map.data is NULL, `embed` holds the whole
+     * table in f32. */
+    st_mapped_raw embed_map; int embed_dtype;
     QW lm_head;
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -1748,6 +1753,54 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 
+/* The token embedding without its f32 copy. The prompt gather reads one row
+ * per token, so the whole-table f32 load (vocab x hidden: 2 GB on
+ * Qwen3.6-35B-A3B, plus its raw copy while loading) held memory for rows a
+ * prompt may never read.
+ * The tensor is mapped read-only in its stored BF16/F16/F32 form and
+ * embed_row widens a row on demand with the same conversion st_read_f32 uses,
+ * so the values are the same bits. Pages come from the file and stay
+ * reclaimable, the way kimi_k3 maps its weights; the checkpoint must not
+ * change underneath the engine while it runs. Returns 0, mapping nothing, for
+ * a table it does not map (an MLX affine triple, a size that disagrees with
+ * the config) or when the mapping fails: load_t_n then loads or refuses it as
+ * before. COLI_EMBED_MMAP=0 keeps the f32 table. */
+static int q36_embed_map(Model *m) {
+    const char *e = getenv("COLI_EMBED_MMAP");
+    if (e && *e == '0') return 0;
+    char rn[QW_DENSE_NAME_MAX];
+    const char *nm = dense_resolve(m, "model.embed_tokens.weight", rn, sizeof rn);
+    st_tensor *t = st_find(&m->S, nm);
+    int64_t want = (int64_t)m->c.vocab * m->c.hidden;
+    if (!t || t->dtype > 2 || want <= 0 || t->numel != want ||
+        t->nbytes != want * st_dtype_esz(t->dtype)) return 0;
+    st_mapped_raw map;
+    if (st_map_raw(&m->S, nm, &map) != 0) return 0;
+    m->embed_map = map; m->embed_dtype = t->dtype;
+    return 1;
+}
+/* The token embedding model_init_range loads: mapped when q36_embed_map maps
+ * it, otherwise the f32 table load_t_n loads, or refuses, as before. */
+static void q36_load_embedding(Model *m) {
+    if (!q36_embed_map(m))
+        m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)m->c.vocab * m->c.hidden);
+}
+/* Row `tok` of the token embedding in f32. The caller checks the range. */
+static void embed_row(const Model *m, int tok, float *out) {
+    int D = m->c.hidden;
+    if (!m->embed_map.data) { memcpy(out, m->embed + (int64_t)tok*D, (size_t)D*sizeof(float)); return; }
+    size_t esz = (size_t)st_dtype_esz(m->embed_dtype);
+    const unsigned char *row = (const unsigned char *)m->embed_map.data + (size_t)tok * D * esz;
+    if (m->embed_dtype == 2) { memcpy(out, row, (size_t)D*sizeof(float)); return; }
+    uint16_t buf[512];      /* the stored halves, aligned whatever the tensor's file offset */
+    for (int i = 0; i < D; i += 512) {
+        int n = D - i < 512 ? D - i : 512;
+        memcpy(buf, row + (size_t)i * 2, (size_t)n * 2);
+        if (m->embed_dtype == 0) bf16_to_f32_bulk(buf, out + i, n);
+        else f16_to_f32_bulk(buf, out + i, n);
+    }
+}
+
 /* ---------- vision (#1757) ----------
  * The weights are the checkpoint's own model.visual.*, copied by the converter,
  * read as f32 like every other small tensor here. */
@@ -1910,7 +1963,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int quantize_dense = load_boundaries && dense_i8_on();
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
-        m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        q36_load_embedding(m);
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_norm_n(m, "model.norm.weight", c->hidden);
@@ -3345,7 +3398,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (vrow >= 0 && vrow < m->vis_rows_n)   /* an image placeholder: the tower's row */
             memcpy(x + (int64_t)s*D, m->vis_rows + (int64_t)vrow*D, D*sizeof(float));
         else
-            memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+            embed_row(m, ids[s], x + (int64_t)s*D);
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
     /* Recorded HERE, where the tokens actually entered the state, rather than
