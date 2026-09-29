@@ -1284,9 +1284,9 @@ static int dense_keep_i8(void){
     }
     return v;
 }
-static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) {
-    int8_t *q = malloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
-    if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
+/* The int8 rows of qw_quantize: each row depends only on itself, so a caller
+ * may run this over any block of rows (load_tq_blocked does). */
+static void qw_quantize_rows(const float *W, int I, int O, int8_t *q, float *sc) {
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const float *r = W + (int64_t)o*I; float am = 0.f;
@@ -1295,6 +1295,11 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
         int8_t *d = q + (int64_t)o*I;
         for (int i = 0; i < I; i++) { int v = (int)lrintf(r[i]*inv); if (v>127) v=127; if (v<-127) v=-127; d[i] = (int8_t)v; }
     }
+}
+static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) {
+    int8_t *q = malloc((size_t)O*I); float *sc = malloc((size_t)O*sizeof(float));
+    if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
+    qw_quantize_rows(W, I, O, q, sc);
     out->q = q; out->sc = sc; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
     if (dense_int4_wanted(tag) && I % 64 == 0) {
@@ -1738,8 +1743,65 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * adapters build partial or auxiliary models straight off
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
- * on that path. */
+ * on that path. A tensor stored as plain BF16/F16/F32 does not even stage its
+ * whole f32 copy: load_tq_blocked quantizes it a block of rows at a time. */
+/* The f32 rows load_tq_blocked stages at once: megabytes per pread and enough
+ * rows per quantizer call to spread over threads, and still noise next to what
+ * the whole-matrix path staged for lm_head alone (its f32 copy plus the raw
+ * f16 st_read_f32 reads it from: ~3 GB on Qwen3.6-35B-A3B). */
+#ifndef QW_LOAD_BLOCK_BYTES
+#define QW_LOAD_BLOCK_BYTES ((size_t)8 << 20)
+#endif
+/* load_tq's quantizing path without the whole-matrix f32 copy: the stored rows
+ * are read a block at a time, widened into a bounded f32 buffer by the same
+ * bulk conversion st_read_f32 uses, and quantized straight into the final
+ * int8 (and int4) buffers. qw_quantize_rows and pack_int4_g64_planar work row
+ * by row, so the result is byte-identical to quantizing the whole matrix, and
+ * the buffers kept are the ones qw_quantize would keep. Returns 0, having
+ * touched nothing, for any tensor it does not stream -- an MLX affine triple,
+ * a non-float dtype, a size that disagrees with the config -- so the caller's
+ * whole-matrix path loads or refuses it exactly as before. */
+static int load_tq_blocked(Model *m, const char *name, int I, int O, const char *tag, QW *out) {
+    char rn[QW_DENSE_NAME_MAX];
+    st_tensor *t = st_find(&m->S, dense_resolve(m, name, rn, sizeof rn));
+    if (!t || t->dtype > 2 || I <= 0 || O <= 0) return 0;
+    size_t esz = (size_t)st_dtype_esz(t->dtype);
+    if (t->numel != (int64_t)I * O || t->nbytes != t->numel * (int64_t)esz) return 0;
+    size_t row_f32 = (size_t)I * sizeof(float);
+    size_t rows = QW_LOAD_BLOCK_BYTES / row_f32;
+    if (rows < 1) rows = 1;
+    if (rows > (size_t)O) rows = (size_t)O;
+    uint8_t *q4 = NULL; float *sg = NULL;
+    if (dense_int4_wanted(tag) && I % 64 == 0) {
+        q4 = malloc((size_t)O*(I/2)); sg = malloc((size_t)O*(I/64)*sizeof(float));
+        if (!q4 || !sg) { free(q4); free(sg); q4 = NULL; sg = NULL; }   /* as qw_quantize: int8 only */
+    }
+    int8_t *q = NULL; float *sc = NULL;
+    if (!q4 || dense_keep_i8()) {
+        q = malloc((size_t)O*I); sc = malloc((size_t)O*sizeof(float));
+        if (!q || !sc) { fprintf(stderr, "OOM qw_quantize\n"); exit(1); }
+    }
+    float *f = malloc(rows * row_f32);
+    void *raw = t->dtype == 2 ? NULL : malloc(rows * (size_t)I * esz);
+    if (!f || (t->dtype != 2 && !raw)) { fprintf(stderr, "OOM staging %s\n", name); exit(1); }
+    for (size_t r0 = 0; r0 < (size_t)O; r0 += rows) {
+        size_t n = (size_t)O - r0 < rows ? (size_t)O - r0 : rows, count = n * (size_t)I;
+        st_read_range_raw_cap(&m->S, t->fd, t->off + (int64_t)(r0 * (size_t)I * esz),
+                              (int64_t)(count * esz), raw ? raw : (void *)f,
+                              (int64_t)(rows * (size_t)I * esz), 0, t->name);
+        if (t->dtype == 0) bf16_to_f32_bulk(raw, f, (int64_t)count);
+        else if (t->dtype == 1) f16_to_f32_bulk(raw, f, (int64_t)count);
+        if (q) qw_quantize_rows(f, I, (int)n, q + r0 * (size_t)I, sc + r0);
+        if (q4) pack_int4_g64_planar(f, q4 + r0 * (size_t)(I/2), sg + r0 * (size_t)(I/64), (int)n, I);
+    }
+    free(f); free(raw);
+    out->w = NULL; out->q = q; out->sc = sc; out->I = I; out->O = O;
+    out->q4 = q4; out->sg = sg; out->ng = q4 ? I/64 : 0;
+    return 1;
+}
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    if (quantize && dense_i8_on() && !getenv("COLI_KEEP_F32") &&
+        load_tq_blocked(m, name, I, O, tag, out)) return;
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
@@ -1996,7 +2058,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     #undef QCOUNT
     if (quantize_dense)
-        fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
+        fprintf(stderr, "[dense-i8] %d matrices quantized during load (%.1f GB as f32)\n", qcount, qfreed/1073741824.0);
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
