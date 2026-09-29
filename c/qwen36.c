@@ -195,14 +195,16 @@ static void build_byte_sym(void){
         g_unmap[cp]=(short)b;   /* reverse: mapped codepoint -> original byte */
     }
 }
-static void push_id(int **ids,int *n,int *cap,int v){
+/* Grows the id buffer on demand. Returns 0 when it cannot: the caller's buffer
+ * is left as it was, still valid and still its own to free. */
+static int push_id(int **ids,int *n,int *cap,int v){
     if(*n==*cap){
-        *cap*=2;
-        int *tmp=realloc(*ids,*cap*sizeof(int));
-        if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating token id buffer (%d entries)\n",*cap); exit(1); }
-        *ids=tmp;
+        if(*cap>INT_MAX/2 || (size_t)*cap>SIZE_MAX/(2*sizeof(int))) return 0;
+        int next=*cap*2; int *grown=realloc(*ids,(size_t)next*sizeof(int));
+        if(!grown) return 0;
+        *cap=next; *ids=grown;
     }
-    (*ids)[(*n)++]=v;
+    (*ids)[(*n)++]=v; return 1;
 }
 
 static int try_special(const char *s,int i,int n,int *id_out){
@@ -260,37 +262,47 @@ static int pretok_end(const char *s,int i,int n){
     }
     return i+adv;
 }
-static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
-    if(len<=0) return;
+/* Byte-level BPE of one pre-tokenized piece. Returns 0 when an allocation
+ * fails: everything this call allocated is released, and the ids pushed so far
+ * stay in the caller's buffer, which remains valid. */
+static int bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
+    if(len<=0) return 1;
     int sc=0,scap=16; char **syms=malloc(scap*sizeof(char*));
+    if(!syms) return 0;
     for(int b=0;b<len;b++){
         const char *sym=byte_sym_utf8[(unsigned char)piece[b]];
-        int sl=(int)strlen(sym); char *d=malloc(sl+1); memcpy(d,sym,sl); d[sl]=0;
         if(sc==scap){
-            scap*=2;
-            char **tmp=realloc(syms,scap*sizeof(char*));
-            if(!tmp){ fprintf(stderr,"qwen36: OOM reallocating BPE symbol buffer (%d entries)\n",scap); exit(1); }
-            syms=tmp;
+            if(scap>INT_MAX/2 || (size_t)scap>SIZE_MAX/(2*sizeof(char*))) goto failed;
+            char **grown=realloc(syms,(size_t)scap*2*sizeof(char*));
+            if(!grown) goto failed;
+            scap*=2; syms=grown;
         }
-        syms[sc++]=d;
+        int sl=(int)strlen(sym); char *d=malloc(sl+1); if(!d) goto failed;
+        memcpy(d,sym,sl); d[sl]=0; syms[sc++]=d;
     }
     while(sc>1){
         int best=-1,besti=-1;
         for(int k=0;k<sc-1;k++){
             const char *a=syms[k],*b=syms[k+1];
             size_t kl=(size_t)strlen(a)+1+(size_t)strlen(b)+1;
-            char *key=malloc(kl); snprintf(key,kl,"%s\x1F%s",a,b);
+            char *key=malloc(kl); if(!key) goto failed;
+            snprintf(key,kl,"%s\x1F%s",a,b);
             int r=smap_get(&g_merge,key); free(key);
             if(r>=0 && (best<0||r<best)){best=r;besti=k;}
         }
         if(besti<0) break;
         char *m=malloc(strlen(syms[besti])+strlen(syms[besti+1])+1);
+        if(!m) goto failed;
         strcpy(m,syms[besti]); strcat(m,syms[besti+1]);
         free(syms[besti]); free(syms[besti+1]); syms[besti]=m;
         for(int k=besti+1;k<sc-1;k++) syms[k]=syms[k+1]; sc--;
     }
-    for(int k=0;k<sc;k++){ int id=smap_get(&g_rev,syms[k]); if(id<0) id=0; push_id(ids,n,cap,id); free(syms[k]); }
-    free(syms);
+    for(int k=0;k<sc;k++){ int id=smap_get(&g_rev,syms[k]); if(id<0) id=0; if(!push_id(ids,n,cap,id)) goto failed; }
+    for(int k=0;k<sc;k++) free(syms[k]);
+    free(syms); return 1;
+failed:
+    for(int k=0;k<sc;k++) free(syms[k]);
+    free(syms); return 0;
 }
 /* The next added token at or after i, or n when there is none. HF splits the
  * added tokens out FIRST and pre-tokenizes only the ordinary text between them.
@@ -304,23 +316,29 @@ static int next_special(const char *s,int i,int n){
     for(int k=i;k<n;k++){ int sid; if(try_special(s,k,n,&sid)>0) return k; }
     return n;
 }
-static void encode_text(const char *text,int **out_ids,int *out_n){
-    int cap=1024,n=0; int *ids=malloc(cap*sizeof(int));
-    int tlen=(int)strlen(text); int i=0;
+/* Returns 0 when the text cannot be encoded for lack of memory, or is longer
+ * than INT_MAX bytes: *out_ids is then NULL and nothing is leaked. */
+static int encode_text(const char *text,int **out_ids,int *out_n){
+    *out_ids=NULL; *out_n=0;
+    size_t bytes=strlen(text); if(bytes>INT_MAX) return 0;
+    int cap=1024,n=0; int *ids=malloc((size_t)cap*sizeof(int)); if(!ids) return 0;
+    int tlen=(int)bytes; int i=0;
     while(i<tlen){
         int sid; int L=try_special(text,i,tlen,&sid);
-        if(L>0){ push_id(&ids,&n,&cap,sid); i+=L; continue; }
+        if(L>0){ if(!push_id(&ids,&n,&cap,sid)) goto failed; i+=L; continue; }
         /* Ordinary text runs to the next added token, and the pre-tokenizer
          * sees that boundary as the end of its input, exactly as HF's does. */
         int end=next_special(text,i+1,tlen);
         while(i<end){
             int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
             if(j>end) j=end;
-            bpe_piece(text+i,j-i,&ids,&n,&cap);
+            if(!bpe_piece(text+i,j-i,&ids,&n,&cap)) goto failed;
             i=j;
         }
     }
-    *out_ids=ids; *out_n=n;
+    *out_ids=ids; *out_n=n; return 1;
+failed:
+    free(ids); return 0;
 }
 
 /* Load Qwen tokenizer.json and build an id->piece table from model.vocab
@@ -4025,7 +4043,13 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
-    encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
+    /* payload is raw prompt text; qwen36 adds no BOS. Running out of memory
+     * here is this request's failure, not the process's: answer it, keep serving. */
+    if(!encode_text(q->payload, &ids, &np)){
+        printf("ERROR %s REQUEST_ALLOCATION_FAILED tokenizing the prompt\n",q->id); fflush(stdout);
+        if(g_pending_image.present) q36_pending_image_clear();
+        return;
+    }
     if(g_pending_image.present){
         Cfg *vc = &m->c;
         if(!m->vis_ready){
@@ -4343,8 +4367,9 @@ int main(int argc, char **argv) {
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
         char *txt=malloc(n+1); if (fread(txt,1,n,f)!=(size_t)n) {} txt[n]=0; fclose(f);
         if (!g_tok) { fprintf(stderr, "[enc] no tokenizer loaded; cannot encode text. Put tokenizer.json in SNAP or set TOK.\n"); free(txt); return 1; }
-        encode_text(txt, &prompt, &np);
+        int encoded = encode_text(txt, &prompt, &np);
         free(txt);
+        if (!encoded) { fprintf(stderr, "[enc] out of memory tokenizing the prompt\n"); return 1; }
         n_new = getenv("N_NEW") ? atoi(getenv("N_NEW")) : 64;
         if (n_new < 1) n_new = 1;
         fprintf(stderr, "[enc] prompt tokens: %d | generating %d new tokens\n", np, n_new);
@@ -5171,8 +5196,11 @@ static int qwen36_edge_tokenize(
                                        "out of memory tokenizing Qwen3.6 text");
     memcpy(copy, text, text_bytes); copy[text_bytes] = '\0';
     int *ids = NULL, count = 0;
-    encode_text(copy, &ids, &count);
+    int encoded = encode_text(copy, &ids, &count);
     free(copy);
+    if (!encoded)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory tokenizing Qwen3.6 text");
     if (count < 0 || (token_ids && token_capacity < (size_t)count)) {
         free(ids);
         return coli_edge_adapter_error(error, error_size,
