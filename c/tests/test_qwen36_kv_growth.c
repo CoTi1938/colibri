@@ -37,11 +37,14 @@
 
 #ifndef _WIN32
 /* Declared under their own names before the macros below hijack every token
- * that follows; the system headers are already included above. */
-static void *test_malloc_seam(size_t n);
-static void *test_calloc_seam(size_t count, size_t size);
-static void *test_realloc_seam(void *p, size_t n);
-static void test_free_seam(void *p);
+ * that follows; the system headers are already included above. Out of line:
+ * inlined into the encoder, the NULL an armed seam returns reached an
+ * unchecked snprintf in bpe_piece, and gcc -O3 warned about it
+ * (-Wformat-truncation). That allocation gets its check with #1800. */
+__attribute__((noinline)) static void *test_malloc_seam(size_t n);
+__attribute__((noinline)) static void *test_calloc_seam(size_t count, size_t size);
+__attribute__((noinline)) static void *test_realloc_seam(void *p, size_t n);
+__attribute__((noinline)) static void test_free_seam(void *p);
 #define malloc test_malloc_seam
 #define calloc test_calloc_seam
 #define realloc test_realloc_seam
