@@ -1323,6 +1323,12 @@ tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c gsgemv.h qg
 tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# KV growth all or nothing: every allocation of ensure_kv refused in turn leaves
+# the cache, its stride and its prefix record as they were, and serve_one
+# answers REQUEST_ALLOCATION_FAILED before ACCEPT.
+tests/test_qwen36_kv_growth$(EXE): tests/test_qwen36_kv_growth.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h kv_prefix.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # Both tokenizer.json merge spellings ("a b" strings and ["a","b"] pairs)
 # must index the same merge table; the pair form is what Qwen3.6 ships.
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)

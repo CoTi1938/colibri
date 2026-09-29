@@ -158,6 +158,14 @@ def _engine_error(fields, message):
                         f"messages resulted in at least {used} tokens. Please shorten the "
                         f"conversation, or restart the server with a larger CTX.",
                         "messages", "context_length_exceeded")
+    if fields and fields[0] == "REQUEST_ALLOCATION_FAILED":
+        # qwen36 could not allocate what this one request needs (tokenizing its
+        # prompt, growing the KV cache for its context) and refused it instead
+        # of exiting: the engine is still serving, the request may fit later.
+        detail = " ".join(fields[1:])
+        return APIError(503, "The engine could not allocate memory for this request"
+                        + (f" ({detail})." if detail else "."),
+                        None, "request_allocation_failed", "server_error")
     return RuntimeError(message)
 
 

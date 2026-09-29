@@ -3618,8 +3618,14 @@ static void reset_recurrent(Model *m){
 
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
  * longer context is needed; never shrinks. Frees the previous buffers on
- * growth so the server doesn't leak KV memory across requests. */
-static void ensure_kv(Model *m){
+ * growth so the server doesn't leak KV memory across requests. The new K/V
+ * rows and attention scores are all allocated before the old ones are
+ * touched: when one cannot be, those already taken are released and the
+ * cache, its row stride and its prefix record stay exactly as they were, so a
+ * later request that fits still reuses them. Returns 0 then, 1 otherwise --
+ * also when only the prefix record, grown after the cache, cannot be: that
+ * loses reuse, as it always did, not the request. */
+static int ensure_kv(Model *m){
     Cfg *c = &m->c;
     if (m->kv_cap >= m->max_t && m->K) {
         /* max_t is the ROW STRIDE of the KV cache, not just a capacity: a row
@@ -3630,7 +3636,7 @@ static void ensure_kv(Model *m){
          * earlier turn wrote, so the stride has to stay the one they were
          * written with: the allocation's, which is kv_cap. */
         m->max_t = m->kv_cap;
-        return;
+        return 1;
     }
     /* Growth COPIES the rows instead of discarding them. A chat resends a
      * longer transcript every turn, so this reallocation lands on exactly the
@@ -3645,36 +3651,46 @@ static void ensure_kv(Model *m){
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
     if (keep > m->max_t)   keep = m->max_t;
-    m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++){
-        if (c->is_attn[i]){
-            int64_t kvd = c->k_head_dim;
-            m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
-            m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
-            if (keep > 0 && oldK && oldK[i] && oldV[i])
-                for (int h = 0; h < c->kv_heads; h++){
-                    memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
-                           oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
-                    memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
-                           oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
-                }
-        } else { m->K[i] = NULL; m->V[i] = NULL; }
-    }
-    if (oldK){
-        for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
-        free(oldK); free(oldV);
-    }
     /* Attention scores: one row per thread, indexed by absolute position, so
      * each row must hold max_t entries. Sized here rather than in attention()
      * because it grows with the context exactly like the KV cache does, and
      * because a per-call allocation would run 10x per token. */
-    free(m->attn_sc);
-    m->attn_sc_thr = 1;
+    int thr = 1;
 #ifdef _OPENMP
-    m->attn_sc_thr = omp_get_max_threads();
-    if (m->attn_sc_thr < 1) m->attn_sc_thr = 1;
+    thr = omp_get_max_threads();
+    if (thr < 1) thr = 1;
 #endif
-    m->attn_sc = falloc((int64_t)m->attn_sc_thr * m->max_t);
+    int64_t kvd = c->k_head_dim, n = (int64_t)c->kv_heads * m->max_t * kvd;
+    float **K = calloc((size_t)c->n_layers, sizeof(float*)), **V = calloc((size_t)c->n_layers, sizeof(float*));
+    float *sc = malloc((size_t)thr * m->max_t * sizeof(float));
+    int ok = K && V && sc;
+    for (int i = 0; ok && i < c->n_layers; i++)
+        if (c->is_attn[i]) {
+            K[i] = malloc((size_t)n * sizeof(float));
+            V[i] = malloc((size_t)n * sizeof(float));
+            ok = K[i] && V[i];
+        }
+    if (!ok) {
+        for (int i = 0; i < c->n_layers; i++) { if (K) free(K[i]); if (V) free(V[i]); }
+        free(K); free(V); free(sc);
+        if (m->K) m->max_t = m->kv_cap;   /* the stride its rows were written with */
+        return 0;
+    }
+    for (int i = 0; i < c->n_layers; i++)
+        if (c->is_attn[i] && keep > 0 && oldK && oldK[i] && oldV[i])
+            for (int h = 0; h < c->kv_heads; h++){
+                memcpy(K[i] + (int64_t)h*m->max_t*kvd,
+                       oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                memcpy(V[i] + (int64_t)h*m->max_t*kvd,
+                       oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+            }
+    if (oldK){
+        for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
+        free(oldK); free(oldV);
+    }
+    m->K = K; m->V = V;
+    free(m->attn_sc);
+    m->attn_sc = sc; m->attn_sc_thr = thr;
     m->kv_cap = m->max_t;
     /* The record describes those same positions, so it survives with them. If
      * its own allocation fails, reuse simply stops: this is an optimisation and
@@ -3685,6 +3701,7 @@ static void ensure_kv(Model *m){
     } else if (!kv_prefix_alloc(&m->kvp, m->max_t)) {
         kv_prefix_clear(&m->kvp);
     }
+    return 1;
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
@@ -3699,7 +3716,10 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
     m->max_t = np + n_new;
     reset_recurrent(m);
-    ensure_kv(m);
+    if (!ensure_kv(m)) {
+        fprintf(stderr, "[kv] out of memory for a %d-token KV cache\n", np + n_new);
+        exit(1);
+    }
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
@@ -3733,7 +3753,10 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     }
     m->max_t = nfull;
     reset_recurrent(m);
-    ensure_kv(m);
+    if (!ensure_kv(m)) {
+        fprintf(stderr, "[kv] out of memory for a %d-token KV cache\n", nfull);
+        exit(1);
+    }
     m->kv_len = 0;
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);
@@ -3987,12 +4010,18 @@ static void emap_emit(Model *m){
     /* A dense model has no expert grid. "EMAP 64 0 " would be a three-field line,
      * and the gateway stops its dispatcher on a line it cannot parse (#1757). */
     if(cols==0) return;
+    /* The serve loop sends this after every request, a refused one included
+     * (REQUEST_ALLOCATION_FAILED): a snapshot whose buffers cannot be
+     * allocated is skipped -- the gateway keeps the previous one -- instead
+     * of being written through NULL. */
     uint8_t *cells=calloc((size_t)rows*cols,1);
+    char *hex=malloc((size_t)rows*cols*2+1);
+    if(!cells||!hex){ free(cells); free(hex); return; }
     pthread_mutex_lock(&g_pilot_mx);
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
         cells[(size_t)i*cols+e]=(uint8_t)((slot_indexed(m,i,e)?1:0)<<6);
     pthread_mutex_unlock(&g_pilot_mx);
-    char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
+    dash_hex(cells,rows*cols,hex);
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
 }
 static void hits_emit(Model *m){
@@ -4056,11 +4085,18 @@ static void serve_one(Model *m, ServeReq *q){
                 q->max_tok, budget, max_ctx, np);
         q->max_tok = budget;
     }
-    printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     m->max_t = np + q->max_tok;
     /* Grow the cache BEFORE deciding, so the decision sees the state that will
-     * actually be there: ensure_kv preserves both the rows and the record. */
-    ensure_kv(m);
+     * actually be there: ensure_kv preserves both the rows and the record. And
+     * before ACCEPT: a cache that cannot grow is this request's refusal, sent
+     * while the gateway can still answer it with a status instead of a stream
+     * it has already committed, and the cache and its record stay as they
+     * were for the next request. */
+    if(!ensure_kv(m)){
+        printf("ERROR %s REQUEST_ALLOCATION_FAILED growing the KV cache to %d tokens\n",q->id,np + q->max_tok);
+        fflush(stdout); free(ids); return;
+    }
+    printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     /* A chat client resends the whole transcript every turn. If this prompt
      * begins with the ids the current state was built from, that state already
      * IS the state at those positions: prefill only the tail. Either the reused
