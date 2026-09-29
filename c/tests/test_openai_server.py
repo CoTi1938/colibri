@@ -3563,6 +3563,20 @@ class EngineErrorFrameTest(unittest.TestCase):
         err = _engine_error(["CONTEXT_EXCEEDED"], "CONTEXT_EXCEEDED")
         self.assertIsInstance(err, APIError)
         self.assertEqual(err.status, 400)
+
+    def test_allocation_failure_becomes_a_503(self):
+        """qwen36 refuses one request it cannot allocate for and keeps serving: the client
+        gets a server-side status it may retry, with the engine's reason, not a 500."""
+        frame = ["REQUEST_ALLOCATION_FAILED", "growing", "the", "KV", "cache", "to", "9000", "tokens"]
+        err = _engine_error(frame, " ".join(frame))
+        self.assertIsInstance(err, APIError)
+        self.assertEqual(err.status, 503)
+        self.assertEqual(err.code, "request_allocation_failed")
+        self.assertEqual(err.error_type, "server_error")
+        self.assertIn("growing the KV cache to 9000 tokens", err.message)
+        bare = _engine_error(["REQUEST_ALLOCATION_FAILED"], "REQUEST_ALLOCATION_FAILED")
+        self.assertEqual(bare.status, 503)
+        self.assertTrue(bare.message.endswith("request."))
 class UnclosedToolCallTest(unittest.TestCase):
     """#401: the model opens <tool_call>, emits a well-formed call, then stops without the
     closing tag (budget ran out, or quantization mangled it). The strict regex needs both tags,
@@ -4287,6 +4301,21 @@ class AcceptFrameTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "context_length_exceeded")
         self.assertEqual(accepts, [])          # nothing committed -> HTTP layer can send a clean 400
 
+    def test_allocation_failure_before_accept_never_commits(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ERROR " + rid +
+                                b" REQUEST_ALLOCATION_FAILED growing the KV cache to 9000 tokens\n")
+        engine = self._engine(respond)
+        accepts = []
+        with self.assertRaises(APIError) as caught:
+            engine.generate("hi", 8, 0.7, 0.9, lambda _: None,
+                            on_accept=lambda info: accepts.append(info))
+        engine.close()
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.code, "request_allocation_failed")
+        self.assertEqual(accepts, [])
+
     def test_data_before_accept_still_commits_for_old_engine(self):
         def respond(process, frame):
             rid = frame.split()[1]
@@ -4348,6 +4377,45 @@ class StreamingContextRejectTest(unittest.TestCase):
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")
         self.assertEqual(body["error"]["param"], "messages")
+
+
+class _AllocationFailedEngine(FakeEngine):
+    """Engine that cannot allocate for the request and refuses it before ACCEPT, through the
+    same frame parser the real Engine uses."""
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+        frame = ["REQUEST_ALLOCATION_FAILED", "growing", "the", "KV", "cache", "to", "9000", "tokens"]
+        raise _engine_error(frame, " ".join(frame))
+
+
+class StreamingAllocationFailureTest(unittest.TestCase):
+    """A request qwen36 cannot allocate for is refused before ACCEPT, so a streaming client
+    gets a real 503 instead of a committed 200 stream that then breaks off."""
+
+    def setUp(self):
+        self.server = APIServer(("127.0.0.1", 0), _AllocationFailedEngine(), "test-model")
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.scheduler.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_streaming_allocation_failure_is_a_503(self):
+        req = Request(self.base + "/v1/chat/completions",
+                      data=json.dumps({"model": "test-model", "stream": True,
+                        "messages": [{"role": "user", "content": "x"}]}).encode(),
+                      headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 503)
+        body = json.load(caught.exception)
+        self.assertEqual(body["error"]["code"], "request_allocation_failed")
+        self.assertIn("growing the KV cache", body["error"]["message"])
 
 
 class _ExplodingEngine(FakeEngine):

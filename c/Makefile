@@ -1298,6 +1298,12 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+# KV growth all or nothing: every allocation of ensure_kv refused in turn leaves
+# the cache, its stride and its prefix record as they were, and serve_one
+# answers REQUEST_ALLOCATION_FAILED before ACCEPT.
+tests/test_qwen36_kv_growth$(EXE): tests/test_qwen36_kv_growth.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h kv_prefix.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # CACHE_ROUTE: route_select() against a residency table, no model needed.
 tests/test_qwen36_cache_route$(EXE): tests/test_qwen36_cache_route.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
