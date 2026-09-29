@@ -934,6 +934,11 @@ double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
+/* Where an int4 expert load's time goes, prefill and decode alike: the
+ * weights' read, the pairs->planar repack, the scales' read (nanoseconds;
+ * atomic because PILOT and the warmstart load from other threads too). */
+static uint64_t g_xl_n=0, g_xl_read=0, g_xl_repack=0, g_xl_scales=0;
+static uint64_t xl_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000u + (uint64_t)ts.tv_nsec; }
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
 static void tm_add(int S, int idx, double ms){
     if(S==1){
@@ -966,6 +971,9 @@ static void tm_report(void){
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
                 g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
+    if(g_xl_n)
+        fprintf(stderr,"[timers]   expert loads: %llu, per load: read %.3f | repack %.3f | scales %.3f ms\n",
+                (unsigned long long)g_xl_n, g_xl_read/1e6/g_xl_n, g_xl_repack/1e6/g_xl_n, g_xl_scales/1e6/g_xl_n);
     if(g_qt_iss+g_qt_cpu+g_qt_tak>0)
         fprintf(stderr,"[timers]   qtier: issue %.2f | cpu-miss %.2f | take %.2f ms/token\n",
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens, g_qt_tak/g_tm_dec_tokens);
@@ -2175,16 +2183,27 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? "kept int4, repacked planar for expert_ffn.h" : "unpacking to int8 in slot"); noted = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
+        const int tm = tm_on();
+        uint64_t t0 = tm ? xl_ns() : 0;
         st_read_raw(&m->S, nm, raw, 1);
         if (s->pw) {
             /* shared kernel: pairs -> planar, never int8 */
             int64_t gp = ng / 2;
+            uint64_t t1 = tm ? xl_ns() : 0;
             xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  cc->hidden);
             xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->hidden);
             xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->hidden, cc->inter);
+            uint64_t t2 = tm ? xl_ns() : 0;
             s->is_int4 = 1;
             free(raw);
             st_read_f32(&m->S, qsnm, s->gs, 0);
+            if (tm) {
+                uint64_t t3 = xl_ns();
+                __atomic_fetch_add(&g_xl_n, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_xl_read, t1 - t0, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_xl_repack, t2 - t1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_xl_scales, t3 - t2, __ATOMIC_RELAXED);
+            }
             return;
         }
         unpack_int4_to_int8(s->g, raw, want_w);
