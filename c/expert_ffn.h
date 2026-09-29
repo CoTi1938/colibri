@@ -48,6 +48,8 @@
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -84,6 +86,23 @@ static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, 
         __m256i e1 = _mm256_set_m128i(_mm_unpackhi_epi8(cl, ch), _mm_unpacklo_epi8(cl, ch));   /* elements 32..63 */
         e0 = _mm256_xor_si256(e0, e8); e1 = _mm256_xor_si256(e1, e8);
         _mm256_storeu_si256((__m256i *)(dst + (size_t)b * XF_BLOCK_BYTES), _mm256_or_si256(e0, _mm256_slli_epi16(e1, 4)));
+    }
+#elif defined(__ARM_NEON)
+    /* The same permutation with NEON: zip interleaves the low (even) and high
+     * (odd) nibbles into element order, 16 elements per register. Without it
+     * the scalar loop below ran for every expert an Apple silicon CPU loaded,
+     * about a millisecond each. */
+    const uint8x16_t m4 = vdupq_n_u8(0x0F), e8 = vdupq_n_u8(8);
+    for (; b < I / XF_BLOCK; b++) {
+        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
+        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
+        uint8x16_t a = vld1q_u8(s), c = vld1q_u8(s + 16);
+        uint8x16_t al = vandq_u8(a, m4), ah = vshrq_n_u8(a, 4);
+        uint8x16_t cl = vandq_u8(c, m4), ch = vshrq_n_u8(c, 4);
+        uint8x16_t e0lo = veorq_u8(vzip1q_u8(al, ah), e8), e0hi = veorq_u8(vzip2q_u8(al, ah), e8);   /* elements 0..15, 16..31 */
+        uint8x16_t e1lo = veorq_u8(vzip1q_u8(cl, ch), e8), e1hi = veorq_u8(vzip2q_u8(cl, ch), e8);   /* elements 32..47, 48..63 */
+        vst1q_u8(d,      vorrq_u8(e0lo, vshlq_n_u8(e1lo, 4)));
+        vst1q_u8(d + 16, vorrq_u8(e0hi, vshlq_n_u8(e1hi, 4)));
     }
 #endif
     for (; b < I / XF_BLOCK; b++) {
