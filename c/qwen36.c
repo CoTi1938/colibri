@@ -2650,6 +2650,56 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * produce the same bits. A pair run used to go through a zeroed buffer and a
  * second add: two roundings where the fused multiply-add of an FMA build
  * does one, and cap=1 moved the logits in their last bits. */
+/* Expert readahead. moe_xf_run loads the routed experts one blocking pread at
+ * a time; announcing them first (posix_fadvise WILLNEED, which compat.h turns
+ * into F_RDADVISE on macOS) lets the SSD work on all of them at once while
+ * the loop waits for the first. Advisory only: every pread still returns the
+ * same bytes. QWEN_EXPERT_READAHEAD=0 turns it off, for an A/B. */
+static int expert_readahead_on(void){ static int v=-1; if(v<0){ const char *e=getenv("QWEN_EXPERT_READAHEAD"); v=!(e&&*e=='0'); } return v; }
+static void expert_advise(Model *m, int layer, int eid) {
+    char nm[256];
+    int la = m->active_of[layer];   /* as load_expert_merged names them */
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
+    st_prefetch(&m->S, nm);
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.qs", la, eid);
+    st_prefetch(&m->S, nm);
+}
+/* The distinct experts of rows [from, to) of idx (K per row) that are not
+ * resident, in order of first appearance, into miss[]; seen[] and miss[] have
+ * room for n_experts, seen[] starts zeroed. Returns how many. */
+static int expert_misses(Model *m, int layer, const int *idx, int K, int from, int to,
+                         unsigned char *seen, int *miss) {
+    const int ne = m->c.n_experts;
+    int cnt = 0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = from * K; i < to * K; i++) {
+        int e = idx[i];
+        if (e < 0 || e >= ne || seen[e]) continue;
+        seen[e] = 1;
+        if (!slot_indexed(m, layer, e)) miss[cnt++] = e;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    return cnt;
+}
+/* Announce the missing experts of rows [from, to), to clipped to S; returns
+ * the first row not announced. */
+static int expert_announce(Model *m, int layer, const int *idx, int S, int K, int from, int to) {
+    if (to > S) to = S;
+    if (from >= to) return from;
+    const int ne = m->c.n_experts;
+    unsigned char *seen = calloc((size_t)ne, 1);
+    int *miss = malloc(sizeof(int) * (size_t)ne);
+    if (!seen || !miss) { free(seen); free(miss); return to; }   /* advisory: skip it */
+    int cnt = expert_misses(m, layer, idx, K, from, to, seen, miss);
+    for (int j = 0; j < cnt; j++) expert_advise(m, layer, miss[j]);   /* syscalls outside the lock */
+    free(seen); free(miss);
+    return to;
+}
+/* Rows of a prefill announced ahead of the loop: enough to keep the SSD busy,
+ * not the whole prompt, whose experts would push each other out of the page
+ * cache before their turn. */
+#define XF_READAHEAD_ROWS 8
+
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
@@ -2664,7 +2714,10 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
     if (!ex || !exp || !ridx || !held || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
+    const int ra = expert_readahead_on();
+    int ra_next = 0;                          /* first row not announced yet */
     for (int s0 = 0; s0 < S; s0 += per) {
+        if (ra) ra_next = expert_announce(m, layer, idx, S, K, ra_next, s0 + per + XF_READAHEAD_ROWS);
         for (int k0 = 0; k0 < K; k0 += kper) {
             double t0 = timed ? tm_now() : 0;
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {

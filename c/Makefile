@@ -1691,6 +1691,11 @@ tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c sse41_kernels
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_deepseek.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The readahead picks what moe_xf_run will load: the distinct, non-resident
+# experts of the rows asked for, never past the prompt.
+tests/test_qwen36_expert_readahead$(EXE): tests/test_qwen36_expert_readahead.c gsgemv.h qgemv.h sse41_kernels.h qwen36.c qwen38_vision.h expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c sse41_kernels.h colibri.c oracle.h st.h uring.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h compat.h grammar.h tier.h quant.h fp8_format.h idot.h sample.h kv_persist.h telemetry.h route_trace.h $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
