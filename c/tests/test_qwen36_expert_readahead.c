@@ -61,8 +61,11 @@ static int same(const int *got, int n, const int *want, int m) {
 }
 
 static void test_misses(void) {
-    unsigned char seen[EXPERTS];
-    int miss[EXPERTS];
+    /* Room for every id in the rows (99 the largest), not only for n_experts:
+     * with expert_misses inlined, gcc cannot tell that the bound on n_experts
+     * keeps 99 out, and warns that seen[99] is past the end. */
+    unsigned char seen[128];
+    int miss[128];
     memset(seen, 0, sizeof seen);
     int n = expert_misses(&g_m, 0, g_idx, K, 0, 2, seen, miss);
     static const int want01[] = { 5, 9, 12 };
