@@ -1180,10 +1180,12 @@ test-qwen36-kernels: tests/test_qwen36_kernels
 # The Metal graph against the CPU engine on a fixture the test writes (no
 # model needed). Needs a METAL=1 build of qwen36; where the graph cannot run
 # (the Apple Paravirtual device) it checks that the CPU engine takes over.
+# qwen36-canonical writes the fixture's experts.qc.
 .PHONY: test-qwen36-graph
-test-qwen36-graph: qwen36$(EXE)
+test-qwen36-graph: qwen36$(EXE) qwen36-canonical$(EXE)
 	$(if $(filter 1,$(METAL)),,$(error test-qwen36-graph needs METAL=1))
-	QWEN36_GRAPH_ENGINE=./qwen36$(EXE) $(PYTHON) -m unittest -v tests.test_qwen36_graph
+	QWEN36_GRAPH_ENGINE=./qwen36$(EXE) QWEN36_CANONICAL_TOOL=./qwen36-canonical$(EXE) \
+		$(PYTHON) -m unittest -v tests.test_qwen36_graph
 
 # GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
 
@@ -2339,6 +2341,8 @@ tests/test_qwen36_dense_file$(EXE): tests/test_qwen36_dense_file.c tools/qwen36_
 # canonical.qc: the INT8 dense weights of a Qwen3.6 model converted once; the
 # engine reads the file beside the model instead of converting them at every start.
 #   ./qwen36-canonical <model-dir>
+# experts.qc: the routed experts in the Metal graph's slot layout, written once.
+#   ./qwen36-canonical --experts <model-dir> [<output>]
 # The name has a dash, so the automatic dependencies below do not cover it: its
 # own .d (written by -MMD) is included here.
 qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(VK_OBJ)
@@ -3017,6 +3021,14 @@ tests/test_qwen36_layer_loader$(EXE): tests/test_qwen36_layer_loader.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen36_advice_schedule$(EXE): tests/test_qwen36_advice_schedule.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# experts.qc without a model: the record format and its checked reads, and the
+# writer (qwen36-canonical --experts) against the checkpoint it repacks.
+tests/test_qwen36_expert_file$(EXE): tests/test_qwen36_expert_file.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_expert_convert$(EXE): tests/test_qwen36_expert_convert.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 # The qwen38 engine through its own main() on the fake backend: tier start

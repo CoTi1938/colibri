@@ -13,6 +13,9 @@ split with the CPU and the CPU's share of the attention.
 On a device that cannot run the graph (the Apple Paravirtual device of CI
 runners and VMs) the engine steps aside to the CPU engine with one line; the
 test checks that line and skips the comparisons.
+
+With qwen36-canonical (QWEN36_CANONICAL_TOOL) it also writes the fixture's
+experts.qc and checks the experts read from it.
 """
 import json
 import os
@@ -26,6 +29,7 @@ import unittest
 from array import array
 
 ENGINE = os.environ.get("QWEN36_GRAPH_ENGINE")
+CANONICAL = os.environ.get("QWEN36_CANONICAL_TOOL")    # qwen36-canonical, which writes experts.qc
 
 HIDDEN, LAYERS, VOCAB = 256, 8, 128
 EXPERTS, TOPK, INTER, SHARED = 64, 4, 64, 64
@@ -293,6 +297,26 @@ class Qwen36GraphTest(unittest.TestCase):
             gap = relative_gap(a[key], b[key])
             self.assertLess(gap, tol, f"{what}: {key} differ by {gap:.3g} of their largest value")
 
+    @classmethod
+    def experts_qc(cls):
+        """The fixture's experts.qc (qwen36-canonical --experts), written once beside the runs."""
+        path = os.path.join(cls.dir, "experts.qc")
+        if not os.path.exists(path):
+            p = subprocess.run([CANONICAL, "--experts", cls.snap, path], capture_output=True, timeout=600)
+            if p.returncode:
+                raise AssertionError(p.stderr.decode(errors="replace")[-3000:])
+        return {"QWEN36_EXPERTS_QC": path}
+
+    @classmethod
+    def snap_with(cls, name, experts):
+        """A model directory of links to the fixture's files, with `experts` as its experts.qc."""
+        snap = os.path.join(cls.dir, name)
+        os.mkdir(snap)
+        for entry in os.listdir(cls.snap):
+            os.symlink(os.path.join(cls.snap, entry), os.path.join(snap, entry))
+        os.symlink(experts, os.path.join(snap, "experts.qc"))
+        return {"SNAP": snap}
+
     def test_steps_aside_with_a_line(self):
         """Where the graph cannot run, the CPU engine does, and says why: on this
         device, with weights in a form the graph does not read, or with a setting of
@@ -411,6 +435,45 @@ class Qwen36GraphTest(unittest.TestCase):
             gpu = self.run_engine(text, 2, STREAM_CACHE, env, {"QWEN36_CPU_MATMUL": "0"})
             self.assert_ran(cpu, True)
             self.assert_close(gpu, cpu, 1e-5, f"fast graph with and without the CPU's products, {n} tokens")
+
+    def test_experts_file(self):
+        """experts.qc beside the model or named by QWEN36_EXPERTS_QC: the slots are read
+        from it, with a line, and the layers, logits and text are the checkpoint's, in
+        exact and in fast mode; QWEN36_EXPERTS_QC=0 reads the checkpoint, with a line.
+        Cut in half beside the model it is reported and the checkpoint is read; cut and
+        named, or named and missing, the start stops with the reason."""
+        self.graph()
+        if not CANONICAL:
+            self.skipTest("make -C c test-qwen36-graph METAL=1 sets QWEN36_CANONICAL_TOOL")
+        qc = self.experts_qc()
+        path = qc["QWEN36_EXPERTS_QC"]
+        beside = self.snap_with("experts-beside", path)
+        for mode in (EXACT, {}):
+            base = self.run_engine(PROMPT, 6, mode, SMALL_CACHE)
+            for env, where in ((qc, path), (beside, os.path.join(beside["SNAP"], "experts.qc"))):
+                run = self.run_engine(PROMPT, 6, mode, SMALL_CACHE, env)
+                self.assert_ran(run, True)
+                self.assertIn(f"[qwen-experts] {where}: {LAYERS * EXPERTS} planar records", run["stderr"])
+                for key in ("layers", "logits", "stdout"):
+                    self.assertEqual(run[key], base[key], key)
+        off = self.run_engine(PROMPT, 6, SMALL_CACHE, beside, {"QWEN36_EXPERTS_QC": "0"})
+        self.assert_ran(off, True)
+        self.assertIn("QWEN36_EXPERTS_QC=0: the experts are read from the checkpoint", off["stderr"])
+        self.assertNotIn("planar records", off["stderr"])
+        self.assertEqual(off["logits"], base["logits"])
+        cut = os.path.join(self.dir, "experts-cut.qc")
+        with open(path, "rb") as f, open(cut, "wb") as g:
+            g.write(f.read(os.path.getsize(path) // 2))
+        stale = self.run_engine(PROMPT, 6, SMALL_CACHE, self.snap_with("experts-cut", cut))
+        self.assert_ran(stale, True)
+        self.assertIn("; reading the checkpoint instead (rebuild it with qwen36-canonical --experts)", stale["stderr"])
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(stale[key], base[key], key)
+        for named in (cut, os.path.join(self.dir, "experts-missing.qc")):
+            stop = self.run_engine(PROMPT, 6, SMALL_CACHE, {"QWEN36_EXPERTS_QC": named})
+            self.assertNotEqual(stop["code"], 0)
+            self.assertIn(f"[qwen-experts] {'' if named == cut else 'QWEN36_EXPERTS_QC='}{named}: ", stop["stderr"])
+            self.assertEqual(len(stop["logits"]), 0)
 
     def test_serve_resumes_from_the_copy(self):
         """A second chat turn starts from the state where the first one's last

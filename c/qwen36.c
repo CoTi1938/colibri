@@ -102,6 +102,7 @@ static int qwen36_max_ctx(void) {
 #endif
 #ifdef QWEN36_METAL_GRAPH
 #include "qwen36_gpu.h"
+#include "qwen36_expert_source.h" /* optional experts.qc: checkpoint stamp and fixed planar records */
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #endif
@@ -1203,6 +1204,7 @@ typedef struct {
     QW lm_head;
     QdfFile dense_file;        /* canonical.qc while the model loads; the Metal graph keeps it */
 #ifdef QWEN36_METAL_GRAPH
+    QefFile expert_file;       /* experts.qc, when present: one pread into a Metal slot */
     QwenGlobalCache *global_cache; /* the Metal graph's experts (qwen36_global_cache.h) */
     Slot *global_slots;     /* its slot descriptors */
     size_t global_cache_budget;
@@ -3864,6 +3866,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 
 #ifdef QWEN36_METAL_GRAPH
 static int qwen_global_cache_init(Model *m);
+static void qwen_expert_file_open(Model *m, const char *snap);
 #endif
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
@@ -3885,6 +3888,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             if (sysctlbyname("hw.memsize", &ram, &len, NULL, 0) || !ram) ram = (uint64_t)8 << 30;
             m->global_cache_budget = (size_t)(ram / 16);
         }
+        qwen_expert_file_open(m, snap);
         if (!qwen_global_cache_init(m) || !qg_create(m)) exit(1);
         m->dense_load_s += now_s() - built;
     }
@@ -4021,6 +4025,25 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
     }
 }
 
+#ifdef QWEN36_METAL_GRAPH
+/* One experts.qc record straight into a Metal slot, which holds the weights
+ * and then the scales in the same order. */
+static int qwen_planar_record(Model *m, int layer, int eid, Slot *s, char *error, size_t cap) {
+    const QefHeader *h = &m->expert_file.h;
+    int contiguous = m->expert_file.opened && s->gpu && s->pw && s->pw == q36_tensor_data(s->gpu) &&
+        q36_tensor_bytes(s->gpu) >= qef_payload_bytes(h) &&
+        (const unsigned char *)s->gs == s->pw + (size_t)h->packed_bytes &&
+        s->us == s->gs + (size_t)(h->scale_count / 3) &&
+        s->ds == s->gs + (size_t)(2 * (h->scale_count / 3));
+    if (!contiguous) {
+        if (error && cap) snprintf(error, cap, "cache slot is not contiguous Metal storage");
+        return 0;
+    }
+    return qef_read(&m->expert_file, (uint32_t)layer, (uint32_t)eid,
+                    s->pw, q36_tensor_bytes(s->gpu), error, cap);
+}
+#endif
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     /* new bytes in the slot: the copy derived from the last ones (gq_slot_i8's int8,
      * gq_slot_file_rows' file rows, keyed by t8_eid) is stale. The CUDA tier's copy-mode
@@ -4069,6 +4092,17 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         s->is_int4 = 0;
         return;
     }
+#ifdef QWEN36_METAL_GRAPH
+    if (m->expert_file.opened) {
+        char error[320];
+        if (!qwen_planar_record(m, layer, eid, s, error, sizeof error)) {
+            fprintf(stderr, "[qwen-experts] %s\n", error);
+            exit(1);
+        }
+        s->is_int4 = 1;
+        return;
+    }
+#endif
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
@@ -4230,11 +4264,19 @@ static void *qwen_global_allocate(void *context, size_t index) {
     s->us = s->gs + gu; s->ds = s->gs + 2 * gu; s->eid = -1; s->is_int4 = 1;
     return s;
 }
-/* Ask the kernel to start reading an expert into the page cache (st_prefetch:
- * F_RDADVISE on macOS). Advisory only: the pread that follows returns the same bytes
+/* Ask the kernel to start reading an expert into the page cache (F_RDADVISE
+ * on macOS). Advisory only: the pread that follows returns the same bytes
  * whether or not the readahead has finished, but misses announced together
  * are read by the SSD in parallel instead of one pread at a time. */
 static void qwen_expert_advise(Model *m, int layer, int eid) {
+    if (m->expert_file.opened && layer >= 0 && eid >= 0 &&
+        (uint32_t)layer < m->expert_file.h.layers && (uint32_t)eid < m->expert_file.h.experts) {
+        const QefHeader *h = &m->expert_file.h;
+        uint64_t key = (uint64_t)(uint32_t)layer * h->experts + (uint32_t)eid;
+        uint64_t offset = h->data_offset + key * h->stride;
+        posix_fadvise(m->expert_file.fd, (off_t)offset, (off_t)h->record_bytes, POSIX_FADV_WILLNEED);
+        return;
+    }
     char nm[256], qsnm[256]; int la = m->active_of[layer];
     snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
     snprintf(qsnm, sizeof qsnm, "model.layers.%d.mlp.experts.%d.qs", la, eid);
@@ -4316,6 +4358,60 @@ static int qwen_global_cache_init(Model *m) {
     return 1;
 fail:
     free(m->global_cache); free(m->global_slots); m->global_cache = NULL; m->global_slots = NULL; return 0;
+}
+/* experts.qc beside the model, or the file QWEN36_EXPERTS_QC names; =0 reads
+ * the checkpoint. Only a cache: one beside the model that is stale (the
+ * checkpoint was copied, replaced or touched), damaged in its header or size,
+ * or unreadable is reported and the experts come from the checkpoint; one the
+ * variable names stops the start instead, as QWEN_DENSE_CACHE does. */
+static void qwen_expert_file_open(Model *m, const char *snap) {
+    char path[2048], error[2300]; struct stat info;
+    const char *named = getenv("QWEN36_EXPERTS_QC");
+    if (named && !strcmp(named, "0")) {
+        fprintf(stderr, "[qwen-experts] QWEN36_EXPERTS_QC=0: the experts are read from the checkpoint\n");
+        return;
+    }
+    if (named && !*named) named = NULL;
+    int length = named ? snprintf(path, sizeof path, "%s", named) : snprintf(path, sizeof path, "%s/experts.qc", snap);
+    if (length < 0 || (size_t)length >= sizeof path) {
+        if (named) { fprintf(stderr, "[qwen-experts] QWEN36_EXPERTS_QC: the path is too long\n"); exit(1); }
+        return;
+    }
+    if (stat(path, &info)) {
+        if (named) { fprintf(stderr, "[qwen-experts] QWEN36_EXPERTS_QC=%s: %s\n", path, strerror(errno)); exit(1); }
+        if (errno != ENOENT) fprintf(stderr, "[qwen-experts] %s: %s; reading the checkpoint instead\n", path, strerror(errno));
+        return;
+    }
+    QefGeometry geometry = {(uint32_t)m->c.n_layers, (uint32_t)m->c.n_experts,
+        (uint32_t)m->c.hidden, (uint32_t)m->c.inter, (uint32_t)m->c.expert_gs};
+    double started = now_s();
+    uint64_t fingerprint = qes_fingerprint(&m->S, &geometry, error, sizeof error);
+    if (fingerprint && qef_open(&m->expert_file, path, &geometry, fingerprint, error, sizeof error)) {
+        /* A record goes straight into a slot of the global cache
+         * (qwen_global_allocate): the weights, then the gate, up and down
+         * scales, a third each. Checked once here, so a file that does not fit
+         * the slots is not used, instead of stopping at the first read. */
+        const QefHeader *h = &m->expert_file.h;
+        uint64_t packed = (uint64_t)3 * m->c.hidden * m->c.inter / 2;
+        uint64_t gu = (uint64_t)scale_count_gu(&m->c), down = (uint64_t)scale_count_d(&m->c);
+        if (h->packed_bytes != packed || gu != down || h->scale_count != 2 * gu + down) {
+            qef_close(&m->expert_file);
+            snprintf(error, sizeof error, "its records do not fit the cache slots");
+        }
+    }
+    if (!m->expert_file.opened) {
+        if (named) {
+            fprintf(stderr, "[qwen-experts] %s: %s (QWEN36_EXPERTS_QC names it: rebuild it with qwen36-canonical "
+                            "--experts, or unset the variable)\n", path, error);
+            exit(1);
+        }
+        fprintf(stderr, "[qwen-experts] %s: %s; reading the checkpoint instead (rebuild it with qwen36-canonical --experts)\n",
+                path, error);
+        return;
+    }
+    fprintf(stderr, "[qwen-experts] %s: %llu planar records, %llu bytes each (scales %s); checkpoint metadata and shard samples checked in %.3f s\n",
+        path, (unsigned long long)m->expert_file.h.count, (unsigned long long)m->expert_file.h.record_bytes,
+        m->expert_file.h.layout == QEF_LAYOUT_CODES ? "as 16-bit codes" : "F32", now_s() - started);
 }
 #endif
 

@@ -115,6 +115,51 @@ chosen again right after, as averages that halve every 16 decode steps
 (`c/qwen36_cache_policy.h`), which prompts use. Both use the same
 expert-payload budget.
 
+An optional disk cache, `experts.qc` beside the model, stores the experts in
+the layout of those slots, each expert's weights and scales together, so a
+slot is filled by one read:
+
+```sh
+make -C c qwen36-canonical
+./c/qwen36-canonical --experts "$SNAP"   # writes $SNAP/experts.qc
+```
+
+It repacks the same INT4 values, without requantization. The scales that
+Colibri's converter (`c/tools/convert_qwen36.py`) writes from a BF16
+checkpoint are max|w| / 7 of a bfloat16 max|w| (1e-12 / 7 for an all-zero
+group): when every scale is one, the file stores that bfloat16 in 2 bytes and
+the reader divides it by 7 again into the same F32 bits (layout 2, checked
+over every scale before writing); otherwise it keeps the F32 scales (layout
+1). On the 40-layer, 256-expert model that is 17.1 GB of disk beside the 23 GB
+of the checkpoint (18.1 GB in layout 1), and 5.6% fewer bytes read per expert.
+It is a file beside the checkpoint rather than another container: the CPU
+engine and the adapters keep reading the checkpoint, and the file can be
+deleted or rebuilt without touching it. The conversion of the 35B model reads
+about 20 GB (the scales twice) and writes 17.1 GB; on an 8 GB M1 it took 23 s
+and 10 MB of memory, measured before the converter synced the file
+(`F_FULLFSYNC` on macOS) and handled signals. A rebuild needs 17.1 GB free
+while the old file is there.
+A conversion stopped by a signal removes its temporary; one killed with
+SIGKILL, or by a machine that stops, leaves `experts.qc.tmp.XXXXXX`, which can
+be deleted. The file gets the mode of a plain file under the umask.
+
+The RAM budget and the cache policy stay the same. `QWEN36_EXPERTS_QC=0`
+reads the checkpoint, to measure; `QWEN36_EXPERTS_QC=<path>` names a file kept
+elsewhere. At start the file's header and size are checked against the model
+and against a stamp of the checkpoint: the source tensor descriptors and, for
+each shard, its inode, size, modification and change times and two samples of
+its first expert tensor. The stamp leaves out the volume's device number,
+which macOS can change at a restart; any change to a shard's metadata (a
+`chmod` or an extended attribute too) makes the file stale. A file beside the
+model that is stale (for example after copying the checkpoint to another
+disk), or whose header or size does not match, is reported and ignored: the
+experts come from the checkpoint until it is rebuilt. One that
+`QWEN36_EXPERTS_QC` names stops the start instead. The records carry no
+checksum: damage inside a file of the right size is not detected, and a read
+error during a run stops the engine, as one in the checkpoint does. The
+converter writes a temporary file, syncs it to the disk (`F_FULLFSYNC` on
+macOS) and publishes it by rename.
+
 In serve mode (`SERVE=1`, what `coli chat` and the OpenAI server drive) chat
 clients resend the whole conversation at every turn. The forward keeps a copy
 of the DeltaNet state where the prompt's last turn opens, and a next request
@@ -136,6 +181,9 @@ prompt reuse.
 | `c/qwen36_layer_loader.h` | a prompt layer's experts, loaded by four reader threads |
 | `c/qwen36_expected_policy.h` | decode expert-reuse estimates for the cache |
 | `c/qwen36_dense_file.h` | the `canonical.qc` format: header, table, INT8 matrices |
+| `c/qwen36_expert_file.h` | the `experts.qc` format and checked record reads |
+| `c/qwen36_expert_source.h` | the checkpoint stamp `experts.qc` is checked against |
+| `c/qwen36_expert_convert.h` | the writer of `experts.qc` |
 
 Per layer, the trunk and the router run as one GPU batch. The CPU then reads
 which experts were chosen and sorts the tokens by expert (a row the router
