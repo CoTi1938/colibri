@@ -689,6 +689,9 @@ endif
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
 METAL_OBJ  =
+QWEN36_METAL_OBJ =
+QWEN36_GRAPH_CFLAGS =
+QWEN36_GRAPH_LDFLAGS =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
@@ -697,6 +700,9 @@ endif
 CFLAGS   += -DCOLI_METAL
 LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
+QWEN36_METAL_OBJ = qwen36_metal.o
+QWEN36_GRAPH_CFLAGS = -DQWEN36_METAL
+QWEN36_GRAPH_LDFLAGS = -framework Accelerate
 endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
@@ -1171,6 +1177,14 @@ tests/test_qwen36_kernels: tests/test_qwen36_kernels.c qwen36_gpu.h qwen36_cpu_m
 test-qwen36-kernels: tests/test_qwen36_kernels
 	./tests/test_qwen36_kernels
 
+# The Metal graph against the CPU engine on a fixture the test writes (no
+# model needed). Needs a METAL=1 build of qwen36; where the graph cannot run
+# (the Apple Paravirtual device) it checks that the CPU engine takes over.
+.PHONY: test-qwen36-graph
+test-qwen36-graph: qwen36$(EXE)
+	$(if $(filter 1,$(METAL)),,$(error test-qwen36-graph needs METAL=1))
+	QWEN36_GRAPH_ENGINE=./qwen36$(EXE) $(PYTHON) -m unittest -v tests.test_qwen36_graph
+
 # GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
 
 # primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block
@@ -1441,8 +1455,11 @@ qpack.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+# METAL=1 also builds the Qwen3.6 Metal graph (QWEN36_GRAPH_CFLAGS, qwen36_metal.o,
+# Accelerate for the CPU's share of a prompt): the forward pass on the GPU,
+# docs/qwen36-metal.md. Tests that include qwen36.c keep the CPU engine.
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(QWEN36_METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) $(QWEN36_GRAPH_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(QWEN36_METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
 # checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
