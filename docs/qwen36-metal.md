@@ -180,6 +180,7 @@ prompt reuse.
 | `c/qwen36_prefill_stream.h` | fast prompt layers: trunk windows, then the experts on the whole batch |
 | `c/qwen36_layer_loader.h` | a prompt layer's experts, loaded by four reader threads |
 | `c/qwen36_expected_policy.h` | decode expert-reuse estimates for the cache |
+| `c/qwen36_advice_schedule.h` | which guessed experts a decode step announces (the six likeliest), after the next trunk is submitted |
 | `c/qwen36_dense_file.h` | the `canonical.qc` format: header, table, INT8 matrices |
 | `c/qwen36_expert_file.h` | the `experts.qc` format and checked record reads |
 | `c/qwen36_expert_source.h` | the checkpoint stamp `experts.qc` is checked against |
@@ -192,9 +193,9 @@ slot's own expert at weight 0, with one line). A worker thread
 fetches the missing experts from disk, eight at a time and up to four at once;
 the first eight come while the GPU computes the shared expert. In generation the GPU also runs the
 next layer's router on this layer's residual: about four times in five it
-picks the experts the next layer will choose, and those not in the cache are
-announced to the SSD as soon as the next layer's trunk is submitted, so the
-system calls run while the GPU computes. Each expert is read once per batch
+picks the experts the next layer will choose, and of its six likeliest picks,
+those not in the cache are announced to the SSD as soon as the next layer's
+trunk is submitted, so the system calls run while the GPU computes. Each expert is read once per batch
 of tokens and computes every token that chose it. A last kernel adds up the
 experts of each token in the router's order, with the shared expert and the
 residual, so the result does not depend on how the experts were grouped, and

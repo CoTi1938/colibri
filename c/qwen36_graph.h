@@ -609,23 +609,17 @@ static void qg_advice_emit(void *context, int layer, const int *ids, int from, i
     qg_advise(context, layer, ids, from, to);
 }
 
-/* Decode: the top-k of the next layer's router run on this layer's residual
- * (qg_layer). The residual changes little from one layer to the next, so
- * about four in five of them are experts the next layer will choose; those
- * not in the cache are announced once the next layer's trunk is submitted,
- * and the SSD reads them while the GPU computes it. A wrong guess costs a
- * read, never a result. */
+/* Decode: the next layer's router run on this layer's residual (qg_layer).
+ * The residual changes little from one layer to the next, so its likeliest
+ * experts are mostly the ones the next layer will choose. Of the six
+ * likeliest (QG_AHEAD_GUESSES, qwen36_advice_schedule.h), those not in the
+ * cache are announced once the next layer's trunk is submitted, and the SSD
+ * reads them while the GPU computes it. A wrong guess costs a read, never a
+ * result; on the 35B model the seventh and eighth guesses were chosen 56% and
+ * 41% of the time on code (65% and 49% on prose), too seldom for their reads
+ * to pay on an 8 GB M1 (docs/experiments/qwen36-ahead-six-2026-10-06). */
 static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il) {
-    const float *l = q36_tensor_data(g->ahead_logits);
-    int K = m->c.topk, top[8], n = 0;
-    for (int e = 0; e < m->c.n_experts; e++) {
-        int i;
-        if (n < K) i = n++;
-        else if (l[e] > l[top[K - 1]]) i = K - 1;
-        else continue;
-        while (i > 0 && l[e] > l[top[i - 1]]) { top[i] = top[i - 1]; i--; }
-        top[i] = e;
-    }
+    int top[8], n = qas_top(q36_tensor_data(g->ahead_logits), m->c.n_experts, qas_ahead_guesses(m->c.topk), top);
     if (g->defer_decode_advice) {
         /* The next trunk overwrites ahead_logits. Save only the selected IDs
          * and emit them after that trunk and the current experts are submitted. */

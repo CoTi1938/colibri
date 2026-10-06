@@ -131,8 +131,26 @@ static void cancellation_and_failure(void) {
     REQUIRE(!qas_submit_advice(&q, submit, emit, 3, ids, 0, 8));
     REQUIRE(!q.emissions && q.in_flight); REQUIRE(!sync_queue(&q)); release_lease(&q);
 }
+/* The guesses a decode step announces: min(top-k, 6) of them, the likeliest
+ * first, a tie to the lower index. */
+static void guesses(void) {
+    float logits[256], tied[5] = {1, 3, 3, 2, 3};
+    int top[8];
+    for (int e = 0; e < 256; e++) logits[e] = (float)((e * 97) % 256);   /* each of 0..255 once */
+    REQUIRE(qas_ahead_guesses(8) == 6 && qas_ahead_guesses(6) == 6);
+    REQUIRE(qas_ahead_guesses(4) == 4 && qas_ahead_guesses(1) == 1);
+    REQUIRE(qas_top(logits, 256, qas_ahead_guesses(8), top) == 6);
+    for (int i = 0; i < 6; i++) REQUIRE(logits[top[i]] == 255 - i);
+    REQUIRE(qas_top(logits, 256, qas_ahead_guesses(4), top) == 4);
+    for (int i = 0; i < 4; i++) REQUIRE(logits[top[i]] == 255 - i);
+    REQUIRE(qas_top(logits, 256, 1, top) == 1 && logits[top[0]] == 255);
+    REQUIRE(qas_top(logits, 256, 9, top) == 8 && logits[top[7]] == 248);
+    REQUIRE(qas_top(logits, 256, 0, top) == 0);
+    REQUIRE(qas_top(logits, 3, 6, top) == 3 && top[0] == 2 && top[1] == 1 && top[2] == 0);
+    REQUIRE(qas_top(tied, 5, 3, top) == 3 && top[0] == 1 && top[1] == 2 && top[2] == 4);
+}
 int main(void) {
-    ordering_and_commits(); cancellation_and_failure();
-    puts("advice schedule: submit/advice/wait order, unchanged modeled command buffers, copied IDs, bounds and failed-submit cleanup passed");
+    ordering_and_commits(); cancellation_and_failure(); guesses();
+    puts("advice schedule: submit/advice/wait order, unchanged modeled command buffers, copied IDs, bounds, failed-submit cleanup and the announced guesses passed");
     return 0;
 }
