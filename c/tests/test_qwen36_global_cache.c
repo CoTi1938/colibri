@@ -191,6 +191,8 @@ static void protect_selected_hits(void) {
     QgcStats now=qgc_snapshot(&f.cache);
     CHECK(now.hits-old.hits==7 && now.misses-old.misses==1 && now.loads-old.loads==1,"selected-hit accounting changed");
     CHECK(!qgc_contains(&f.cache,7) && qgc_contains(&f.cache,8),"eligible unselected victim not replaced");
+    unsigned char present[12];qgc_present(&f.cache,0,12,present);    /* the same answers under one lock */
+    for(int i=0;i<12;i++)CHECK(present[i]==qgc_contains(&f.cache,i),"qgc_present and qgc_contains differ on key %d",i);
     CHECK(qgc_release_group(&f.cache,&lease),"mixed release");
     old=qgc_snapshot(&f.cache);REQUIRE(qgc_acquire(&f.cache,mixed,GROUP,NULL,&lease),"all-hit group refused");
     now=qgc_snapshot(&f.cache);CHECK(now.hits-old.hits==8 && now.loads==old.loads,"all selected hits not preserved");
@@ -501,6 +503,13 @@ static void expected_reuse_in_decode(void) {
     CHECK(q->probability[0]==chosen && q->probability[GROUP]==0.5*q->beta && q->probability[E]==0.5,
           "one group updates the estimates of its own layer only");
     int mixed[3]={0,E,2*E};qep_begin(q,mixed,3);CHECK(!q->group_active,"a mixed group is not a decode group");
+    /* Fast experts leave some of a token's top-k out: fewer experts of one layer are still a decode group. */
+    int fewer[3]={E+1,E+2,E+5};qep_begin(q,fewer,3);CHECK(q->group_active,"part of a layer's top-k is a decode group");
+    qep_end(q,1);
+    CHECK(q->probability[E+1]==chosen && q->probability[E+3]==0.5*q->beta,
+          "a smaller group updates the estimates of its layer");
+    int more[GROUP+1];for(int i=0;i<=GROUP;i++)more[i]=2*E+i;
+    qep_begin(q,more,GROUP+1);CHECK(!q->group_active,"more than top-k experts of a layer are not a decode group");
     qep_free(q);
 
     Fixture f;fixture_init(&f,24);                   /* 16 retained slots, 8 working */

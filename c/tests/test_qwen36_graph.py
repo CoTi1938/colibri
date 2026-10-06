@@ -422,6 +422,34 @@ class Qwen36GraphTest(unittest.TestCase):
         self.assert_ran(f, True)
         self.assert_close(x, f, 3e-4, "fast and exact graph, decode")
 
+    def test_fast_experts(self):
+        """QWEN36_FAST_EXPERTS=J, a whole number from 1 to top-k - 1 (top-k is 4 here): fast-mode
+        decode only, with a line, the same output in every run; other values and exact
+        mode change nothing, with a line."""
+        self.graph()
+        fast = {"QWEN36_FAST_EXPERTS": "2"}
+        base = self.run_engine(PROMPT, 6, SMALL_CACHE)
+        self.assert_ran(base, True)
+        for v in ("4", "-1", "x", "2x"):
+            run = self.run_engine(PROMPT, 6, SMALL_CACHE, {"QWEN36_FAST_EXPERTS": v})
+            self.assertIn(f"QWEN36_FAST_EXPERTS={v} ignored: J is a whole number from 1 to 3", run["stderr"])
+            self.assertEqual(run["logits"], base["logits"], v)
+        off = self.run_engine(PROMPT, 6, SMALL_CACHE, {"QWEN36_FAST_EXPERTS": "0"})
+        self.assertNotIn("QWEN36_FAST_EXPERTS", off["stderr"])
+        self.assertEqual(off["logits"], base["logits"])
+        a = self.run_engine(PROMPT, 6, SMALL_CACHE, fast)
+        b = self.run_engine(PROMPT, 6, SMALL_CACHE, fast)
+        self.assert_ran(a, True)
+        self.assertIn("QWEN36_FAST_EXPERTS=2: in decode a token uses its 2 likeliest routed experts", a["stderr"])
+        self.assertNotEqual(a["logits"], base["logits"])
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(a[key], b[key], key)
+        prompt_only = self.run_engine(PROMPT, 1, SMALL_CACHE, fast)
+        self.assertEqual(prompt_only["logits"], self.run_engine(PROMPT, 1, SMALL_CACHE)["logits"])
+        x = self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE, fast)
+        self.assertIn("QWEN36_FAST_EXPERTS=2 ignored: exact mode uses every chosen expert", x["stderr"])
+        self.assertEqual(x["logits"], self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE)["logits"])
+
     def test_cpu_share_matches_the_gpu(self):
         """The products the CPU's matrix unit takes in a fast prompt (DeltaNet's z,
         the gate half of q, the shared and routed experts; in the second batch of

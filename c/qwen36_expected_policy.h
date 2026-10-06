@@ -51,13 +51,14 @@ static QwenExpectedPolicy *qep_new(size_t keys,size_t layers,size_t experts,size
     }
     return p;
 }
-/* A decode group: the top-k of one layer. It is only noted here; the
+/* A decode group: the top-k of one layer, or fewer of its experts (fast
+ * experts, qwen36_fast_experts.h, leave some out). It is only noted here; the
  * estimates change when the whole group has been acquired (qep_end). Any
- * other group (prefill, or not one layer's top-k) keeps the frequency policy. */
+ * other group (prefill, or not one layer's choices) keeps the frequency policy. */
 static void qep_begin(QwenExpectedPolicy *p,const int *keys,unsigned n) {
     if (!p) return;
     p->group_active=0;
-    if (!p->decode || n!=p->topk || !n || keys[0]<0 || (size_t)keys[0]>=p->keys) return;
+    if (!p->decode || n>p->topk || !n || keys[0]<0 || (size_t)keys[0]>=p->keys) return;
     size_t layer=(size_t)keys[0]/p->experts;
     memset(p->current_selected,0,p->experts);
     for (unsigned i=0;i<n;i++) {

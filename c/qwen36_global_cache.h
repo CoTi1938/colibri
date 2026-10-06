@@ -382,6 +382,15 @@ static int qgc_contains(QwenGlobalCache *c,int key) {
     pthread_mutex_lock(&c->mutex);int i=c->index[key];int yes=i>=0 && c->entries[i].state==QGC_READY;
     pthread_mutex_unlock(&c->mutex);return yes;
 }
+/* qgc_contains for keys [first, first + n) under one lock: out[k] = 1 when ready. */
+static void qgc_present(QwenGlobalCache *c,int first,int n,unsigned char *out) {
+    pthread_mutex_lock(&c->mutex);
+    for(int k=0;k<n;k++){
+        int key=first+k,i=key>=0 && (size_t)key<c->key_count?c->index[key]:-1;
+        out[k]=(unsigned char)(i>=0 && c->entries[i].state==QGC_READY);
+    }
+    pthread_mutex_unlock(&c->mutex);
+}
 /* Presence/debug metadata only. The stable descriptor is NOT a read lease. */
 static void *qgc_peek(QwenGlobalCache *c,int key) {
     if(key<0 || (size_t)key>=c->key_count)return NULL;

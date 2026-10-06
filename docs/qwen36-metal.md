@@ -108,12 +108,35 @@ the serve-mode copy). Memory a forward does not use goes back to the system,
 whose file cache then keeps more experts.
 
 In decode the Metal graph keeps the experts whose next use is expected
-soonest: for each expert it tracks how often it is chosen and how often it is
-chosen again right after, as averages that halve every 16 decode steps
+soonest: for each expert it tracks how often it is used and how often it is
+used again right after, as averages that halve every 16 decode steps
 (`c/qwen36_expected_policy.h`). The prompt does not train these estimates.
 `QWEN36_CACHE_EXPECTED=0` keeps the global cache's frequency policy
 (`c/qwen36_cache_policy.h`), which prompts use. Both use the same
 expert-payload budget.
+
+In fast mode `QWEN36_FAST_EXPERTS=J` reads fewer experts from the disk in
+decode (every one-token forward after the first position), at a cost in
+quality: a token uses its J likeliest routed experts, and the rest of its top-8
+only when the expert cache already holds them
+(`c/qwen36_fast_experts.h`). A left-out choice costs no read and no cache
+slot: it points at the heaviest expert with weight 0, whose FFN runs once more
+for it. The kept weights stay as the router computed them, divided by the
+probability mass of the whole top-8, so a left-out expert's share is simply
+missing; renormalizing over the kept experts would raise their gain above what
+the model was trained with (arXiv 2609.04575 studies this on Qwen3.6-35B-A3B).
+Unlike `CACHE_ROUTE` of the CPU engine ([CACHE_ROUTE.md](CACHE_ROUTE.md)),
+nothing is substituted. Which experts are left out depends on what the cache
+holds (the RAM, `QWEN_EXPERT_CACHE_BYTES`, the requests before), and so does
+the output. Unset or 0, the default, and in exact mode every chosen expert is
+used; a value that is not a whole number from 1 to top-k − 1 is refused with a
+line, and a line says when the option is on. The speed and the quality on an
+8 GB M1 are in
+[the experiment's record](experiments/qwen36-fast-experts-2026-10-06/README.md).
+The quality there is the likelihood of three texts, which the same paper finds
+can rank such settings wrongly on this model: with 6 of 8 experts and the
+weights divided by the top-8 mass, as here, its 5-shot MMLU lost 1.10 points
+(p = 0.021). No downstream task was measured.
 
 An optional disk cache, `experts.qc` beside the model, stores the experts in
 the layout of those slots, each expert's weights and scales together, so a
@@ -181,6 +204,7 @@ prompt reuse.
 | `c/qwen36_layer_loader.h` | a prompt layer's experts, loaded by four reader threads |
 | `c/qwen36_expected_policy.h` | decode expert-reuse estimates for the cache |
 | `c/qwen36_advice_schedule.h` | which guessed experts a decode step announces (the six likeliest), after the next trunk is submitted |
+| `c/qwen36_fast_experts.h` | fast experts: which of a token's routed choices a decode step keeps |
 | `c/qwen36_dense_file.h` | the `canonical.qc` format: header, table, INT8 matrices |
 | `c/qwen36_expert_file.h` | the `experts.qc` format and checked record reads |
 | `c/qwen36_expert_source.h` | the checkpoint stamp `experts.qc` is checked against |
@@ -193,7 +217,8 @@ slot's own expert at weight 0, with one line). A worker thread
 fetches the missing experts from disk, eight at a time and up to four at once;
 the first eight come while the GPU computes the shared expert. In generation the GPU also runs the
 next layer's router on this layer's residual: about four times in five it
-picks the experts the next layer will choose, and of its six likeliest picks,
+picks the experts the next layer will choose, and of its six likeliest picks
+(its J likeliest with `QWEN36_FAST_EXPERTS=J` below six),
 those not in the cache are announced to the SSD as soon as the next layer's
 trunk is submitted, so the system calls run while the GPU computes. Each expert is read once per batch
 of tokens and computes every token that chose it. A last kernel adds up the

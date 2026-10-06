@@ -25,6 +25,7 @@
 #include "qwen36_layer_loader.h"
 #include "qwen36_advice_schedule.h"
 #include "qwen36_cpu_mm.h"
+#include "qwen36_fast_experts.h"
 
 typedef struct { q36_tensor *q, *sc; int in, out; } QgDense;
 
@@ -86,6 +87,7 @@ struct Qwen36Graph {
 };
 
 static void qg_settle(Model *, Qwen36Graph *, int);
+static int qg_fast_experts(int topk);
 
 static q36_tensor *qg_upload(const float *data, size_t count) {
     return data ? q36_tensor_upload(data, count * sizeof(float)) : NULL;
@@ -448,6 +450,7 @@ static int qg_create(Model *m) {
                     "global cache, not in the per-layer one\n",
             q36_gpu_device_name(), qg_prompt_rows(), g->map ? "mapped" : "copied", g->kv_bytes == 2 ? "half" : "float",
             g->map_bytes);
+    qg_fast_experts(c->topk);                   /* its line, if QWEN36_FAST_EXPERTS is set */
     return 1;
 failed:
     fprintf(stderr, "[qwen36-metal] cannot build the Metal graph (weights or GPU memory)\n");
@@ -609,6 +612,32 @@ static void qg_advice_emit(void *context, int layer, const int *ids, int from, i
     qg_advise(context, layer, ids, from, to);
 }
 
+/* Fast mode, decode: QWEN36_FAST_EXPERTS=J reads a token's J likeliest experts
+ * and uses the rest of its top-k only when the expert cache holds them
+ * (qwen36_fast_experts.h), with one line at start. Unset or 0, the default, and
+ * exact mode use all of them; a value that is not a whole number from 1 to
+ * top-k - 1 is refused with a line. */
+static int qg_fast_experts(int topk) {
+    static int j = -1;
+    if (j < 0) {
+        const char *v = getenv("QWEN36_FAST_EXPERTS");
+        char *end = NULL;
+        long n = v && *v ? strtol(v, &end, 10) : 0;
+        j = 0;
+        if (v && *v && (*end || n < 0 || n >= topk))
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_EXPERTS=%s ignored: J is a whole number from 1 to %d\n", v,
+                    topk - 1);
+        else if (n > 0 && q36_gpu_is_exact())
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_EXPERTS=%ld ignored: exact mode uses every chosen expert\n", n);
+        else if (n > 0) {
+            j = (int)n;
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_EXPERTS=%d: in decode a token uses its %d likeliest routed "
+                            "experts, the rest of its top-%d only when the expert cache holds them\n", j, j, topk);
+        }
+    }
+    return j;
+}
+
 /* Decode: the next layer's router run on this layer's residual (qg_layer).
  * The residual changes little from one layer to the next, so its likeliest
  * experts are mostly the ones the next layer will choose. Of the six
@@ -619,7 +648,10 @@ static void qg_advice_emit(void *context, int layer, const int *ids, int from, i
  * 41% of the time on code (65% and 49% on prose), too seldom for their reads
  * to pay on an 8 GB M1 (docs/experiments/qwen36-ahead-six-2026-10-06). */
 static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il) {
-    int top[8], n = qas_top(q36_tensor_data(g->ahead_logits), m->c.n_experts, qas_ahead_guesses(m->c.topk), top);
+    int K = qas_ahead_guesses(m->c.topk), top[8], n;
+    /* with fast experts the others are used only when the cache holds them: nothing to announce */
+    if (qg_fast_experts(m->c.topk) && K > qg_fast_experts(m->c.topk)) K = qg_fast_experts(m->c.topk);
+    n = qas_top(q36_tensor_data(g->ahead_logits), m->c.n_experts, K, top);
     if (g->defer_decode_advice) {
         /* The next trunk overwrites ahead_logits. Save only the selected IDs
          * and emit them after that trunk and the current experts are submitted. */
@@ -711,7 +743,12 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
     Cfg *c = &m->c;
     QgLayer *L = &g->L[il];
     int H = c->hidden, K = c->topk, E = c->n_experts, n = rows * K;
-    qg_route_degrade(m, g, il, 0, rows);
+    qg_route_degrade(m, g, il, 0, rows);   /* first: qfe_keep indexes by the ids */
+    if (g->defer_decode_advice && rows == 1 && qg_fast_experts(K) && E <= 256) {
+        unsigned char present[256];
+        qgc_present(m->global_cache, il * E, E, present);
+        qfe_keep(q36_tensor_data(g->ids), q36_tensor_data(g->weights), K, qg_fast_experts(K), present);
+    }
     const int32_t *ids = q36_tensor_data(g->ids);
     uint32_t *pairs = q36_tensor_data(g->pairs);
     int first[257] = {0}, fill[256], experts[256], ne = 0, keys[8];
@@ -742,19 +779,23 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
         q36_tensor *gpu[8] = {0};
         /* Decode: the experts the cache already holds are computed while the
          * misses read, in a GPU batch of their own; the misses' pairs follow
-         * theirs. Each choice is computed alone and expert_sum adds them in
-         * the router's order: the same bits in any order. */
-        if (ok && rows == 1 && ng == ne && b - a == ng) {
+         * theirs. An expert's pairs stay together: with fast experts a
+         * left-out choice is another pair of the heaviest expert. Each choice
+         * is computed alone and expert_sum adds them in the router's order:
+         * the same bits in any order. */
+        if (ok && rows == 1 && ng == ne) {
             Slot *hit[8] = {0};
             unsigned held = qsl_wait_hits(&g->loader, (void **)hit);
             if (held > 0 && held < (unsigned)ng) {
                 uint32_t order[8];
                 int o = 0;
-                for (int j = 0; j < ng; j++) if (hit[j]) order[o++] = pairs[a + j];
-                for (int j = 0; j < ng; j++) if (!hit[j]) order[o++] = pairs[a + j];
-                memcpy(pairs + a, order, (size_t)ng * sizeof(uint32_t));
+                for (int j = 0; j < ng; j++)
+                    if (hit[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
+                done = o;
+                for (int j = 0; j < ng; j++)
+                    if (!hit[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
+                memcpy(pairs + a, order, (size_t)o * sizeof(uint32_t));
                 for (int j = 0; j < ng; j++) gpu[j] = hit[j] ? hit[j]->gpu : NULL;
-                done = (int)held;
                 ok = q36_expert_gate_up(g->eh, g->post, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
                      q36_expert_down(g->ey, g->eh, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
                      q36_gpu_flush();

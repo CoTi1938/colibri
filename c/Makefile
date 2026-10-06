@@ -3023,6 +3023,10 @@ tests/test_qwen36_layer_loader$(EXE): tests/test_qwen36_layer_loader.c
 tests/test_qwen36_advice_schedule$(EXE): tests/test_qwen36_advice_schedule.c
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+# The Metal graph's fast experts without a model: which choices of a token stay.
+tests/test_qwen36_fast_experts$(EXE): tests/test_qwen36_fast_experts.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 # experts.qc without a model: the record format and its checked reads, and the
 # writer (qwen36-canonical --experts) against the checkpoint it repacks.
 tests/test_qwen36_expert_file$(EXE): tests/test_qwen36_expert_file.c
