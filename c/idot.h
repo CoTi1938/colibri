@@ -559,6 +559,13 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
             for(int r=0;r<n;r++) y[(int64_t)(s0+r)*O+o]=(float)d[r]*sc*sx[s0+r];
         } }
 }
+/* matmul_q_idot for one activation row (S = 1) and only the rows ids[0..n) of q: y[j] is
+ * the output of row ids[j]. */
+static void matmul_q_idot_rows(float *y, const int8_t *xq, float sx, const int8_t *q,
+                               const float *scale, const int *ids, int n, int I){
+    #pragma omp parallel for schedule(static)
+    for(int j=0;j<n;j++) y[j]=(float)dot_i8i8(q+(int64_t)ids[j]*I,xq,I)*scale[ids[j]]*sx;
+}
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
