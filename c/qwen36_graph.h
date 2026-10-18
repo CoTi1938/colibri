@@ -1183,7 +1183,7 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
     int H = c->hidden;
     q36_shape s = {rows, H, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
                    c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap,
-                   snap};
+                   snap, 0, 0};
     int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, H, c->eps, 0), width;
     const QgDense *wo;
     if (c->is_attn[il]) {
@@ -1260,7 +1260,8 @@ static int qg_trunk_kv(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, i
     Cfg *c = &m->c;
     QgLayer *L = &g->L[il];
     q36_shape s = {rows, c->hidden, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
-                   c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap, 0};
+                   c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap, 0,
+                   0, 0};
     int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, c->hidden, c->eps, 0) &&
              qg_mm(t->p1, t->normal, &L->k, rows) && qg_mm(t->p2, t->normal, &L->v, rows);
     if (ok && L->kn) ok = q36_rmsnorm(t->p1, t->p1, L->kn, rows * c->kv_heads, c->head_dim, c->eps, 0);

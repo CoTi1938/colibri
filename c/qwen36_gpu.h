@@ -80,6 +80,9 @@ typedef struct {
     int v_heads, k_heads, k_dim, v_dim, conv_kernel, conv_dim; /* DeltaNet */
     int pos, cap;               /* first position of the batch, KV capacity */
     int snap;                   /* DeltaNet: copy the state after this many rows (0: none) */
+    /* DeltaNet as llama.cpp's GGUF files store it: value head h reads key head h % k_heads,
+     * not h / (v_heads / k_heads) (tiled), and the A_log weights hold A = -exp(A_log) (a_direct) */
+    int tiled, a_direct;
 } q36_shape;
 
 /* Dense trunk. plain=0: Qwen gamma (1+w); plain=1: w. */
@@ -170,6 +173,33 @@ int q36_expert_down(q36_tensor *y, q36_tensor *h, q36_tensor *pairs, int first, 
                     q36_tensor *const slots[8], int rows, int hidden, int inter, int topk, size_t scales);
 int q36_expert_sum(q36_tensor *out, q36_tensor *y, q36_tensor *weights, q36_tensor *shared,
                    q36_tensor *residual, int rows, int hidden, int topk);
+
+/* GGUF matrices: the file's ggml blocks, read as they are (no second quantization). Rows of
+ * Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL or IQ4_XS blocks (ggml_quants.h's type ids); the bytes of a row
+ * of n weights, 0 for another type or a partial block. */
+uint64_t q36_gq_row_bytes(int type, int n);
+/* y[r][o] = scale * sum_i w[o][i] * x[r][i], w out rows of `in` weights (scale: an ".scale"
+ * companion, else 1). Exact mode: a thread per output with the CPU's exact-mode sums
+ * (gq_matmul_f32: each product rounded, added in input order), so its bits. Fast mode: a SIMD
+ * group per output up to 8 rows (a row's bits do not depend on the batch), the matrix units
+ * for more. 0, with nothing encoded, for a type or shape it does not take. */
+int q36_dot_gq(q36_tensor *y, q36_tensor *x, q36_tensor *w, int type, float scale, int rows, int in, int out);
+/* The decoded weights of `rows` rows, gq_dequant_row's bits (the decoders' test). */
+int q36_gq_dequant(q36_tensor *y, q36_tensor *w, int type, int rows, int in);
+/* y[r][o] = sum_i w[o][i] * x[r][i] for a float matrix (a GGUF's F32 router), with the CPU's
+ * arithmetic (matmul_f32.h's dot_f32_lanes) in both modes. */
+int q36_dot_f32(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, int out);
+/* A GGUF layer's routed experts, bound and paired as for q36_expert_gate_up and q36_expert_down. A
+ * slot holds gate (inter rows of hidden), up (the same) and down (hidden rows of inter) as the
+ * file's rows, of the types of the layer's three tensors; sg, su and sd are the slots' ".scale"
+ * factors (1 without), by slot. The CPU's exact-mode sums in both modes. */
+typedef struct { int gate, up, down; float sg[8], su[8], sd[8]; } q36_gq_experts;
+int q36_expert_gate_up_gq(q36_tensor *h, q36_tensor *x, q36_tensor *pairs, int first, int n,
+                          q36_tensor *const slots[8], int rows, int hidden, int inter, int topk,
+                          const q36_gq_experts *t);
+int q36_expert_down_gq(q36_tensor *y, q36_tensor *h, q36_tensor *pairs, int first, int n,
+                       q36_tensor *const slots[8], int rows, int hidden, int inter, int topk,
+                       const q36_gq_experts *t);
 
 #ifdef __cplusplus
 }

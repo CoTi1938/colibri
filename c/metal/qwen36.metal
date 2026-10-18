@@ -25,6 +25,8 @@ struct q36_state_args {
     uint vh, kh, kd, vd, convk, convd, pos, cap;
     uint snap;      // DeltaNet: copy the state after this row into the snapshot (~0u: no copy)
     uint low;       // DeltaNet: the state has its low plane (exact mode); fast kernels skip it otherwise
+    uint tiled;     // DeltaNet: value head h reads key head h % kh (a GGUF's tiled heads), else h / (vh / kh)
+    uint adirect;   // DeltaNet: alog holds A itself (a GGUF's ssm_a = -exp(A_log)), else A_log
 };
 struct q36_router_args { uint rows, H, E, K, G, T, shared_gate; };
 struct q36_expert_args { uint H, I, K, rows, first, n; ulong scales; };
@@ -408,7 +410,7 @@ kernel void q36_dn_aux(device const float *x [[buffer(0)]],
     av = simd_sum(av);
     bv = simd_sum(bv);
     if (lane == 0) {
-        float ea = exp(alog[h]), sp = q36_softplus(av + dt[h]), gg = -ea * sp;
+        float ea = p.adirect ? -alog[h] : exp(alog[h]), sp = q36_softplus(av + dt[h]), gg = -ea * sp;
         decay[z] = exp(gg);
         beta[z] = q36_sigmoid(bv);
     }
@@ -445,7 +447,7 @@ kernel void q36_dn_aux4(device const float *x [[buffer(0)]],
     float av[4] = {simd_sum(a0), simd_sum(a1), simd_sum(a2), simd_sum(a3)};
     float bv[4] = {simd_sum(b0), simd_sum(b1), simd_sum(b2), simd_sum(b3)};
     if (lane != 0) return;
-    float ea = exp(alog[h]);
+    float ea = p.adirect ? -alog[h] : exp(alog[h]);
     for (uint k = 0; k < 4 && r0 + k < p.rows; k++) {
         float sp = q36_softplus(av[k] + dt[h]), gg = -ea * sp;
         decay[(r0 + k) * p.vh + h] = exp(gg);
@@ -539,6 +541,10 @@ inline float2 q36_dd_mul(float2 a, float b) {
     return q36_two_sum(p, fma(a.x, b, -p) + a.y * b);
 }
 
+// The key head a value head reads: h / (vh / kh), the checkpoint's grouping, or h % kh where the
+// heads are tiled (q36_state_args.tiled: a GGUF stores its value heads so).
+inline uint q36_dn_kh(uint h, uint vh, uint kh, uint tiled) { return tiled ? h % kh : h / (vh / kh); }
+
 // The delta rule, one token after the other. A group owns 32 value columns of
 // one head; each lane keeps its column of both planes (kdim <= 128) in private
 // memory. In threadgroup memory the slice took the whole 32 KiB, so one group
@@ -556,7 +562,7 @@ kernel void q36_dn_delta(device const float *qk [[buffer(0)]],
     uint v = group.x * 32 + lane, h = group.y;
     if (h >= p.vh || v >= p.vd) return;
     thread float tile[128], low[128];           // the lane's column, both planes (see below)
-    uint kh = h / (p.vh / p.kh);
+    uint kh = q36_dn_kh(h, p.vh, p.kh, p.tiled);
     ulong cells = ulong(p.vh) * p.kd * p.vd;
     for (uint k = 0; k < p.kd; k++) {
         ulong off = (ulong(h) * p.kd + k) * p.vd + v;
@@ -615,7 +621,7 @@ kernel void q36_dn_delta_row(device const float *qk [[buffer(0)]],
                              ushort lane [[thread_index_in_simdgroup]]) {
     uint v = group.x * 32 + lane, h = group.y;
     if (h >= p.vh || v >= p.vd) return;
-    uint kh = h / (p.vh / p.kh);
+    uint kh = q36_dn_kh(h, p.vh, p.kh, p.tiled);
     ulong cells = ulong(p.vh) * p.kd * p.vd, qbase = kh * p.kd, kbase = qbase + p.kh * p.kd;
     float decay = g[h];
     float2 u = 0;
@@ -658,7 +664,7 @@ kernel void q36_dn_scan(device const float *qk [[buffer(0)]],
                         ushort lane [[thread_index_in_simdgroup]]) {
     uint v0 = (group.x * 4 + sg) * 4, h = group.y;
     if (h >= p.vh || v0 >= p.vd) return;
-    uint n = p.kd / 32, k0 = lane * n, kh = h / (p.vh / p.kh);
+    uint n = p.kd / 32, k0 = lane * n, kh = q36_dn_kh(h, p.vh, p.kh, p.tiled);
     ulong cells = ulong(p.vh) * p.kd * p.vd;
     float4 s[4];                                // s[i]: key k0 + i, columns v0..v0+3
     for (uint i = 0; i < n; i++) {
@@ -742,7 +748,7 @@ kernel void q36_dn_chunk_gram(device const float *qk [[buffer(0)]],
                               ushort tid [[thread_index_in_threadgroup]],
                               ushort sg [[simdgroup_index_in_threadgroup]]) {
     const uint c = tg.x, h = tg.y, first = a.first[c], n = a.n[c];
-    const uint kh = h / (a.s.vh / a.s.kh), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
+    const uint kh = q36_dn_kh(h, a.s.vh, a.s.kh, a.s.tiled), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
     device float *w = scratch + (ulong(c) * vh + h) * Q36_DNC_STRIDE;
     threadgroup float *g = shared, *bt = shared + 32, *ks = shared + 64, *qs = ks + 1024;
     if (tid < 32) {
@@ -848,7 +854,7 @@ kernel void q36_dn_chunk_uw(device const float *qk [[buffer(0)]],
                             ushort sg [[simdgroup_index_in_threadgroup]],
                             ushort lane [[thread_index_in_simdgroup]]) {
     const uint c = tg.x, h = tg.y, pass = tg.z, first = a.first[c], n = a.n[c];
-    const uint kh = h / (a.s.vh / a.s.kh), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
+    const uint kh = q36_dn_kh(h, a.s.vh, a.s.kh, a.s.tiled), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
     device float *w = scratch + (ulong(c) * vh + h) * Q36_DNC_STRIDE;
     const ushort2 pl = q36_lane_place(lane);
     const ushort sn = pl.x, sm = pl.y;
@@ -903,7 +909,7 @@ kernel void q36_dn_chunk_step(device const float *qk [[buffer(0)]],
                               ushort sg [[simdgroup_index_in_threadgroup]],
                               ushort lane [[thread_index_in_simdgroup]]) {
     const uint c = a.chunk, h = tg.y, c0 = tg.x * 32, first = a.first[c], n = a.n[c];
-    const uint kh = h / (a.s.vh / a.s.kh), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
+    const uint kh = q36_dn_kh(h, a.s.vh, a.s.kh, a.s.tiled), convd = a.s.convd, vh = a.s.vh, nkh = a.s.kh;
     device const float *w = scratch + (ulong(c) * vh + h) * Q36_DNC_STRIDE;
     device float *s0 = state + ulong(h) * 128 * 128;
     const ulong cells = ulong(vh) * 128 * 128;
@@ -2686,4 +2692,294 @@ kernel void q36_attn_gqa_reduce(device const float *s [[buffer(0)]],
     float sum = 0;
     for (uint k = 0; k < parts; k++) sum += part[ulong(k) * width];
     out[i] = sum;
+}
+
+// ---------------------------------------------------------------------------
+// GGUF matrices: ggml blocks as the file holds them, decoded where they are
+// read (no second quantization). A row is a run of blocks of one type; a step
+// is 32 weights of a row (a block of Q8_0 and IQ4_NL, an eighth of the others).
+// The decoders are ggml_quants.h's float decoders, operation for operation and
+// uncontracted, so they give gq_dequant_row's bits. The value tables sit in one
+// buffer in shaders/blockdec_table.h's layout (q36_gpu_init fills it as the
+// Vulkan backend does, from ggml_grids.h).
+// ---------------------------------------------------------------------------
+
+// ggml_quants.h's type ids
+constant uint Q36_GQ_Q8_0 = 8, Q36_GQ_Q4_K = 12, Q36_GQ_Q5_K = 13, Q36_GQ_Q6_K = 14, Q36_GQ_IQ4_NL = 20,
+              Q36_GQ_IQ4_XS = 23;
+constant uint Q36_BDT_IQ4NL = 214;  // blockdec_table.h's BDT_IQ4NL: kvalues_iq4nl, as int
+
+struct q36_gq_args { uint rows, in, out, type, row_bytes; float scale; };
+
+inline float4 q36_gq_kv4(device const int *tab, uint4 i, float d) {
+    return d * float4(tab[Q36_BDT_IQ4NL + i.x], tab[Q36_BDT_IQ4NL + i.y], tab[Q36_BDT_IQ4NL + i.z],
+                      tab[Q36_BDT_IQ4NL + i.w]);
+}
+
+inline uint4 q36_gq_bytes4(device const uchar *p) { return uint4(uchar4(*(device const packed_uchar4 *)p)); }
+
+// Step q of the row at r, of ggml type t: w[k] = weights 32q + 4k .. 32q + 4k + 3.
+inline void q36_gq_step(uint t, device const uchar *r, uint q, device const int *tab, thread float4 *w) {
+#pragma clang fp contract(off)
+    if (t == Q36_GQ_Q8_0) {             // d, then 32 int8
+        device const uchar *b = r + 34 * ulong(q);
+        float d = float(*(device const half *)b);
+        for (uint k = 0; k < 8; k++) w[k] = float4(char4(*(device const packed_char4 *)(b + 2 + 4 * k))) * d;
+        return;
+    }
+    if (t == Q36_GQ_Q4_K || t == Q36_GQ_Q5_K) {
+        // d, dmin, 12 bytes of 6-bit scales and mins (gq_scale_min_k4), Q5_K's high bits (32
+        // bytes: bit g of byte j for weight j of group g), then the nibbles, 32 bytes for each
+        // pair of groups (the low nibbles the first group, the high the second)
+        uint g = q & 7;
+        device const uchar *b = r + (t == Q36_GQ_Q4_K ? 144 : 176) * ulong(q >> 3), *s = b + 4;
+        float d = float(*(device const half *)b), dmin = float(*(device const half *)(b + 2));
+        uint sc = g < 4 ? s[g] & 63 : (s[g + 4] & 15) | ((s[g - 4] >> 2) & 0x30);
+        uint mn = g < 4 ? s[g + 4] & 63 : (s[g + 4] >> 4) | ((s[g] >> 2) & 0x30);
+        float d1 = d * float(sc), m1 = dmin * float(mn);
+        device const uchar *qs = b + (t == Q36_GQ_Q4_K ? 16 : 48) + 32 * (g >> 1);
+        uint sh = 4 * (g & 1);
+        for (uint k = 0; k < 8; k++) {
+            uint4 v = (q36_gq_bytes4(qs + 4 * k) >> sh) & 15u;
+            if (t == Q36_GQ_Q5_K) v |= ((q36_gq_bytes4(b + 16 + 4 * k) >> g) & 1u) << 4;
+            w[k] = d1 * float4(v) - m1;
+        }
+        return;
+    }
+    if (t == Q36_GQ_Q6_K) {
+        // ql (128 bytes), qh (64), 16 int8 scales, d. Step j of the block is half n = j / 4 of
+        // it, run m = j % 4 of that half: the low (m < 2) or high nibbles of ql[64n + 32(m % 2)
+        // ..], bits 2m of qh[32n ..], scales 2j and 2j + 1 (16 weights each)
+        uint j = q & 7, n = j >> 2, m = j & 3;
+        device const uchar *b = r + 210 * ulong(q >> 3), *ql = b + 64 * n + 32 * (m & 1), *qh = b + 128 + 32 * n;
+        device const char *sc = (device const char *)(b + 192 + 2 * j);
+        float d = float(*(device const half *)(b + 208)), s0 = d * float(sc[0]), s1 = d * float(sc[1]);
+        uint sh = 4 * (m >> 1), hs = 2 * m;
+        for (uint k = 0; k < 8; k++) {
+            uint4 v = ((q36_gq_bytes4(ql + 4 * k) >> sh) & 15u) | (((q36_gq_bytes4(qh + 4 * k) >> hs) & 3u) << 4);
+            w[k] = (k < 4 ? s0 : s1) * float4(int4(v) - 32);
+        }
+        return;
+    }
+    // IQ4_NL: d, then 16 bytes, the low nibbles weights 0..15, the high 16..31. IQ4_XS: d, the
+    // scales' high bits (2 a step), their low nibbles (4 bytes), then 16 bytes a step as IQ4_NL's,
+    // with a 6-bit scale each.
+    device const uchar *qs;
+    float d;
+    if (t == Q36_GQ_IQ4_NL) {
+        device const uchar *b = r + 18 * ulong(q);
+        d = float(*(device const half *)b);
+        qs = b + 2;
+    } else {
+        uint ib = q & 7;
+        device const uchar *b = r + 136 * ulong(q >> 3);
+        uint shi = *(device const ushort *)(b + 2);
+        int ls = int(((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | (((shi >> (2 * ib)) & 3) << 4));
+        d = float(*(device const half *)b) * float(ls - 32);
+        qs = b + 8 + 16 * ib;
+    }
+    for (uint k = 0; k < 4; k++) {
+        uint4 v = q36_gq_bytes4(qs + 4 * k);
+        w[k] = q36_gq_kv4(tab, v & 15u, d);
+        w[k + 4] = q36_gq_kv4(tab, v >> 4, d);
+    }
+}
+
+// A row's dot product as the CPU's exact mode computes it (gq_matmul_f32: the decoded row times x,
+// each product rounded, added in input order).
+inline float q36_gq_row_dot(uint t, device const uchar *r, device const float *x, uint in, device const int *tab) {
+#pragma clang fp contract(off)
+    float acc = 0;
+    for (uint q = 0; q < in / 32; q++) {
+        float4 w[8];
+        q36_gq_step(t, r, q, tab, w);
+        for (uint k = 0; k < 8; k++) acc = q36_ordered4(acc, q36_load4(x + 32 * q + 4 * k), w[k]);
+    }
+    return acc;
+}
+
+// y[row][i] = the decoded weights of a matrix of `rows` rows (the decoders' test). One thread a step.
+kernel void q36_gq_dequant(device const uchar *w [[buffer(0)]],
+                           device const int *tab [[buffer(1)]],
+                           device float *y [[buffer(2)]],
+                           constant q36_gq_args &p [[buffer(3)]],
+                           uint z [[thread_position_in_grid]]) {
+    uint steps = p.in / 32;
+    if (z >= p.rows * steps) return;
+    uint o = z / steps, q = z % steps;
+    float4 v[8];
+    q36_gq_step(p.type, w + ulong(o) * p.row_bytes, q, tab, v);
+    device float *out = y + ulong(o) * p.in + 32 * q;
+    for (uint k = 0; k < 8; k++) *(device packed_float4 *)(out + 4 * k) = v[k];
+}
+
+// y[row][o] = scale * sum_i w[o][i] * x[row][i], exact mode: one thread per output and row, the
+// sum of q36_gq_row_dot (the CPU's bits), then the scale (an ".scale" companion) where it is not 1.
+kernel void q36_dot_gq_exact(device const uchar *w [[buffer(0)]],
+                             device const int *tab [[buffer(1)]],
+                             device const float *x [[buffer(2)]],
+                             device float *y [[buffer(3)]],
+                             constant q36_gq_args &p [[buffer(4)]],
+                             uint z [[thread_position_in_grid]]) {
+    if (z >= p.rows * p.out) return;
+    uint row = z / p.out, o = z % p.out;
+    float acc = q36_gq_row_dot(p.type, w + ulong(o) * p.row_bytes, x + ulong(row) * p.in, p.in, tab);
+    y[z] = p.scale != 1.f ? acc * p.scale : acc;
+}
+
+// The same in fast mode for up to 8 rows (decode, a verify): one SIMD group per output, lane l on
+// steps l, l + 32, ..., each step decoded once for every row and a float4 fma chain per row, then
+// simd_sum. A row's operations do not depend on the others: in a batch it gets its bits alone.
+kernel void q36_dot_gq_vec(device const uchar *w [[buffer(0)]],
+                           device const int *tab [[buffer(1)]],
+                           device const float *x [[buffer(2)]],
+                           device float *y [[buffer(3)]],
+                           constant q36_gq_args &p [[buffer(4)]],
+                           uint o [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    if (o >= p.out) return;
+    device const uchar *wr = w + ulong(o) * p.row_bytes;
+    float4 acc[8];
+    for (uint r = 0; r < 8; r++) acc[r] = 0;
+    for (uint q = lane; q < p.in / 32; q += 32) {
+        float4 v[8];
+        q36_gq_step(p.type, wr, q, tab, v);
+        for (uint r = 0; r < 8; r++) {
+            if (r >= p.rows) break;
+            device const float *xr = x + ulong(r) * p.in + 32 * q;
+            for (uint k = 0; k < 8; k++) acc[r] = fma(v[k], q36_load4(xr + 4 * k), acc[r]);
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        if (r >= p.rows) break;
+        float sum = simd_sum((acc[r].x + acc[r].y) + (acc[r].z + acc[r].w));
+        if (lane == 0) y[ulong(r) * p.out + o] = p.scale != 1.f ? sum * p.scale : sum;
+    }
+}
+
+// Prompt batches in fast mode, on the 8x8 matrix operations: a threadgroup of 4 SIMD groups computes
+// 32 rows x 128 outputs, a step of 32 inputs at a time. Every thread decodes its output's step into
+// threadgroup memory (inputs along the rows of the tile, 136 floats apart) and stages 8 values of
+// the step's 32 rows of x (40 apart); each SIMD group then multiplies the x tile by its 32 outputs'
+// weights. Accumulators as q36_dot_i8_mm keeps them. Outputs past out decode the last row and are not
+// stored; rows past rows read the last one. Float, but not q36_dot_gq_exact's order of additions.
+#define Q36_GQ_WLD 136
+#define Q36_GQ_XLD 40
+kernel void q36_dot_gq_mm(device const uchar *w [[buffer(0)]],
+                          device const int *tab [[buffer(1)]],
+                          device const float *x [[buffer(2)]],
+                          device float *y [[buffer(3)]],
+                          constant q36_gq_args &p [[buffer(4)]],
+                          threadgroup float *shared [[threadgroup(0)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float *ws = shared, *xs = shared + 32 * Q36_GQ_WLD;
+    const uint r0 = tg.x * 32, o0 = tg.y * 128, nr = min(32u, p.rows - r0);
+    device const uchar *wr = w + ulong(min(o0 + tid, p.out - 1)) * p.row_bytes;
+    const uint xrow = tid / 4, xc = 8 * (tid % 4);
+    device const float *xp = x + ulong(r0 + min(xrow, nr - 1)) * p.in + xc;
+    const ushort2 pl = q36_lane_place(lane);
+    const ushort sn = pl.x, sm = pl.y;
+    float2 acc[16];
+    for (uint i = 0; i < 16; i++) acc[i] = float2(0.f);
+    for (uint q = 0; q < p.in / 32; q++) {
+        float4 v[8];
+        q36_gq_step(p.type, wr, q, tab, v);
+        float4 xa = q36_load4(xp + 32 * q), xb = q36_load4(xp + 32 * q + 4);
+        threadgroup_barrier(mem_flags::mem_threadgroup);     // the last step's tiles are read
+        for (uint k = 0; k < 8; k++)
+            for (uint e = 0; e < 4; e++) ws[(4 * k + e) * Q36_GQ_WLD + tid] = v[k][e];
+        *(threadgroup float4 *)(xs + xrow * Q36_GQ_XLD + xc) = xa;
+        *(threadgroup float4 *)(xs + xrow * Q36_GQ_XLD + xc + 4) = xb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kb = 0; kb < 4; kb++) {
+            simdgroup_float8x8 a[4], b[4];
+            for (uint rb = 0; rb < 4; rb++) simdgroup_load(a[rb], xs + 8 * rb * Q36_GQ_XLD + 8 * kb, Q36_GQ_XLD);
+            for (uint cb = 0; cb < 4; cb++)
+                simdgroup_load(b[cb], ws + 8 * kb * Q36_GQ_WLD + 32 * sg + 8 * cb, Q36_GQ_WLD);
+            for (uint rb = 0; rb < 4; rb++)
+                for (uint cb = 0; cb < 4; cb++) {
+                    simdgroup_float8x8 cm;
+                    reinterpret_cast<thread float2 &>(cm.thread_elements()) = acc[4 * rb + cb];
+                    simdgroup_multiply_accumulate(cm, a[rb], b[cb], cm);
+                    acc[4 * rb + cb] = reinterpret_cast<thread float2 &>(cm.thread_elements());
+                }
+        }
+    }
+    for (uint rb = 0; rb < 4; rb++) {
+        uint row = 8 * rb + sm;
+        if (row >= nr) continue;
+        device float *yr = y + ulong(r0 + row) * p.out;
+        for (uint cb = 0; cb < 4; cb++) {
+            uint o = o0 + 32 * sg + 8 * cb + sn;
+            float2 s = p.scale != 1.f ? acc[4 * rb + cb] * p.scale : acc[4 * rb + cb];
+            if (o < p.out) yr[o] = s.x;
+            if (o + 1 < p.out) yr[o + 1] = s.y;
+        }
+    }
+}
+
+// y[row][o] = sum_i w[o][i] * x[row][i] for a float matrix (a GGUF's F32 router): dot_f32_lanes of
+// matmul_f32.h, the CPU's product. Lane j chains inputs j, j + 32, ... with fma, then the lanes are
+// added in its halving tree: the CPU's bits. One SIMD group per output and row.
+kernel void q36_dot_f32(device const float *w [[buffer(0)]],
+                        device const float *x [[buffer(1)]],
+                        device float *y [[buffer(2)]],
+                        constant q36_gq_args &p [[buffer(3)]],
+                        uint z [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_simdgroup]]) {
+    if (z >= p.rows * p.out) return;
+    uint row = z / p.out, o = z % p.out;
+    device const float *wr = w + ulong(o) * p.in, *xr = x + ulong(row) * p.in;
+    float a = 0;
+    for (uint i = lane; i < p.in; i += 32) a = fma(xr[i], wr[i], a);
+    for (ushort h = 16; h > 0; h >>= 1) a = a + simd_shuffle_down(a, h);
+    if (lane == 0) y[z] = a;
+}
+
+// A GGUF's routed experts. A slot holds an expert's three matrices as the file's rows, gate | up |
+// down, each of the type of the layer's tensor; the slot's scales (".scale" companions, else 1) are
+// in the arguments, by slot. Bound and paired as q36_expert_gate_up. One thread per output and
+// choice, the sums of q36_gq_row_dot: moe_gq_run's operations, the SwiGLU of q36_expert_gate_up.
+struct q36_expert_gq_args {
+    uint H, I, K, rows, first, n;
+    uint tg, tu, td, rbg, rbu, rbd;     // the three types, and their rows' bytes
+    ulong up, down;                     // where up and down start in a slot
+    float sg[8], su[8], sd[8];
+};
+
+// h[choice][i] = silu(sg * gate_i . x[row]) * (su * up_i . x[row])
+kernel void q36_expert_gate_up_gq(device const float *x [[buffer(0)]],
+                                  device const uint *pairs [[buffer(1)]],
+                                  device float *h [[buffer(2)]],
+                                  constant q36_expert_gq_args &p [[buffer(3)]],
+                                  Q36_SLOTS,
+                                  device const int *tab [[buffer(12)]],
+                                  uint2 at [[thread_position_in_grid]]) {
+    if (at.x >= p.I || at.y >= p.n) return;
+    device const uchar *ws[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    uint pair = pairs[p.first + at.y], choice = pair & 0x0fffffffu, s = pair >> 28;
+    device const uchar *w = ws[s];
+    device const float *row = x + ulong(choice / p.K) * p.H;
+    float g = q36_gq_row_dot(p.tg, w + ulong(at.x) * p.rbg, row, p.H, tab) * p.sg[s];
+    float u = q36_gq_row_dot(p.tu, w + p.up + ulong(at.x) * p.rbu, row, p.H, tab) * p.su[s];
+    float z = g / (1.f + exp(-g));
+    h[ulong(choice) * p.I + at.x] = z * u;
+}
+
+// y[choice][o] = sd * down_o . h[choice], not weighted yet
+kernel void q36_expert_down_gq(device const float *h [[buffer(0)]],
+                               device const uint *pairs [[buffer(1)]],
+                               device float *y [[buffer(2)]],
+                               constant q36_expert_gq_args &p [[buffer(3)]],
+                               Q36_SLOTS,
+                               device const int *tab [[buffer(12)]],
+                               uint2 at [[thread_position_in_grid]]) {
+    if (at.x >= p.H || at.y >= p.n) return;
+    device const uchar *ws[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    uint pair = pairs[p.first + at.y], choice = pair & 0x0fffffffu, s = pair >> 28;
+    device const uchar *w = ws[s] + p.down + ulong(at.x) * p.rbd;
+    y[ulong(choice) * p.H + at.x] = q36_gq_row_dot(p.td, w, h + ulong(choice) * p.I, p.I, tab) * p.sd[s];
 }

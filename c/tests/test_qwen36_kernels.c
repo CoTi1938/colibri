@@ -16,6 +16,8 @@
 #include <time.h>
 #include "../qwen36_gpu.h"
 #include "../qwen36_cpu_mm.h"
+#include "../ggml_quants.h"
+#include "../matmul_f32.h"
 
 static uint32_t g_rng = 0x2545f491u;
 static float frand(void) {                      /* uniform in [-1, 1) */
@@ -228,16 +230,19 @@ static double softplus_d(double x) { return x > 20 ? x : log1p(exp(x)); }
 /* One DeltaNet core over `rows` tokens, twice (two batches) so the state and
  * the conv history carry across calls, against a double reference. */
 /* handoff: the first batch in fast mode, the second exact, as a prompt then
- * generation: the state the fast kernel leaves must read the same. */
-static void test_deltanet(int rows, int H, int vh, int kh, int kd, int vd, int ck, int handoff) {
+ * generation: the state the fast kernel leaves must read the same. gguf: the
+ * layout of llama.cpp's files (q36_shape.tiled and a_direct), value head h on
+ * key head h % kh and A = -exp(A_log) in the place of A_log. */
+static void test_deltanet(int rows, int H, int vh, int kh, int kd, int vd, int ck, int handoff, int gguf) {
     int saved_exact = g_test_exact;
     int cd = 2 * kh * kd + vh * vd;
     q36_shape s = {0};
     s.rows = rows; s.hidden = H; s.v_heads = vh; s.k_heads = kh; s.k_dim = kd; s.v_dim = vd;
-    s.conv_kernel = ck; s.conv_dim = cd;
+    s.conv_kernel = ck; s.conv_dim = cd; s.tiled = s.a_direct = gguf;
     q36_tensor *x = rand_tensor((size_t)rows * H, 1.0f);
     q36_tensor *a = rand_tensor((size_t)vh * H, 0.05f), *b = rand_tensor((size_t)vh * H, 0.05f);
     q36_tensor *alog = rand_tensor((size_t)vh, 1.0f), *dt = rand_tensor((size_t)vh, 1.0f);
+    if (gguf) for (int h = 0; h < vh; h++) F(alog)[h] = -expf(F(alog)[h]);
     q36_tensor *proj = rand_tensor((size_t)rows * cd, 1.0f), *w = rand_tensor((size_t)cd * ck, 0.5f);
     q36_tensor *ring = q36_tensor_new((size_t)cd * (ck - 1) * 4);
     q36_tensor *state = q36_tensor_new((size_t)2 * vh * kd * vd * 4);
@@ -271,7 +276,8 @@ static void test_deltanet(int rows, int H, int vh, int kh, int kd, int vd, int c
                     av += (double)F(a)[(size_t)h * H + i] * F(x)[(size_t)r * H + i];
                     bv += (double)F(b)[(size_t)h * H + i] * F(x)[(size_t)r * H + i];
                 }
-                rdecay[r * vh + h] = exp(-exp((double)F(alog)[h]) * softplus_d(av + F(dt)[h]));
+                double A = gguf ? (double)F(alog)[h] : -exp((double)F(alog)[h]);
+                rdecay[r * vh + h] = exp(A * softplus_d(av + F(dt)[h]));
                 rbeta[r * vh + h] = 1.0 / (1.0 + exp(-bv));
             }
             for (int c = 0; c < cd; c++) {
@@ -302,7 +308,7 @@ static void test_deltanet(int rows, int H, int vh, int kh, int kd, int vd, int c
                 sqk[(size_t)r * cd + 2 * kh * kd + v] = sconv[(size_t)r * cd + 2 * kh * kd + v];
             }
             for (int h = 0; h < vh; h++) {
-                int kk = h / (vh / kh);
+                int kk = gguf ? h % kh : h / (vh / kh);
                 const double *q = rqk + (size_t)r * cd + kk * kd, *kv = q + kh * kd;
                 for (int v = 0; v < vd; v++) {
                     double u = 0;
@@ -323,7 +329,7 @@ static void test_deltanet(int rows, int H, int vh, int kh, int kd, int vd, int c
             }
         }
         char name[80];
-        snprintf(name, sizeof name, "dn pass%d decay rows=%d vh=%d", pass, rows, vh);
+        snprintf(name, sizeof name, "dn pass%d decay rows=%d vh=%d%s", pass, rows, vh, gguf ? " gguf" : "");
         check(name, F(decay), rdecay, NULL, (size_t)rows * vh, 1e-5);
         snprintf(name, sizeof name, "dn pass%d beta", pass);
         check(name, F(beta), rbeta, NULL, (size_t)rows * vh, 1e-5);
@@ -1594,6 +1600,284 @@ static void test_attention_dominant(int rows, int scratch) {
     test_set_exact(saved_exact);
 }
 
+/* ---- GGUF blocks ------------------------------------------------------------
+ * The decoders against the CPU's (ggml_quants.h, held to gguf-py's dequantization by
+ * tests/test_ggml_quants.py): the same bits. The exact products against the CPU's exact
+ * mode (gq_matmul_f32, times the ".scale" factor as matmul_d applies it) and the float
+ * router against matmul_f32.h: the same bits. The fast products and the experts' SwiGLU
+ * (whose exp is the GPU's) against a double reference. */
+
+static const int gq_types[] = {GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_IQ4_NL, GQ_IQ4_XS};
+
+static void check_bits(const char *what, const float *got, const float *ref, size_t n) {
+    size_t bad = 0, at = 0;
+    for (size_t i = 0; i < n; i++)
+        if (memcmp(&got[i], &ref[i], sizeof(float))) { if (!bad) at = i; bad++; }
+    printf("%-34s %s  mismatches=%zu of %zu", what, bad ? "FAIL" : "ok  ", bad, n);
+    if (bad) printf(" (first at %zu: got %.9g ref %.9g)", at, (double)got[at], (double)ref[at]);
+    printf("\n");
+    if (bad) g_failures++;
+}
+
+static uint8_t rand_byte(void) { return (uint8_t)((g_rng = g_rng * 1664525u + 1013904223u) >> 24); }
+
+static uint16_t f16_bits(float f) {
+    _Float16 h = (_Float16)f;
+    uint16_t b;
+    memcpy(&b, &h, 2);
+    return b;
+}
+
+/* rows of `in` weights of ggml type t as a quantizer leaves them: random quants and packed scales, the
+ * f16 scales of a sensible size and sign (Q4_K's and Q5_K's minimum near the middle of the range), every
+ * seventh block's scale subnormal */
+static void gq_fill_rows(int t, uint8_t *p, int rows, int in) {
+    const int64_t rb = gq_row_bytes(t, in), blocks = (int64_t)rows * (in / GQ_TYPES[t].blck);
+    const int bytes = GQ_TYPES[t].bytes;
+    for (int64_t i = 0; i < rb * rows; i++) p[i] = rand_byte();
+    for (int64_t k = 0; k < blocks; k++) {
+        uint8_t *b = p + k * bytes;
+        float d = (frand() + 1.5f) * 0.004f;
+        uint16_t dh = k % 7 == 3 ? (uint16_t)(1 + rand_byte()) : f16_bits(frand() < -0.6f ? -d : d);
+        if (t == GQ_Q6_K) memcpy(b + 208, &dh, 2);
+        else memcpy(b, &dh, 2);
+        if (t == GQ_Q4_K || t == GQ_Q5_K) {
+            uint16_t mh = f16_bits(d * (t == GQ_Q4_K ? 7.5f : 15.5f));
+            memcpy(b + 2, &mh, 2);
+        }
+    }
+}
+
+static q36_tensor *gq_rand_rows(int t, int rows, int in) {
+    q36_tensor *w = q36_tensor_new((size_t)(gq_row_bytes(t, in) * rows));
+    gq_fill_rows(t, q36_tensor_data(w), rows, in);
+    return w;
+}
+
+static const uint8_t *B(q36_tensor *t) { return q36_tensor_data(t); }
+
+static void test_gq_dequant(int t, int rows, int in) {
+    size_t n = (size_t)rows * in;
+    q36_tensor *w = gq_rand_rows(t, rows, in), *y = q36_tensor_new(n * 4);
+    int ok = q36_gq_dequant(y, w, t, rows, in);
+    sync_or_die();
+    float *ref = malloc(n * 4);
+    for (int r = 0; r < rows; r++) gq_dequant_row(t, B(w) + r * gq_row_bytes(t, in), ref + (size_t)r * in, in);
+    char name[80];
+    snprintf(name, sizeof name, "gguf dequant %s %dx%d", gq_type_name(t), rows, in);
+    if (!ok) { printf("%-34s FAIL  refused\n", name); g_failures++; }
+    else check_bits(name, F(y), ref, n);
+    free(ref);
+    q36_tensor_free(w); q36_tensor_free(y);
+}
+
+/* the product in both modes: exact against the CPU's bits, fast against a double reference */
+static void test_gq_dot(int t, int rows, int in, int out, float scale) {
+    int saved = g_test_exact;
+    size_t n = (size_t)rows * out;
+    q36_tensor *w = gq_rand_rows(t, out, in), *x = rand_tensor((size_t)rows * in, 1.0f);
+    q36_tensor *y = q36_tensor_new(n * 4), *yf = q36_tensor_new(n * 4);
+    test_set_exact(1);
+    int ok = q36_dot_gq(y, x, w, t, scale, rows, in, out);
+    test_set_exact(0);
+    ok = q36_dot_gq(yf, x, w, t, scale, rows, in, out) && ok;
+    sync_or_die();
+    float *cpu = malloc(n * 4), *row = malloc((size_t)in * 4);
+    gq_matmul_f32(cpu, F(x), B(w), t, rows, in, out);
+    if (scale != 1.f) for (size_t i = 0; i < n; i++) cpu[i] *= scale;
+    double *ref = malloc(n * sizeof(double)), *mag = malloc(n * sizeof(double));
+    for (int o = 0; o < out; o++) {
+        gq_dequant_row(t, B(w) + o * gq_row_bytes(t, in), row, in);
+        for (int r = 0; r < rows; r++) {
+            double s = 0, m = 0;
+            for (int i = 0; i < in; i++) {
+                double v = (double)row[i] * F(x)[(size_t)r * in + i];
+                s += v;
+                m += fabs(v);
+            }
+            ref[(size_t)r * out + o] = s * scale;
+            mag[(size_t)r * out + o] = m * fabs(scale) + 1e-12;
+        }
+    }
+    char name[80];
+    snprintf(name, sizeof name, "gguf dot %s %dx%d->%d exact", gq_type_name(t), rows, in, out);
+    if (!ok) { printf("%-34s FAIL  refused\n", name); g_failures++; }
+    else check_bits(name, F(y), cpu, n);
+    snprintf(name, sizeof name, "gguf dot %s %dx%d->%d fast", gq_type_name(t), rows, in, out);
+    check(name, F(yf), ref, mag, n, 3e-5);
+    free(cpu); free(row); free(ref); free(mag);
+    q36_tensor_free(w); q36_tensor_free(x); q36_tensor_free(y); q36_tensor_free(yf);
+    test_set_exact(saved);
+}
+
+/* fast mode, 2-8 rows: each row gets the bits it gets alone (a verify's rows stand for the steps) */
+static void test_gq_rows_bits(int t, int rows, int in, int out) {
+    int saved = g_test_exact;
+    test_set_exact(0);
+    q36_tensor *w = gq_rand_rows(t, out, in), *x = rand_tensor((size_t)rows * in, 1.0f);
+    q36_tensor *y = q36_tensor_new((size_t)rows * out * 4), *y1 = q36_tensor_new((size_t)out * 4);
+    float *alone = malloc((size_t)rows * out * 4);
+    int ok = q36_dot_gq(y, x, w, t, 1.f, rows, in, out);
+    sync_or_die();
+    for (int r = 0; ok && r < rows; r++) {
+        q36_tensor *x1 = q36_tensor_view(x, (size_t)r * in * 4, (size_t)in * 4);
+        ok = q36_dot_gq(y1, x1, w, t, 1.f, 1, in, out);
+        sync_or_die();
+        memcpy(alone + (size_t)r * out, F(y1), (size_t)out * 4);
+        q36_tensor_free(x1);
+    }
+    int same = ok && !memcmp(alone, F(y), (size_t)rows * out * 4);
+    printf("gguf dot %s %d rows = each alone %d->%d  %s\n", gq_type_name(t), rows, in, out, same ? "ok" : "FAIL");
+    g_failures += !same;
+    free(alone);
+    q36_tensor_free(w); q36_tensor_free(x); q36_tensor_free(y); q36_tensor_free(y1);
+    test_set_exact(saved);
+}
+
+/* a GGUF's F32 router: matmul_f32.h's bits, in both modes */
+static void test_dot_f32(int rows, int in, int out) {
+    int saved = g_test_exact;
+    size_t n = (size_t)rows * out;
+    q36_tensor *w = rand_tensor((size_t)out * in, 0.05f), *x = rand_tensor((size_t)rows * in, 1.0f);
+    q36_tensor *y = q36_tensor_new(n * 4), *yf = q36_tensor_new(n * 4);
+    test_set_exact(1);
+    int ok = q36_dot_f32(y, x, w, rows, in, out);
+    test_set_exact(0);
+    ok = q36_dot_f32(yf, x, w, rows, in, out) && ok;
+    sync_or_die();
+    float *cpu = malloc(n * 4);
+    matmul(cpu, F(x), F(w), rows, in, out);
+    char name[80];
+    snprintf(name, sizeof name, "dot_f32 %dx%d->%d exact", rows, in, out);
+    if (!ok) { printf("%-34s FAIL  refused\n", name); g_failures++; }
+    else check_bits(name, F(y), cpu, n);
+    snprintf(name, sizeof name, "dot_f32 %dx%d->%d fast", rows, in, out);
+    check_bits(name, F(yf), cpu, n);
+    free(cpu);
+    q36_tensor_free(w); q36_tensor_free(x); q36_tensor_free(y); q36_tensor_free(yf);
+    test_set_exact(saved);
+}
+
+/* a type, shape or view the kernels do not take: refused, nothing encoded */
+static void test_gq_refusals(void) {
+    q36_tensor *w = q36_tensor_new(1 << 20), *x = rand_tensor(4096, 1.0f), *y = q36_tensor_new(1 << 16);
+    q36_tensor *odd = q36_tensor_view(w, 1, 1 << 19), *two = q36_tensor_view(w, 2, 1 << 19);
+    q36_tensor *small = q36_tensor_new(1024), *pairs = q36_tensor_new(4);   /* one choice, in slot 0 */
+    int took = 0;
+    took += q36_dot_gq(y, x, w, GQ_Q2_K, 1.f, 1, 256, 16);        /* a type outside the six */
+    took += q36_dot_gq(y, x, w, GQ_F16, 1.f, 1, 256, 16);
+    took += q36_dot_gq(y, x, w, GQ_Q4_K, 1.f, 1, 288, 16);        /* a partial block */
+    took += q36_dot_gq(y, x, w, GQ_Q8_0, 1.f, 1, 4096, 8192);     /* weights past the tensor */
+    took += q36_dot_gq(y, x, odd, GQ_Q8_0, 1.f, 1, 256, 16);      /* weights at an odd offset */
+    took += q36_gq_dequant(y, w, GQ_IQ2_XXS, 1, 256);
+    took += q36_gq_dequant(y, odd, GQ_Q8_0, 1, 256);
+    took += q36_gq_row_bytes(GQ_Q4_K, 300) != 0 || q36_gq_row_bytes(GQ_Q6_K, 512) != 420;
+    took += q36_dot_f32(y, x, w, 1, 4096, 128);                   /* weights past the tensor */
+    took += q36_dot_f32(y, x, two, 1, 256, 16);                   /* weights off a float boundary */
+    q36_tensor *s8[8] = {w};
+    q36_gq_experts t = {GQ_Q8_0, GQ_Q8_0, GQ_Q2_K, {0}, {0}, {0}};
+    took += q36_expert_gate_up_gq(y, x, pairs, 0, 1, s8, 1, 256, 256, 1, &t);   /* a type outside the six */
+    t.down = GQ_Q4_K;
+    took += q36_expert_down_gq(y, x, pairs, 0, 1, s8, 1, 256, 288, 1, &t);      /* a partial block */
+    t.down = GQ_Q8_0;
+    s8[0] = small;
+    took += q36_expert_gate_up_gq(y, x, pairs, 0, 1, s8, 1, 256, 256, 1, &t);   /* a slot too small */
+    s8[0] = odd;
+    took += q36_expert_down_gq(y, x, pairs, 0, 1, s8, 1, 256, 256, 1, &t);      /* a slot at an odd offset */
+    sync_or_die();
+    printf("gguf refusals                      %s\n", took ? "FAIL" : "ok");
+    g_failures += took != 0;
+    q36_tensor_free(w); q36_tensor_free(x); q36_tensor_free(y); q36_tensor_free(odd); q36_tensor_free(two);
+    q36_tensor_free(small); q36_tensor_free(pairs);
+}
+
+/* Routed experts of a GGUF layer (gate tg, up tu, down td), rows tokens choosing K of E experts, the
+ * slots in groups of K as the graph binds them; with `scaled` every expert has ".scale" factors. The
+ * down products from the GPU's h against the CPU's bits; h against a double reference. */
+static void test_gq_experts(int H, int I, int K, int E, int rows, int tg, int tu, int td, int scaled) {
+    const int64_t rbg = gq_row_bytes(tg, H), rbu = gq_row_bytes(tu, H), rbd = gq_row_bytes(td, I);
+    const size_t up = (size_t)(rbg * I), down = up + (size_t)(rbu * I), bytes = down + (size_t)(rbd * H);
+    const int choices = rows * K;
+    q36_tensor **slot = calloc((size_t)E, sizeof(*slot));
+    float *sg = malloc(sizeof(float) * E), *su = malloc(sizeof(float) * E), *sd = malloc(sizeof(float) * E);
+    for (int e = 0; e < E; e++) {
+        slot[e] = q36_tensor_new(bytes);
+        uint8_t *p = q36_tensor_data(slot[e]);
+        gq_fill_rows(tg, p, I, H);
+        gq_fill_rows(tu, p + up, I, H);
+        gq_fill_rows(td, p + down, H, I);
+        sg[e] = scaled ? 0.5f + 0.25f * (frand() + 1.0f) : 1.f;
+        su[e] = scaled ? 0.5f + 0.25f * (frand() + 1.0f) : 1.f;
+        sd[e] = scaled ? 0.5f + 0.25f * (frand() + 1.0f) : 1.f;
+    }
+    q36_tensor *x = rand_tensor((size_t)rows * H, 1.0f), *pairs = q36_tensor_new((size_t)choices * 4);
+    q36_tensor *h = q36_tensor_new((size_t)choices * I * 4), *y = q36_tensor_new((size_t)choices * H * 4);
+    int *ids = malloc(sizeof(int) * choices), *experts = malloc(sizeof(int) * E), ne = 0;
+    for (int r = 0; r < rows; r++)
+        for (int k = 0; k < K; k++) {
+            int e, taken;
+            do {
+                e = (int)((g_rng = g_rng * 1664525u + 1013904223u) >> 8) % E;
+                taken = 0;
+                for (int j = 0; j < k; j++) taken |= ids[r * K + j] == e;
+            } while (taken);
+            ids[r * K + k] = e;
+        }
+    for (int e = 0; e < E; e++)
+        for (int p = 0; p < choices; p++)
+            if (ids[p] == e) { experts[ne++] = e; break; }
+    uint32_t *pp = q36_tensor_data(pairs);
+    int ok = 1, q = 0;
+    for (int g0 = 0; g0 < ne; g0 += K) {        /* a group of K experts: their choices, slot by slot */
+        int ng = ne - g0 < K ? ne - g0 : K, first = q;
+        q36_tensor *s8[8] = {0};
+        q36_gq_experts t = {tg, tu, td, {0}, {0}, {0}};
+        for (int j = 0; j < ng; j++) {
+            int e = experts[g0 + j];
+            s8[j] = slot[e];
+            t.sg[j] = sg[e]; t.su[j] = su[e]; t.sd[j] = sd[e];
+            for (int p = 0; p < choices; p++)
+                if (ids[p] == e) pp[q++] = (uint32_t)p | (uint32_t)j << 28;
+        }
+        ok = q36_expert_gate_up_gq(h, x, pairs, first, q - first, s8, rows, H, I, K, &t) && ok;
+        ok = q36_expert_down_gq(y, h, pairs, first, q - first, s8, rows, H, I, K, &t) && ok;
+    }
+    sync_or_die();
+    double *rh = malloc(sizeof(double) * choices * I), *hm = malloc(sizeof(double) * choices * I);
+    float *cy = malloc(sizeof(float) * choices * H), *gr = malloc(sizeof(float) * H), *ur = malloc(sizeof(float) * H);
+    for (int p = 0; p < choices; p++) {
+        int e = ids[p];
+        const uint8_t *w = B(slot[e]);
+        const float *xr = F(x) + (size_t)(p / K) * H;
+        for (int i = 0; i < I; i++) {
+            gq_dequant_row(tg, w + i * rbg, gr, H);
+            gq_dequant_row(tu, w + up + i * rbu, ur, H);
+            double g = 0, u = 0, mg = 0, mu = 0;
+            for (int j = 0; j < H; j++) {
+                g += (double)gr[j] * xr[j]; mg += fabs((double)gr[j] * xr[j]);
+                u += (double)ur[j] * xr[j]; mu += fabs((double)ur[j] * xr[j]);
+            }
+            g *= sg[e]; u *= su[e]; mg *= sg[e]; mu *= su[e];
+            rh[(size_t)p * I + i] = g / (1.0 + exp(-g)) * u;
+            hm[(size_t)p * I + i] = (mg * fabs(u) + mu * fabs(g)) + 1e-9;
+        }
+        /* down, from the GPU's h: moe_gq_run's gq_matmul_f32, then the factor */
+        gq_matmul_f32(cy + (size_t)p * H, F(h) + (size_t)p * I, w + down, td, 1, I, H);
+        for (int o = 0; o < H; o++) cy[(size_t)p * H + o] *= sd[e];
+    }
+    char name[96];
+    snprintf(name, sizeof name, "gguf experts %s|%s|%s H=%d I=%d K=%d rows=%d%s gate_up", gq_type_name(tg),
+             gq_type_name(tu), gq_type_name(td), H, I, K, rows, scaled ? " scaled" : "");
+    if (!ok) { printf("%-34s FAIL  refused\n", name); g_failures++; }
+    check(name, F(h), rh, hm, (size_t)choices * I, 3e-5);
+    snprintf(name, sizeof name, "gguf experts down (%d experts, %d groups)", ne, (ne + K - 1) / K);
+    check_bits(name, F(y), cy, (size_t)choices * H);
+    free(rh); free(hm); free(cy); free(gr); free(ur); free(ids); free(experts); free(sg); free(su); free(sd);
+    for (int e = 0; e < E; e++) q36_tensor_free(slot[e]);
+    free(slot);
+    q36_tensor_free(x); q36_tensor_free(pairs); q36_tensor_free(h); q36_tensor_free(y);
+}
+
 int main(void) {
     /* GitHub's Apple Silicon runners expose Metal through the Apple Paravirtual device, where command
      * buffers never complete (tests/test_backend_metal.mm skips it too), and which need not meet the
@@ -1620,8 +1904,8 @@ int main(void) {
     test_dot(1, 2048, 256, 1);
     test_dot(3, 2048, 256, 1);
     test_elementwise(8192);
-    test_deltanet(1, 2048, 32, 16, 128, 128, 4, 0);
-    test_deltanet(5, 2048, 32, 16, 128, 128, 4, 0);
+    test_deltanet(1, 2048, 32, 16, 128, 128, 4, 0, 0);
+    test_deltanet(5, 2048, 32, 16, 128, 128, 4, 0, 0);
     test_attention(1, 16, 2, 256, 512, 64, 37);
     test_attention(4, 16, 2, 256, 512, 64, 0);
     test_router(1, 256, 8, 1, 1, 0);
@@ -1635,7 +1919,7 @@ int main(void) {
     test_rmsnorm(2, 64, 0);
     test_dot(2, 64, 32, 0);
     test_dot(2, 64, 8, 1);
-    test_deltanet(2, 64, 2, 1, 8, 8, 4, 0);
+    test_deltanet(2, 64, 2, 1, 8, 8, 4, 0, 0);
     test_attention(2, 2, 1, 8, 16, 8, 3);
     test_router(2, 8, 8, 1, 1, 0);
     test_experts(64, 64, 8, 8, 5);
@@ -1674,10 +1958,10 @@ int main(void) {
     test_experts(2048, 512, 8, 40, 33);
     test_experts(64, 64, 8, 8, 21);
     test_attention(9, 4, 2, 64, 128, 32, 0);        /* a short first batch */
-    test_deltanet(40, 2048, 32, 16, 128, 128, 4, 0);  /* the fast delta rule (q36_dn_scan) */
-    test_deltanet(24, 2048, 32, 16, 128, 128, 4, 1);  /* fast prompt, then exact */
-    test_deltanet(17, 64, 4, 2, 32, 12, 4, 0);        /* one key per lane, a part threadgroup */
-    test_deltanet(10, 64, 2, 1, 96, 8, 4, 1);         /* three keys per lane */
+    test_deltanet(40, 2048, 32, 16, 128, 128, 4, 0, 0);  /* the fast delta rule (q36_dn_scan) */
+    test_deltanet(24, 2048, 32, 16, 128, 128, 4, 1, 0);  /* fast prompt, then exact */
+    test_deltanet(17, 64, 4, 2, 32, 12, 4, 0, 0);        /* one key per lane, a part threadgroup */
+    test_deltanet(10, 64, 2, 1, 96, 8, 4, 1, 0);         /* three keys per lane */
     test_deltanet_snapshot(20, 13, 0);                  /* the state copied at a row */
     test_deltanet_snapshot(5, 1, 0);                    /* after the first row */
     test_deltanet_snapshot(9, 9, 0);                    /* after the last row */
@@ -1700,8 +1984,8 @@ int main(void) {
     test_shared_dot_modes(9, 64, 64);
     test_shared_dot_modes(3, 75, 19);
     test_set_exact(0);
-    test_deltanet(1, 2048, 32, 16, 128, 128, 4, 0); /* float scan in generation */
-    test_deltanet(8, 64, 4, 2, 32, 12, 4, 1);      /* short fast batch, exact handoff */
+    test_deltanet(1, 2048, 32, 16, 128, 128, 4, 0, 0); /* float scan in generation */
+    test_deltanet(8, 64, 4, 2, 32, 12, 4, 1, 0);      /* short fast batch, exact handoff */
     test_deltanet_snapshot(5, 1, 1);               /* snapshot from a one-row fast prefix */
     test_deltanet_snapshot(8, 8, 1);
     test_deltanet_high_only(1, 0);                 /* decode: the scan */
@@ -1767,6 +2051,41 @@ int main(void) {
     test_dot_rows_bits(2, 2048, 12);            /* exact: four outputs per SIMD group, not eight */
     test_dot_rows_bits(3, 68, 20);
     test_dot_rows_bits(2, 75, 7);               /* neither vector nor four: the one-output kernel */
+
+    /* GGUF blocks (after the others, which keep their random inputs) */
+    for (size_t i = 0; i < sizeof gq_types / sizeof gq_types[0]; i++) {
+        int t = gq_types[i], k = GQ_TYPES[t].blck == 256;
+        test_gq_dequant(t, 3, 2048);
+        test_gq_dequant(t, 2, k ? 256 : 288);                       /* one block, or nine */
+        test_gq_dot(t, 1, 2048, 512, 1.f);                          /* decode */
+        test_gq_dot(t, 3, k ? 768 : 96, 37, 1.25f);                 /* a short verify, three blocks, a factor */
+        test_gq_dot(t, 40, 2048, 300, 1.f);                         /* a prompt batch: partial tiles */
+        test_gq_dot(t, 9, k ? 256 : 32, 129, 0.5f);                 /* one row past a tile, one block */
+        test_gq_rows_bits(t, 5, k ? 512 : 160, 37);
+    }
+    test_gq_dot(GQ_Q8_0, 1, 2048, 8192, 1.f);    /* the 35B model's trunk: qkv, the query and its gate */
+    test_gq_dot(GQ_Q8_0, 1, 4096, 2048, 1.f);    /* the output projections */
+    test_gq_dot(GQ_Q8_0, 3, 512, 2048, 1.f);     /* the shared expert's down */
+    test_gq_dot(GQ_Q8_0, 64, 2048, 4096, 1.f);   /* a prompt batch */
+    test_gq_dot(GQ_Q6_K, 1, 2048, 2000, 1.f);    /* the head (2048 -> the vocabulary), in small */
+    test_gq_dot(GQ_Q6_K, 33, 2048, 2000, 1.f);
+    test_gq_rows_bits(GQ_Q8_0, 8, 2048, 512);
+    test_gq_rows_bits(GQ_Q6_K, 2, 2048, 64);
+    test_dot_f32(1, 2048, 256);                  /* the router */
+    test_dot_f32(9, 2048, 256);
+    test_dot_f32(3, 75, 9);                      /* lanes past the inputs, a tail */
+    test_gq_refusals();
+    test_gq_experts(2048, 512, 8, 40, 1, GQ_Q4_K, GQ_Q4_K, GQ_Q5_K, 0);    /* the 35B's layers, decode */
+    test_gq_experts(2048, 512, 8, 40, 9, GQ_Q4_K, GQ_Q4_K, GQ_Q6_K, 1);    /* its last layers, ".scale" factors */
+    test_gq_experts(64, 64, 4, 13, 5, GQ_Q8_0, GQ_IQ4_NL, GQ_IQ4_NL, 1);   /* blocks of 32 */
+    test_gq_experts(256, 256, 8, 8, 3, GQ_IQ4_XS, GQ_Q8_0, GQ_IQ4_XS, 1);
+    /* a GGUF's DeltaNet: every delta kernel with the value heads tiled (q36_shape.tiled, a_direct) */
+    test_set_exact(1);
+    test_deltanet(1, 2048, 32, 16, 128, 128, 4, 0, 1);  /* q36_dn_aux, q36_dn_delta_row */
+    test_deltanet(5, 2048, 32, 16, 128, 128, 4, 0, 1);  /* q36_dn_aux4, q36_dn_delta */
+    test_set_exact(0);
+    test_deltanet(5, 2048, 32, 16, 128, 128, 4, 0, 1);  /* q36_dn_scan */
+    test_deltanet(40, 2048, 32, 16, 128, 128, 4, 0, 1); /* the chunks */
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

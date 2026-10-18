@@ -15,6 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 #include "qwen36_gpu.h"
+#include "ggml_grids.h"
+#include "shaders/blockdec_table.h"
 
 static const char q36_source[] = {
 #embed "metal/qwen36.metal"
@@ -28,9 +30,17 @@ typedef struct {
     uint32_t vh, kh, kd, vd, convk, convd, pos, cap;
     uint32_t snap;
     uint32_t low;                               /* DeltaNet: the state has its low plane */
+    uint32_t tiled, adirect;                    /* DeltaNet: a GGUF's head order and A (q36_shape) */
 } q36_state_args;
 typedef struct { uint32_t rows, H, E, K, G, T, shared_gate; } q36_router_args;
 typedef struct { uint32_t H, I, K, rows, first, n; uint64_t scales; } q36_expert_args;
+typedef struct { uint32_t rows, in, out, type, row_bytes; float scale; } q36_gq_args;
+typedef struct {
+    uint32_t H, I, K, rows, first, n;
+    uint32_t tg, tu, td, rbg, rbu, rbd;
+    uint64_t up, down;
+    float sg[8], su[8], sd[8];
+} q36_expert_gq_args;
 
 enum {
     K_RMSNORM, K_RMSNORM_FAST, K_DOT_I8, K_GATE, K_ADD,
@@ -49,7 +59,8 @@ enum {
     K_ATTN_KV_HALF, K_ATTN_QK_HALF, K_ATTN_PV_HALF, K_ATTN_GQA_QK_HALF, K_ATTN_GQA_PV_HALF,
     K_ATTN_QK8, K_ATTN_QK8_HALF, K_ATTN_PV8, K_ATTN_PV8_HALF, K_RMSNORM_WIDE,
     K_ROUTER_SOFTMAX_FAST, K_DN_CHUNK_GRAM, K_DN_CHUNK_INV, K_DN_CHUNK_UW, K_DN_CHUNK_STEP, K_DN_FOLD, K_DN_AUX4,
-    K_EXPERT_GATE_UP_MM4, K_EXPERT_DOWN_MM4, K_DOT_I8_R4, K_ROUTER_DOT2, K_COUNT
+    K_EXPERT_GATE_UP_MM4, K_EXPERT_DOWN_MM4, K_DOT_I8_R4, K_ROUTER_DOT2,
+    K_GQ_DEQUANT, K_DOT_GQ_EXACT, K_DOT_GQ_VEC, K_DOT_GQ_MM, K_DOT_F32, K_EXPERT_GATE_UP_GQ, K_EXPERT_DOWN_GQ, K_COUNT
 };
 static const char *const q36_kernel_names[K_COUNT] = {
     "q36_rmsnorm", "q36_rmsnorm_fast", "q36_dot_i8", "q36_gate", "q36_add",
@@ -73,10 +84,13 @@ static const char *const q36_kernel_names[K_COUNT] = {
     "q36_rmsnorm_wide", "q36_router_softmax_fast", "q36_dn_chunk_gram", "q36_dn_chunk_inv", "q36_dn_chunk_uw",
     "q36_dn_chunk_step", "q36_dn_fold", "q36_dn_aux4", "q36_expert_gate_up_mm4", "q36_expert_down_mm4", "q36_dot_i8_r4",
     "q36_router_dot2",
+    "q36_gq_dequant", "q36_dot_gq_exact", "q36_dot_gq_vec", "q36_dot_gq_mm", "q36_dot_f32", "q36_expert_gate_up_gq",
+    "q36_expert_down_gq",
 };
 
 static id<MTLDevice> g_device;
 static id<MTLBuffer> g_dn_chunk_scratch;       /* q36_dn_chunk: eight prepared chunks */
+static id<MTLBuffer> g_gq_table;               /* the GGUF decoders' values (q36_gq_table_fill) */
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_pipe[K_COUNT];
 static id<MTLCommandBuffer> g_batch;           /* open, not committed yet */
@@ -149,6 +163,33 @@ int q36_gpu_compile_check(void) {
     return 1;
 }
 
+/* The table of shaders/blockdec_table.h, in which metal/qwen36.metal's GGUF decoders find
+ * kvalues_iq4nl (and the grids of the IQ types they will take), as bdtab_fill
+ * (backend_vulkan.c) writes it from ggml_grids.h. No kernel here reads the block sizes or
+ * vq2's books: they stay zero. */
+_Static_assert(BDT_IQ4NL == 214, "metal/qwen36.metal's Q36_BDT_IQ4NL");
+static void q36_gq_table_fill(uint32_t *t) {
+    memset(t, 0, (size_t)BDT_WORDS * 4);
+    for (int i = 0; i < 128; i++) t[BDT_KSIGNS + i] = GGML_KSIGNS_IQ2XS[i];
+    for (int i = 0; i < 16; i++) {
+        t[BDT_IQ4NL + i] = (uint32_t)(int32_t)GGML_KVALUES_IQ4NL[i];
+        t[BDT_MXFP4 + i] = (uint32_t)(int32_t)GGML_KVALUES_MXFP4[i];
+    }
+    memcpy(t + BDT_IQ2XXS, GGML_IQ2XXS_GRID, sizeof GGML_IQ2XXS_GRID);
+    memcpy(t + BDT_IQ2XS, GGML_IQ2XS_GRID, sizeof GGML_IQ2XS_GRID);
+    memcpy(t + BDT_IQ2S, GGML_IQ2S_GRID, sizeof GGML_IQ2S_GRID);
+    memcpy(t + BDT_IQ3XXS, GGML_IQ3XXS_GRID, sizeof GGML_IQ3XXS_GRID);
+    memcpy(t + BDT_IQ3S, GGML_IQ3S_GRID, sizeof GGML_IQ3S_GRID);
+    memcpy(t + BDT_IQ1S, GGML_IQ1S_GRID, sizeof GGML_IQ1S_GRID);
+}
+/* each grid fills the words up to the next offset, as backend_vulkan.c checks it for bdtab_fill */
+_Static_assert(BDT_IQ2XS - BDT_IQ2XXS == sizeof GGML_IQ2XXS_GRID / 4 &&
+               BDT_IQ2S - BDT_IQ2XS == sizeof GGML_IQ2XS_GRID / 4 &&
+               BDT_IQ3XXS - BDT_IQ2S == sizeof GGML_IQ2S_GRID / 4 &&
+               BDT_IQ3S - BDT_IQ3XXS == sizeof GGML_IQ3XXS_GRID / 4 &&
+               BDT_IQ1S - BDT_IQ3S == sizeof GGML_IQ3S_GRID / 4 && BDT_VQ2 - BDT_IQ1S == sizeof GGML_IQ1S_GRID / 4,
+               "shaders/blockdec_table.h does not match ggml_grids.h");
+
 int q36_gpu_init(void) {
     if (g_device) return 1;
     @autoreleasepool {
@@ -169,6 +210,17 @@ int q36_gpu_init(void) {
         }
         g_queue = [device newCommandQueue];
         if (!g_queue) return 0;
+        uint32_t *table = malloc((size_t)BDT_WORDS * 4);
+        if (table) {
+            q36_gq_table_fill(table);
+            g_gq_table = [device newBufferWithBytes:table length:(NSUInteger)BDT_WORDS * 4
+                                            options:MTLResourceStorageModeShared];
+            free(table);
+        }
+        if (!g_gq_table) {
+            g_queue = nil;
+            return 0;
+        }
         g_device = device;
         snprintf(g_device_name, sizeof g_device_name, "%s", device.name.UTF8String);
         const char *exact = getenv("QWEN36_METAL_EXACT");
@@ -185,6 +237,7 @@ void q36_gpu_cleanup(void) {
     @autoreleasepool {
         for (int i = 0; i < K_COUNT; i++) g_pipe[i] = nil;
         g_dn_chunk_scratch = nil;
+        g_gq_table = nil;
         g_queue = nil;
         g_device = nil;
     }
@@ -530,7 +583,7 @@ static q36_state_args q36_state(const q36_shape *s) {
         (uint32_t)s->head_dim, (uint32_t)s->q_head_dim, (uint32_t)s->rotary, 0,
         (uint32_t)s->v_heads, (uint32_t)s->k_heads, (uint32_t)s->k_dim, (uint32_t)s->v_dim,
         (uint32_t)s->conv_kernel, (uint32_t)s->conv_dim, (uint32_t)s->pos, (uint32_t)s->cap,
-        s->snap > 0 ? (uint32_t)s->snap - 1 : ~0u, 1};
+        s->snap > 0 ? (uint32_t)s->snap - 1 : ~0u, 1, s->tiled ? 1u : 0u, s->a_direct ? 1u : 0u};
 }
 
 #define F4 (uint64_t)sizeof(float)
@@ -1292,4 +1345,131 @@ int q36_expert_sum(q36_tensor *out, q36_tensor *y, q36_tensor *weights, q36_tens
         q36_threads(e, cells);
     }
     return 1;
+}
+
+/* ---- GGUF matrices --------------------------------------------------------- */
+
+/* q36_dot_gq_mm's tiles in threadgroup memory, as metal/qwen36.metal defines them: 32 inputs of
+ * the weights 136 floats apart, then 32 rows of x 40 apart. */
+#define Q36_GQ_WLD 136
+#define Q36_GQ_XLD 40
+
+uint64_t q36_gq_row_bytes(int type, int n) {
+    int block, bytes;
+    switch (type) {             /* ggml_quants.h's GQ_TYPES */
+    case 8:  block = 32;  bytes = 34;  break;    /* Q8_0 */
+    case 12: block = 256; bytes = 144; break;    /* Q4_K */
+    case 13: block = 256; bytes = 176; break;    /* Q5_K */
+    case 14: block = 256; bytes = 210; break;    /* Q6_K */
+    case 20: block = 32;  bytes = 18;  break;    /* IQ4_NL */
+    case 23: block = 256; bytes = 136; break;    /* IQ4_XS */
+    default: return 0;
+    }
+    return n > 0 && n % block == 0 ? (uint64_t)(n / block) * bytes : 0;
+}
+
+/* The checks of a product of `rows` rows of x by a GGUF matrix of out rows; its row bytes, 0 when refused.
+ * The blocks' f16 fields are read as halves: the weights must start at an even offset. */
+static uint64_t q36_gq_fits(q36_tensor *y, q36_tensor *x, q36_tensor *w, int type, int rows, int in, int out) {
+    uint64_t rb = q36_gq_row_bytes(type, in);
+    if (rows < 1 || out < 1 || !rb || rb > UINT32_MAX || (uint64_t)rows * out > UINT32_MAX ||
+        !q36_fits(w, rb * (uint64_t)out) || w->offset % 2 || !q36_fits(x, (uint64_t)rows * in * F4) ||
+        !q36_fits(y, (uint64_t)rows * out * F4)) return 0;
+    return rb;
+}
+
+int q36_gq_dequant(q36_tensor *y, q36_tensor *w, int type, int rows, int in) {
+    uint64_t rb = q36_gq_row_bytes(type, in);
+    if (rows < 1 || !rb || rb > UINT32_MAX || (uint64_t)rows * (in / 32) > UINT32_MAX ||
+        !q36_fits(w, rb * (uint64_t)rows) || w->offset % 2 || !q36_fits(y, (uint64_t)rows * in * F4)) return 0;
+    @autoreleasepool {
+        q36_gq_args a = {(uint32_t)rows, (uint32_t)in, 0, (uint32_t)type, (uint32_t)rb, 1.f};
+        id<MTLComputeCommandEncoder> e = q36_encoder(K_GQ_DEQUANT);
+        q36_bind(e, w, 0); [e setBuffer:g_gq_table offset:0 atIndex:1]; q36_bind(e, y, 2);
+        [e setBytes:&a length:sizeof(a) atIndex:3];
+        q36_threads(e, (uint64_t)rows * (in / 32));
+    }
+    return 1;
+}
+
+int q36_dot_gq(q36_tensor *y, q36_tensor *x, q36_tensor *w, int type, float scale, int rows, int in, int out) {
+    uint64_t rb = q36_gq_fits(y, x, w, type, rows, in, out);
+    if (!rb) return 0;
+    @autoreleasepool {
+        q36_gq_args a = {(uint32_t)rows, (uint32_t)in, (uint32_t)out, (uint32_t)type, (uint32_t)rb, scale};
+        /* fast mode: decode and verifies a SIMD group per output, prompt batches on the matrix units */
+        int k = g_exact ? K_DOT_GQ_EXACT : rows <= 8 ? K_DOT_GQ_VEC
+                : g_pipe[K_DOT_GQ_MM].maxTotalThreadsPerThreadgroup >= 128 ? K_DOT_GQ_MM : K_DOT_GQ_EXACT;
+        id<MTLComputeCommandEncoder> e = q36_encoder(k);
+        q36_bind(e, w, 0); [e setBuffer:g_gq_table offset:0 atIndex:1]; q36_bind(e, x, 2); q36_bind(e, y, 3);
+        [e setBytes:&a length:sizeof(a) atIndex:4];
+        if (k == K_DOT_GQ_MM) {
+            [e setThreadgroupMemoryLength:32 * (Q36_GQ_WLD + Q36_GQ_XLD) * F4 atIndex:0];
+            [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows + 31) / 32, (NSUInteger)(out + 127) / 128, 1)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else if (k == K_DOT_GQ_VEC) {
+            q36_groups(e, (uint64_t)out, 1);
+        } else {
+            q36_threads(e, (uint64_t)rows * out);
+        }
+    }
+    return 1;
+}
+
+int q36_dot_f32(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, int out) {
+    if (rows < 1 || in < 1 || out < 1 || (uint64_t)rows * out > UINT32_MAX || !q36_fits(w, (uint64_t)out * in * F4) ||
+        w->offset % 4 || !q36_fits(x, (uint64_t)rows * in * F4) || !q36_fits(y, (uint64_t)rows * out * F4)) return 0;
+    @autoreleasepool {
+        q36_gq_args a = {(uint32_t)rows, (uint32_t)in, (uint32_t)out, 0, 0, 1.f};
+        id<MTLComputeCommandEncoder> e = q36_encoder(K_DOT_F32);
+        q36_bind(e, w, 0); q36_bind(e, x, 1); q36_bind(e, y, 2);
+        [e setBytes:&a length:sizeof(a) atIndex:3];
+        q36_groups(e, (uint64_t)rows * out, 1);
+    }
+    return 1;
+}
+
+static int q36_experts_gq(int kernel, q36_tensor *out, uint64_t out_bytes, q36_tensor *in, uint64_t in_bytes,
+                          q36_tensor *pairs, int first, int n, q36_tensor *const slots[8], int rows, int hidden,
+                          int inter, int topk, const q36_gq_experts *t, int width) {
+    uint64_t rbg = t ? q36_gq_row_bytes(t->gate, hidden) : 0, rbu = t ? q36_gq_row_bytes(t->up, hidden) : 0;
+    uint64_t rbd = t ? q36_gq_row_bytes(t->down, inter) : 0;
+    if (rows < 1 || topk < 1 || topk > 8 || !rbg || !rbu || !rbd || rbg > UINT32_MAX || rbu > UINT32_MAX ||
+        rbd > UINT32_MAX || !q36_fits(out, out_bytes) || !q36_fits(in, in_bytes) ||
+        !q36_pairs_ok(pairs, first, n, slots, rows, topk, (rbg + rbu) * inter + rbd * hidden)) return 0;
+    for (int k = 0; k < 8; k++)
+        if (slots[k] && slots[k]->offset % 2) return 0;   /* the blocks' f16 fields are read as halves */
+    @autoreleasepool {
+        q36_expert_gq_args a = {(uint32_t)hidden, (uint32_t)inter, (uint32_t)topk, (uint32_t)rows, (uint32_t)first,
+                                (uint32_t)n, (uint32_t)t->gate, (uint32_t)t->up, (uint32_t)t->down, (uint32_t)rbg,
+                                (uint32_t)rbu, (uint32_t)rbd, rbg * inter, (rbg + rbu) * inter, {0}, {0}, {0}};
+        memcpy(a.sg, t->sg, sizeof a.sg);
+        memcpy(a.su, t->su, sizeof a.su);
+        memcpy(a.sd, t->sd, sizeof a.sd);
+        id<MTLComputeCommandEncoder> e = q36_encoder(kernel);
+        q36_bind(e, in, 0); q36_bind(e, pairs, 1); q36_bind(e, out, 2);
+        [e setBytes:&a length:sizeof(a) atIndex:3];
+        for (int k = 0; k < 8; k++) q36_bind(e, slots[k] ? slots[k] : pairs, (NSUInteger)(4 + k));
+        [e setBuffer:g_gq_table offset:0 atIndex:12];
+        NSUInteger most = g_pipe[kernel].maxTotalThreadsPerThreadgroup;
+        [e dispatchThreads:MTLSizeMake((NSUInteger)width, (NSUInteger)n, 1)
+            threadsPerThreadgroup:MTLSizeMake(most < 64 ? most : 64, 1, 1)];
+    }
+    return 1;
+}
+
+int q36_expert_gate_up_gq(q36_tensor *h, q36_tensor *x, q36_tensor *pairs, int first, int n,
+                          q36_tensor *const slots[8], int rows, int hidden, int inter, int topk,
+                          const q36_gq_experts *t) {
+    uint64_t choices = (uint64_t)rows * topk;
+    return q36_experts_gq(K_EXPERT_GATE_UP_GQ, h, choices * inter * F4, x, (uint64_t)rows * hidden * F4, pairs, first,
+                          n, slots, rows, hidden, inter, topk, t, inter);
+}
+
+int q36_expert_down_gq(q36_tensor *y, q36_tensor *h, q36_tensor *pairs, int first, int n,
+                       q36_tensor *const slots[8], int rows, int hidden, int inter, int topk,
+                       const q36_gq_experts *t) {
+    uint64_t choices = (uint64_t)rows * topk;
+    return q36_experts_gq(K_EXPERT_DOWN_GQ, y, choices * hidden * F4, h, choices * inter * F4, pairs, first, n,
+                          slots, rows, hidden, inter, topk, t, hidden);
 }
