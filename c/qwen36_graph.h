@@ -87,6 +87,7 @@ struct Qwen36Graph {
      * runs them through the head once the token after the last is known. */
     int verify, no_tail, tail_keep;             /* tail_keep: a prompt's last rows that run the last layer whole (qg_layer_tail) */
     int vadv_layer, vadv_n, vadv_ids[8 * Q36_SPEC_ROWS];    /* a verify's guesses for the next layer (qg_advise_ahead) */
+    int guess_layer, guess_n, guess_ids[8 * Q36_SPEC_ROWS];  /* QWEN36_FAST_GUESSED: the guesses for guess_layer */
     q36_tensor *last_rows, *head_rows;          /* final norms and logits of a verify's rows */
     float *h_rows; size_t h_cap;                /* host: final residuals of the forward's rows */
     QgDense mtp_fc;
@@ -106,6 +107,7 @@ struct Qwen36Graph {
 
 static void qg_settle(Model *, Qwen36Graph *, int);
 static int qg_fast_experts(int topk);
+static int qg_fast_guessed(int topk);
 
 static q36_tensor *qg_upload(const float *data, size_t count) {
     return data ? q36_tensor_upload(data, count * sizeof(float)) : NULL;
@@ -395,6 +397,7 @@ static int qg_create(Model *m) {
     Qwen36Graph *g = calloc(1, sizeof(*g));
     if (!g) return 0;
     m->graph = g;
+    g->guess_layer = -1;                        /* nothing guessed before the first decode step */
     /* Fast mode keeps the KV cache in halves where its kernels read them. */
     q36_shape kvs = {0};
     kvs.q_heads = c->q_heads; kvs.kv_heads = c->kv_heads; kvs.head_dim = c->head_dim;
@@ -488,6 +491,7 @@ static int qg_create(Model *m) {
             q36_gpu_device_name(), qg_prompt_rows(), g->map ? "mapped" : "copied", g->kv_bytes == 2 ? "half" : "float",
             g->map_bytes);
     qg_fast_experts(c->topk);                   /* its line, if QWEN36_FAST_EXPERTS is set */
+    qg_fast_guessed(c->topk);                   /* and QWEN36_FAST_GUESSED's */
     return 1;
 failed:
     fprintf(stderr, "[qwen36-metal] cannot build the Metal graph (weights or GPU memory)\n");
@@ -683,6 +687,53 @@ static int qg_fast_experts(int topk) {
     return j;
 }
 
+/* QWEN36_FAST_GUESSED's counts for its line at exit: the rows the rule ran
+ * for (a token at a layer) and the middle-rank choices that stayed only
+ * because the layer before guessed them. */
+static unsigned long long qg_guessed_rows, qg_guessed_kept;
+static void qg_guessed_report(void) {
+    fprintf(stderr, "[qwen36-metal] QWEN36_FAST_GUESSED: the rule ran %llu times (a token at a layer); %llu "
+                    "middle-rank choices stayed because the layer before guessed them\n", qg_guessed_rows,
+            qg_guessed_kept);
+}
+
+/* Fast experts, decode: QWEN36_FAST_GUESSED=R uses a token's R - 1 likeliest
+ * experts, its next ones up to the J likeliest only when the expert cache
+ * holds them or they were guessed for its layer (qg_advise_ahead: their reads
+ * were announced while the layer before computed, so keeping them costs
+ * little), and the rest of its top-k as fast experts do (qfe_keep_guessed),
+ * with one line at start and one at exit (qg_guessed_report). Unset or 0, the
+ * default, leaves fast experts as they are; exact mode, the variable without
+ * QWEN36_FAST_EXPERTS of 2 or more, and a value that is not a whole number
+ * from 2 to J are refused with a line. */
+static int qg_fast_guessed(int topk) {
+    static int r = -1;
+    if (r < 0) {
+        const char *v = getenv("QWEN36_FAST_GUESSED");
+        char *end = NULL;
+        long n = v && *v ? strtol(v, &end, 10) : 0;
+        int J = qg_fast_experts(topk);
+        r = 0;
+        if (!v || !*v || (!*end && n == 0))
+            ;
+        else if (q36_gpu_is_exact())
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_GUESSED=%s ignored: exact mode uses every chosen expert\n", v);
+        else if (J < 2)
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_GUESSED=%s ignored: it needs QWEN36_FAST_EXPERTS of 2 or more\n",
+                    v);
+        else if (*end || n < 2 || n > J)
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_GUESSED=%s ignored: R is a whole number from 2 to %d\n", v, J);
+        else {
+            r = (int)n;
+            fprintf(stderr, "[qwen36-metal] QWEN36_FAST_GUESSED=%d: in decode a token uses its %d likeliest routed "
+                            "experts, the next ones up to its %d likeliest only when the expert cache holds "
+                            "them or the layer before guessed them\n", r, r - 1, J);
+            atexit(qg_guessed_report);
+        }
+    }
+    return r;
+}
+
 /* Decode: the next layer's router run on this layer's residual (qg_layer).
  * The residual changes little from one layer to the next, so its likeliest
  * experts are mostly the ones the next layer will choose. Of the six
@@ -699,6 +750,15 @@ static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il, int row) {
     /* with fast experts the others are used only when the cache holds them: nothing to announce */
     if (qg_fast_experts(m->c.topk) && K > qg_fast_experts(m->c.topk)) K = qg_fast_experts(m->c.topk);
     n = qas_top(l, m->c.n_experts, K, top);
+    if (qg_fast_guessed(m->c.topk)) {           /* the next layer's guesses for its rule: every row's, once each */
+        if (g->guess_layer != il + 1) { g->guess_layer = il + 1; g->guess_n = 0; }
+        for (int j = 0; j < n; j++) {
+            int k = 0;
+            while (k < g->guess_n && g->guess_ids[k] != top[j]) k++;
+            if (k == g->guess_n && k < (int)(sizeof g->guess_ids / sizeof *g->guess_ids))
+                g->guess_ids[g->guess_n++] = top[j];
+        }
+    }
     if (g->defer_decode_advice && !g->verify && n <= 8) {
         /* The next trunk overwrites ahead_logits. Save only the selected IDs
          * and emit them after that trunk and the current experts are submitted. */
@@ -864,11 +924,24 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
         } else if (qg_fast_experts(K) && ((g->defer_decode_advice && rows == 1) || (g->verify && rows == g->verify))) {
             /* Fast experts (qwen36_fast_experts.h). A verify's later rows also count what its earlier rows chose,
              * which the verify reads anyway, and with J above 3 its draft rows keep two sure experts fewer (3 with
-             * J = 5), except in the last quarter of the layers. */
+             * J = 5), except in the last quarter of the layers. With QWEN36_FAST_GUESSED the first row keeps its
+             * middle ranks only when the cache holds them or they were guessed for this layer; the first layer of a
+             * step, which nothing guessed, keeps the rule above. */
             int J = qg_fast_experts(K), late = il >= c->n_layers - c->n_layers / 4;
+            int R = g->guess_layer == il ? qg_fast_guessed(K) : 0;
+            unsigned char cheap[256];
             qgc_present(m->global_cache, il * E, E, present);
+            if (R) {
+                memcpy(cheap, present, (size_t)E);
+                for (int q = 0; q < g->guess_n; q++) cheap[g->guess_ids[q]] = 1;
+            }
             for (int r = 0; r < rows; r++) {
-                qfe_keep(iw + (size_t)r * K, w + (size_t)r * K, K, r && !late && J > 3 ? J - 2 : J, present);
+                if (!r && R) {
+                    int kept = 0;
+                    qfe_keep_guessed(iw + (size_t)r * K, w + (size_t)r * K, K, J, R - 1, present, cheap, &kept);
+                    qg_guessed_rows++;
+                    qg_guessed_kept += (unsigned long long)kept;
+                } else qfe_keep(iw + (size_t)r * K, w + (size_t)r * K, K, r && !late && J > 3 ? J - 2 : J, present);
                 for (int k = 0; k < K; k++) present[iw[(size_t)r * K + k]] = 1;
             }
         }
@@ -1374,6 +1447,8 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
     int verify = g->verify;
     qas_clear(&g->ahead_advice);
     g->vadv_n = 0;
+    g->guess_layer = -1;                        /* a forward's guesses are its own (QWEN36_FAST_GUESSED) */
+    g->guess_n = 0;
     g->defer_decode_advice = S == 1 && pos > 0;
     int R = S > 1 && !verify ? qg_prompt_rows() : S;
     /* A prompt's last layer runs whole for its last row only; with the MTP head, for the rows whose final

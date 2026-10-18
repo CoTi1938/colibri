@@ -141,6 +141,26 @@ can rank such settings wrongly on this model: with 6 of 8 experts and the
 weights divided by the top-8 mass, as here, its 5-shot MMLU lost 1.10 points
 (p = 0.021). No downstream task was measured.
 
+`QWEN36_FAST_GUESSED=R` narrows fast experts in the middle ranks, so fewer
+experts are read, at a further cost in quality: a token uses its R − 1
+likeliest routed experts, its next ones up to the J likeliest only when the
+expert cache holds them or the layer before guessed them for its layer, and
+the rest of its top-8 as above. A guessed expert's read was announced while
+the layer before computed, so keeping it costs little; a choice neither
+guessed nor in the cache would wait for a whole SSD read. The first layer of
+a step, which nothing guessed, and a verify's draft rows keep the rule of fast
+experts. Unset or 0, the default, changes nothing; in exact mode, without
+`QWEN36_FAST_EXPERTS` of 2 or more, or with a value that is not a whole number
+from 2 to J, it is refused with a line. A line says when it is on, and one at
+exit counts the rows the rule ran for (a token at a layer) and the choices
+that stayed because they were guessed. The speed and the quality on an 8 GB
+M1 are in
+[the experiment's record](experiments/qwen36-fast-guessed-2026-10-14/README.md);
+the quality is again the likelihood of three texts. A token keeps from R − 1
+to 8 experts (3 to 8 with R = 4, the setting measured), and on this model the
+paper above found that 4 of 8, divided by the top-8 mass, lost 3.10 points of
+5-shot MMLU.
+
 An optional disk cache, `experts.qc` beside the model, stores the experts in
 the layout of those slots, each expert's weights and scales together, so a
 slot is filled by one read:

@@ -289,6 +289,13 @@ def drafts(run):
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def guessed_counts(run):
+    """The rows the QWEN36_FAST_GUESSED rule ran for and the choices it kept as guessed, from its line at exit."""
+    m = re.search(r"QWEN36_FAST_GUESSED: the rule ran (\d+) times \(a token at a layer\); (\d+) middle-rank",
+                  run["stderr"])
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def floats_of(path):
     with open(path, "rb") as f:
         data = f.read()
@@ -541,6 +548,47 @@ class Qwen36GraphTest(unittest.TestCase):
         self.assertIn("QWEN36_FAST_EXPERTS=2 ignored: exact mode uses every chosen expert", x["stderr"])
         self.assertEqual(x["logits"], self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE)["logits"])
 
+    def test_fast_guessed(self):
+        """QWEN36_FAST_GUESSED=R, a whole number from 2 to J (3 here): with fast experts,
+        fast-mode decode only, with a line, the same output in every run, and a line at
+        exit that counts where the rule ran and the choices it kept as guessed; other
+        values, the variable without fast experts and exact mode change nothing, with a
+        line."""
+        self.graph()
+        fast = {"QWEN36_FAST_EXPERTS": "3"}
+        rule = {"QWEN36_FAST_EXPERTS": "3", "QWEN36_FAST_GUESSED": "2"}
+        base = self.run_engine(PROMPT, 6, SMALL_CACHE, fast)
+        self.assert_ran(base, True)
+        for v in ("1", "4", "-1", "x", "2x"):
+            run = self.run_engine(PROMPT, 6, SMALL_CACHE, fast, {"QWEN36_FAST_GUESSED": v})
+            self.assertIn(f"QWEN36_FAST_GUESSED={v} ignored: R is a whole number from 2 to 3", run["stderr"])
+            self.assertEqual(run["logits"], base["logits"], v)
+        off = self.run_engine(PROMPT, 6, SMALL_CACHE, fast, {"QWEN36_FAST_GUESSED": "0"})
+        self.assertNotIn("QWEN36_FAST_GUESSED", off["stderr"])
+        self.assertEqual(off["logits"], base["logits"])
+        alone = self.run_engine(PROMPT, 6, SMALL_CACHE, {"QWEN36_FAST_GUESSED": "2"})
+        self.assertIn("QWEN36_FAST_GUESSED=2 ignored: it needs QWEN36_FAST_EXPERTS of 2 or more", alone["stderr"])
+        self.assertEqual(alone["logits"], self.run_engine(PROMPT, 6, SMALL_CACHE)["logits"])
+        a = self.run_engine(PROMPT, 6, SMALL_CACHE, rule)
+        b = self.run_engine(PROMPT, 6, SMALL_CACHE, rule)
+        self.assert_ran(a, True)
+        self.assertIn("QWEN36_FAST_GUESSED=2: in decode a token uses its 1 likeliest routed experts", a["stderr"])
+        self.assertNotEqual(a["logits"], base["logits"])
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(a[key], b[key], key)
+        # The line at exit: the rule ran at layers 1 to 7 of the five decode steps, never at a step's first
+        # layer, which nothing guessed, and kept choices the cache did not hold because they were guessed.
+        ran, kept = guessed_counts(a)
+        self.assertEqual(ran, 5 * (LAYERS - 1), a["stderr"][-3000:])
+        self.assertGreater(kept, 0, a["stderr"][-3000:])
+        prompt_only = self.run_engine(PROMPT, 1, SMALL_CACHE, rule)
+        self.assertEqual(prompt_only["logits"], self.run_engine(PROMPT, 1, SMALL_CACHE, fast)["logits"])
+        self.assertEqual(guessed_counts(prompt_only), (0, 0))
+        x = self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE, rule)
+        self.assertIn("QWEN36_FAST_GUESSED=2 ignored: exact mode uses every chosen expert", x["stderr"])
+        self.assertIsNone(guessed_counts(x))
+        self.assertEqual(x["logits"], self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE)["logits"])
+
     def test_cpu_share_matches_the_gpu(self):
         """The products the CPU's matrix unit takes in a fast prompt (DeltaNet's z,
         the gate half of q, the shared and routed experts; in the second batch of
@@ -652,8 +700,8 @@ class Qwen36GraphTest(unittest.TestCase):
 
     def test_mtp_drafts_fast(self):
         """Fast mode: the drafts give plain decoding's tokens, the logits within the rounding
-        of the two-row kernels; with fast experts in the verifies too, the same output in
-        every run."""
+        of the two-row kernels; with fast experts in the verifies too, and with
+        QWEN36_FAST_GUESSED on top, the same output in every run."""
         self.graph()
         head = self.mtp_snap()
         for prompt, right, wrong in MTP_PROMPTS:
@@ -668,6 +716,17 @@ class Qwen36GraphTest(unittest.TestCase):
         b = self.run_engine(MTP_PROMPTS[0][0], 24, SMALL_CACHE, head, fast)
         self.assert_ran(a, True)
         self.assertGreater(drafts(a)[1], 0, a["stderr"][-3000:])
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(a[key], b[key], key)
+        guessed = dict(fast, QWEN36_FAST_GUESSED="2")
+        a = self.run_engine(MTP_PROMPTS[0][0], 24, SMALL_CACHE, head, guessed)
+        b = self.run_engine(MTP_PROMPTS[0][0], 24, SMALL_CACHE, head, guessed)
+        self.assert_ran(a, True)
+        self.assertIn("QWEN36_FAST_GUESSED=2: in decode", a["stderr"])
+        self.assertGreater(drafts(a)[1], 0, a["stderr"][-3000:])
+        # once per forward, plain step or verify (its first row only), at every layer but the first
+        forwards = int(re.search(r"\[qwen36 mtp\] [^\n]*\((\d+) forwards per", a["stderr"]).group(1))
+        self.assertEqual(guessed_counts(a)[0], (LAYERS - 1) * forwards, a["stderr"][-3000:])
         for key in ("layers", "logits", "stdout"):
             self.assertEqual(a[key], b[key], key)
 

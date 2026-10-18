@@ -1,5 +1,6 @@
-/* qfe_keep (qwen36_fast_experts.h) without a model: which choices stay, what a
- * left-out choice becomes, and that the kept weights are not touched. */
+/* qfe_keep and qfe_keep_guessed (qwen36_fast_experts.h) without a model: which
+ * choices stay, what a left-out choice becomes, that the kept weights are not
+ * touched, and how many stayed only because they were guessed. */
 #include "../qwen36_fast_experts.h"
 #include <stdio.h>
 #include <string.h>
@@ -54,6 +55,50 @@ int main(void) {
     float tw[4] = {0.25f, 0.25f, 0.25f, 0.25f};
     CHECK(qfe_keep(tid, tw, 4, 2, none) == 2, "ties: wrong count");
     CHECK(tid[0] == 5 && tid[1] == 6 && tw[2] == 0 && tw[3] == 0 && tid[2] == 5, "ties: not in the router's order");
+
+    /* qfe_keep_guessed, keep 5 and sure 3. By weight 9, 0 and 12 always stay; 7 and 4 (ranks 3 and 4) only if
+     * cheap; 3, 15 and 1 (ranks 5 to 7) only if present. */
+    unsigned char cheap[16] = {0}, pres[16] = {0};
+    int guessed = 0;
+    memcpy(ids, ids0, sizeof ids); memcpy(w, w0, sizeof w);
+    left = qfe_keep_guessed(ids, w, 8, 5, 3, none, none, &guessed);
+    CHECK(left == 5 && guessed == 0, "guessed, nothing cheap: left %d, kept as guessed %d, expected 5 and 0", left,
+          guessed);
+    CHECK(ids[1] == 9 && ids[7] == 0 && ids[3] == 12 && w[1] == w0[1] && w[7] == w0[7] && w[3] == w0[3],
+          "guessed: the three sure ones did not stay");
+    CHECK(ids[4] == 9 && w[4] == 0 && ids[5] == 9 && w[5] == 0, "guessed: ranks 3 and 4 stayed without being cheap");
+
+    /* 15 cached (so cheap too), 7, 3 and 1 guessed: 7 (rank 3) and 15 (rank 6) stay, and only 7 stayed because
+     * it was guessed; 4 (rank 4) goes; 3 (rank 5) and 1 (rank 7) go too, since after the keep heaviest only the
+     * cache counts. */
+    memcpy(ids, ids0, sizeof ids); memcpy(w, w0, sizeof w);
+    pres[15] = 1;
+    memcpy(cheap, pres, sizeof cheap); cheap[7] = cheap[3] = cheap[1] = 1;
+    guessed = 0;
+    left = qfe_keep_guessed(ids, w, 8, 5, 3, pres, cheap, &guessed);
+    CHECK(left == 3, "guessed: left %d, expected 3", left);
+    CHECK(guessed == 1, "guessed: %d kept as guessed, expected 1 (7)", guessed);
+    CHECK(ids[4] == 7 && w[4] == w0[4], "guessed: a guessed rank 3 was left out");
+    CHECK(ids[5] == 9 && w[5] == 0, "guessed: rank 4, neither guessed nor cached, stayed");
+    CHECK(ids[0] == 9 && w[0] == 0, "guessed: rank 5, guessed but not cached, stayed");
+    CHECK(ids[6] == 15 && w[6] == w0[6], "guessed: rank 6, cached, was left out");
+    CHECK(ids[2] == 9 && w[2] == 0, "guessed: rank 7, guessed but not cached, stayed");
+
+    /* sure = keep: no middle ranks, qfe_keep's row; sure 0 still keeps the heaviest; keep 8 with every expert
+     * cheap leaves nothing out; a row of one is left alone. */
+    int32_t a_ids[8], b_ids[8]; float a_w[8], b_w[8];
+    memcpy(a_ids, ids0, sizeof a_ids); memcpy(a_w, w0, sizeof a_w);
+    memcpy(b_ids, ids0, sizeof b_ids); memcpy(b_w, w0, sizeof b_w);
+    CHECK(qfe_keep_guessed(a_ids, a_w, 8, 5, 5, pres, none, NULL) == qfe_keep(b_ids, b_w, 8, 5, pres),
+          "sure = keep: another count than qfe_keep");
+    CHECK(!memcmp(a_ids, b_ids, sizeof a_ids) && !memcmp(a_w, b_w, sizeof a_w), "sure = keep: not qfe_keep's row");
+    memcpy(ids, ids0, sizeof ids); memcpy(w, w0, sizeof w);
+    left = qfe_keep_guessed(ids, w, 8, 5, 0, none, none, NULL);
+    CHECK(left == 7 && ids[1] == 9 && w[1] == w0[1], "guessed, sure 0: the heaviest did not stay (left %d)", left);
+    memcpy(ids, ids0, sizeof ids); memcpy(w, w0, sizeof w);
+    CHECK(qfe_keep_guessed(ids, w, 8, 8, 3, none, all, NULL) == 0 && !memcmp(ids, ids0, sizeof ids) &&
+          !memcmp(w, w0, sizeof w), "guessed, keep 8, all cheap: something was left out");
+    CHECK(qfe_keep_guessed(ids, w, 1, 1, 1, none, none, NULL) == 0, "guessed: a single choice was left out");
 
     printf("test_qwen36_fast_experts: %d checks, %d failures\n", checks, failures);
     return failures != 0;
