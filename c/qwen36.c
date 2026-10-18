@@ -104,6 +104,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_gpu.h"
 #include "qwen36_expert_source.h" /* optional experts.qc: checkpoint stamp and fixed planar records */
 #include <dispatch/dispatch.h>
+#include <sys/mman.h>     /* QWEN36_PREFETCH: experts.qc mapped to ask mincore */
 #include <sys/sysctl.h>
 #endif
 #ifdef COLI_VULKAN
@@ -3875,6 +3876,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #ifdef QWEN36_METAL_GRAPH
 static int qwen_global_cache_init(Model *m);
 static void qwen_expert_file_open(Model *m, const char *snap);
+static void qwen_prefetch_open(Model *m);
 #endif
 #ifdef QWEN36_METAL_GRAPH
 static int64_t scale_count_gu(const Cfg *c);
@@ -4031,6 +4033,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         qwen_expert_file_open(m, snap);
         qwen36_graph_mtp_load(m);
         if (!qwen_global_cache_init(m) || !qg_create(m)) exit(1);
+        qwen_prefetch_open(m);
         m->dense_load_s += now_s() - built;
     }
 #endif
@@ -4395,16 +4398,20 @@ static int container_layer_is_int4(Model *m, int layer) {
  * (the planar int4 weights, then the scales: what the graph's kernels read),
  * reads announced to the disk before they are made, and a group's misses
  * loaded in parallel. The CPU engine keeps its per-layer cache. */
-static void *qwen_global_allocate(void *context, size_t index) {
-    Model *m = context; Slot *s = &m->global_slots[index]; Cfg *c = &m->c;
+static int qwen_slot_storage(Model *m, Slot *s) {
+    Cfg *c = &m->c;
     size_t packed = (size_t)3 * c->hidden * c->inter / 2;
     size_t gu = (size_t)scale_count_gu(c), ns = 2 * gu + (size_t)scale_count_d(c);
     s->gpu = q36_tensor_new(packed + ns * sizeof(float));
-    if (!s->gpu) return NULL;
+    if (!s->gpu) return 0;
     s->pw = q36_tensor_data(s->gpu);
     s->gs = (float *)(s->pw + packed);
     s->us = s->gs + gu; s->ds = s->gs + 2 * gu; s->eid = -1; s->is_int4 = 1;
-    return s;
+    return 1;
+}
+static void *qwen_global_allocate(void *context, size_t index) {
+    Model *m = context; Slot *s = &m->global_slots[index];
+    return qwen_slot_storage(m, s) ? s : NULL;
 }
 /* Ask the kernel to start reading an expert into the page cache (F_RDADVISE
  * on macOS). Advisory only: the pread that follows returns the same bytes
@@ -4431,12 +4438,119 @@ static void qwen_expert_advise(Model *m, int layer, int eid) {
     snprintf(qsnm, sizeof qsnm, "model.layers.%d.mlp.experts.%d.qs", la, eid);
     st_prefetch(&m->S, nm); st_prefetch(&m->S, qsnm);
 }
+/* QWEN36_PREFETCH=1 (qwen_prefetch_open): a decode step copies the next
+ * layer's guesses (the ones qg_advise_ahead announces) while this layer
+ * computes, on two serial queues of their own, into eight slots beside the
+ * expert cache (qwen36_prefetch_ring.h). When the next layer misses one of
+ * them, its load takes the copy instead of reading the record while the step
+ * waits, after waiting for a copy still reading: the two slots trade their
+ * storage (qwen_slot_swap). A copy done when the layer starts is also lent
+ * to it (qwen_prefetch_lend): the GPU computes it early, with the experts the
+ * cache holds, while the layer's other misses read. The cache makes the same
+ * choices as without the copies and its slots end up with the same bytes, so
+ * the output does not change, in any mode. A guess is not copied when a
+ * later layer's guesses were issued (its layer has read its experts), when
+ * the cache holds it, or when the system's file cache does not hold every
+ * page of its record (mincore): a cold one would hold a queue for a disk
+ * read, and is only announced, as before. */
+#include "qwen36_prefetch_ring.h"
+static int qpf_on, qpf_said;
+static QprRing qpf_ring;
+static uint64_t qpf_issue;                  /* grows with each layer's guesses (qwen_prefetch_issue) */
+static dispatch_queue_t qpf_queue[2];
+static const unsigned char *qpf_map;        /* experts.qc mapped read-only, only asked with mincore */
+static char *qpf_pages[2];                  /* each queue's mincore vector, qpf_page_count pages */
+static size_t qpf_page_count;
+static uint64_t qpf_late[2], qpf_held[2], qpf_cold[2], qpf_twice[2];   /* each queue's guesses not copied */
+static uint64_t qpf_early;                  /* lent copies computed early (qwen36_graph.h) */
+typedef struct { Model *m; uint64_t issue; int queue, n, keys[8]; } QwenPrefetchJob;
+static void qwen_slot_swap(void *a, void *b) {
+    Slot *x = a, *y = b;
+    Slot t = *x;
+    x->gpu = y->gpu; x->pw = y->pw; x->gs = y->gs; x->us = y->us; x->ds = y->ds;
+    y->gpu = t.gpu; y->pw = t.pw; y->gs = t.gs; y->us = t.us; y->ds = t.ds;
+}
+/* 1 when the system's file cache holds every page of key's record in experts.qc. */
+static int qwen_record_warm(Model *m, int key, char *pages) {
+    const QefHeader *h = &m->expert_file.h;
+    uintptr_t page = (uintptr_t)getpagesize();
+    uintptr_t at = (uintptr_t)(qpf_map + h->data_offset + (uint64_t)key * h->stride), first = at & ~(page - 1);
+    size_t n = (size_t)((at + h->record_bytes - first + page - 1) / page);
+    if (n > qpf_page_count || mincore((void *)first, n * page, pages)) return 0;
+    for (size_t i = 0; i < n; i++) if (!(pages[i] & MINCORE_INCORE)) return 0;
+    return 1;
+}
+static void qwen_prefetch_run(void *context) {
+    QwenPrefetchJob *j = context;
+    Model *m = j->m;
+    int q = j->queue;
+    for (int i = 0; i < j->n; i++) {
+        int key = j->keys[i], at;
+        void *payload;
+        char error[320];
+        if (__atomic_load_n(&qpf_issue, __ATOMIC_RELAXED) != j->issue) { qpf_late[q] += (uint64_t)(j->n - i); break; }
+        if (qgc_contains(m->global_cache, key)) { qpf_held[q]++; continue; }
+        if (!qwen_record_warm(m, key, qpf_pages[q])) { qpf_cold[q]++; continue; }
+        if ((at = qpr_reserve(&qpf_ring, key, j->issue, &payload)) < 0) { if (at == -1) qpf_twice[q]++; continue; }
+        int ok = qwen_planar_record(m, key / m->c.n_experts, key % m->c.n_experts, payload, error, sizeof error);
+        if (!ok && !__atomic_exchange_n(&qpf_said, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH: a copy failed (its layer reads the expert itself): %s\n",
+                    error);
+        qpr_done(&qpf_ring, at, ok);
+    }
+    free(j);
+}
+static void qwen_prefetch_issue(Model *m, int layer, const int *eids, int n) {
+    if (!qpf_on || layer < 0 || layer >= m->c.n_layers || n < 1) return;
+    uint64_t issue = __atomic_add_fetch(&qpf_issue, 1, __ATOMIC_RELAXED);
+    if (n > 8) n = 8;
+    for (int q = 0; q < 2; q++) {               /* the guesses in turn on the two queues */
+        QwenPrefetchJob *j = malloc(sizeof *j);
+        if (!j) return;
+        j->m = m; j->issue = issue; j->queue = q; j->n = 0;
+        for (int i = q; i < n; i += 2) j->keys[j->n++] = layer * m->c.n_experts + eids[i];
+        if (j->n) dispatch_async_f(qpf_queue[q], j, qwen_prefetch_run); else free(j);
+    }
+}
+/* The tensor of a slot, which a loan reads under the ring's lock. */
+static void *qwen_slot_tensor(void *slot) { return ((Slot *)slot)->gpu; }
+/* A copy of key done before its layer's loads start, for the GPU to compute
+ * early: the tensor of its slot, NULL when there is none. The copy is lent
+ * (qpr_hold): no other copy reuses its slot until the load takes it, which
+ * moves the tensor into the cache's slot that the layer then holds, or until
+ * qwen_prefetch_settle. */
+static q36_tensor *qwen_prefetch_lend(int key) {
+    void *tensor;
+    return qpf_on && qpr_hold(&qpf_ring, key, &tensor, qwen_slot_tensor) ? tensor : NULL;
+}
+/* After a sync: the GPU is done with the lent copies; those no load took can be reused. */
+static void qwen_prefetch_settle(void) {
+    if (qpf_on) qpr_release(&qpf_ring);
+}
+static void qwen_prefetch_noop(void *context) { (void)context; }
+static void qpf_report(void) {
+    if (!qpf_on) return;
+    for (int q = 0; q < 2; q++) dispatch_sync_f(qpf_queue[q], NULL, qwen_prefetch_noop);   /* the queued copies first */
+    QprStats s = qpr_snapshot(&qpf_ring);
+    fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH: %llu guesses copied beside the cache, %llu of them taken by "
+                    "their layer (%llu after waiting for the copy, %llu computed early while the layer read the "
+                    "rest); not copied: %llu held by the cache, %llu not in the file cache, %llu too late, %llu "
+                    "copied already, %llu without a free slot, %llu failed\n",
+            (unsigned long long)s.copies, (unsigned long long)s.taken, (unsigned long long)s.waited,
+            (unsigned long long)qpf_early,
+            (unsigned long long)(qpf_held[0] + qpf_held[1]), (unsigned long long)(qpf_cold[0] + qpf_cold[1]),
+            (unsigned long long)(qpf_late[0] + qpf_late[1]), (unsigned long long)(qpf_twice[0] + qpf_twice[1]),
+            (unsigned long long)s.busy, (unsigned long long)s.failed);
+}
 static void qwen_global_advise(void *context, int key) {
     Model *m = context; qwen_expert_advise(m, key / m->c.n_experts, key % m->c.n_experts);
 }
 static int qwen_global_load(void *context, int key, void *payload) {
     Model *m = context; Slot *s = payload; int layer = key / m->c.n_experts, eid = key % m->c.n_experts;
-    double start = now_s(); load_expert_merged(m, layer, eid, s);
+    double start = now_s();
+    /* QWEN36_PREFETCH: a copy of the record made beside the cache becomes the slot's storage */
+    if (qpf_on && layer < m->c.n_layers && qpr_take(&qpf_ring, key, s, qwen_slot_swap)) s->is_int4 = 1;
+    else load_expert_merged(m, layer, eid, s);
     double elapsed = now_s() - start;
     pthread_mutex_lock(&g_pilot_mx); m->t_disk += elapsed; pthread_mutex_unlock(&g_pilot_mx);
     s->eid = eid; return 1;   /* tensor I/O errors stay process-fatal, as in load_expert_merged */
@@ -4569,6 +4683,66 @@ static void qwen_expert_file_open(Model *m, const char *snap) {
     fprintf(stderr, "[qwen-experts] %s: %llu planar records, %llu bytes each (scales %s); checkpoint metadata and shard samples checked in %.3f s\n",
         path, (unsigned long long)m->expert_file.h.count, (unsigned long long)m->expert_file.h.record_bytes,
         m->expert_file.h.layout == QEF_LAYOUT_CODES ? "as 16-bit codes" : "F32", now_s() - started);
+}
+/* QWEN36_PREFETCH=1 (qwen_prefetch_issue): experts.qc mapped read-only, only
+ * to ask which records the system's file cache holds, the copies' slots
+ * beside the expert cache, one expert's storage each, and their two queues.
+ * Unset or 0, the default, keeps it off; another value and the variable
+ * without experts.qc are refused with a line. A line at start gives the
+ * slots' bytes, one at exit counts the copies and how many their layer took. */
+static void qwen_prefetch_open(Model *m) {
+    const char *v = getenv("QWEN36_PREFETCH"), *why = NULL;
+    struct stat info;
+    void *base = MAP_FAILED, *payloads[QPR_MAX] = {0};
+    if (!v || !*v || !strcmp(v, "0")) return;
+    if (strcmp(v, "1")) {
+        fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH=%s ignored: 1 turns it on, 0 (the default) off\n", v);
+        return;
+    }
+    if (!m->expert_file.opened || !m->global_cache) {
+        fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH=1 ignored: it copies from experts.qc, which is not in use\n");
+        return;
+    }
+    if (fstat(m->expert_file.fd, &info)) why = strerror(errno);
+    else if (info.st_size <= 0) why = "it is empty";
+    else if ((base = mmap(NULL, (size_t)info.st_size, PROT_READ, MAP_SHARED, m->expert_file.fd, 0)) == MAP_FAILED)
+        why = strerror(errno);
+    if (why) {
+        fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH=1 ignored: experts.qc cannot be mapped: %s\n", why);
+        return;
+    }
+    uintptr_t page = (uintptr_t)getpagesize();
+    Slot *slots = calloc(QPR_MAX, sizeof *slots);
+    int made = 0, ring = 0;
+    qpf_page_count = (size_t)((m->expert_file.h.record_bytes + page - 1) / page) + 1;
+    qpf_pages[0] = malloc(qpf_page_count);
+    qpf_pages[1] = malloc(qpf_page_count);
+    if (slots && qpf_pages[0] && qpf_pages[1])
+        for (; made < QPR_MAX && qwen_slot_storage(m, &slots[made]); made++) payloads[made] = &slots[made];
+    if (made == QPR_MAX && (ring = qpr_init(&qpf_ring, payloads, QPR_MAX))) {
+        dispatch_queue_attr_t attr =
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+        qpf_queue[0] = dispatch_queue_create("qwen36.prefetch.0", attr);
+        qpf_queue[1] = dispatch_queue_create("qwen36.prefetch.1", attr);
+    }
+    if (!ring || !qpf_queue[0] || !qpf_queue[1]) {    /* nothing is queued yet: all of it is undone */
+        fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH=1 ignored: its %d slots, their page vectors or their two "
+                        "queues cannot be made\n", QPR_MAX);
+        for (int q = 0; q < 2; q++) if (qpf_queue[q]) dispatch_release(qpf_queue[q]);
+        qpf_queue[0] = qpf_queue[1] = NULL;
+        if (ring) qpr_destroy(&qpf_ring);
+        for (int i = 0; i < made; i++) q36_tensor_free(slots[i].gpu);
+        free(slots); free(qpf_pages[0]); free(qpf_pages[1]);
+        qpf_pages[0] = qpf_pages[1] = NULL;
+        munmap(base, (size_t)info.st_size);
+        return;
+    }
+    qpf_map = base;
+    qpf_on = 1;
+    atexit(qpf_report);
+    fprintf(stderr, "[qwen-experts] QWEN36_PREFETCH=1: a decode step copies the next layer's guesses that the "
+                    "system's file cache holds while this layer computes, into %d slots beside the expert cache "
+                    "(%zu bytes)\n", QPR_MAX, (size_t)QPR_MAX * m->global_cache->payload_bytes);
 }
 #endif
 

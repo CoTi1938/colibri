@@ -22,7 +22,7 @@ runners and VMs) the engine steps aside to the CPU engine with one line; the
 test checks that line and skips the comparisons.
 
 With qwen36-canonical (QWEN36_CANONICAL_TOOL) it also writes the fixture's
-experts.qc and checks the experts read from it.
+experts.qc and checks the experts read from it and QWEN36_PREFETCH.
 """
 import json
 import os
@@ -294,6 +294,20 @@ def guessed_counts(run):
     m = re.search(r"QWEN36_FAST_GUESSED: the rule ran (\d+) times \(a token at a layer\); (\d+) middle-rank",
                   run["stderr"])
     return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+PREFETCH_LINE = re.compile(
+    r"QWEN36_PREFETCH: (\d+) guesses copied beside the cache, (\d+) of them taken by their layer \((\d+) after "
+    r"waiting for the copy, (\d+) computed early while the layer read the rest\); not copied: (\d+) held by the "
+    r"cache, (\d+) not in the file cache, (\d+) too late, (\d+) copied already, (\d+) without a free slot, (\d+) "
+    r"failed")
+
+
+def prefetch_counts(run):
+    """QWEN36_PREFETCH's line at exit, its counts by name; None without the line."""
+    m = PREFETCH_LINE.search(run["stderr"])
+    names = ("copied", "taken", "waited", "early", "held", "cold", "late", "twice", "busy", "failed")
+    return dict(zip(names, map(int, m.groups()))) if m else None
 
 
 def floats_of(path):
@@ -588,6 +602,75 @@ class Qwen36GraphTest(unittest.TestCase):
         self.assertIn("QWEN36_FAST_GUESSED=2 ignored: exact mode uses every chosen expert", x["stderr"])
         self.assertIsNone(guessed_counts(x))
         self.assertEqual(x["logits"], self.run_engine(PROMPT, 6, EXACT, SMALL_CACHE)["logits"])
+
+    def test_prefetch(self):
+        """QWEN36_PREFETCH=1 with experts.qc: a line, guesses copied beside the cache and
+        taken by their layer, none failed, and the output without it, byte for byte, in
+        exact mode, in fast mode, with fast experts and with QWEN36_FAST_GUESSED on top,
+        and with the cache's frequency policy (over these five some copies are computed
+        early, while their layer reads the rest), with the MTP head's drafts, and in serve
+        mode (the layers and the text), where a turn's prompt comes after the decode steps
+        of the one before, also with a cache large enough for the prompt's readers, which
+        read a longer second turn layer by layer with the copies left beside the cache; a
+        prompt alone copies nothing. Another value, and the variable without experts.qc,
+        change nothing, with a line."""
+        self.graph()
+        if not CANONICAL:
+            self.skipTest("make -C c test-qwen36-graph METAL=1 sets QWEN36_CANONICAL_TOOL")
+        qc, on, fast = self.experts_qc(), {"QWEN36_PREFETCH": "1"}, {"QWEN36_FAST_EXPERTS": "3"}
+
+        def copies(run, what):
+            """The counts of a run with the option on: its line, copies taken, none failed."""
+            counts = prefetch_counts(run)
+            self.assertIsNotNone(counts, f"{what}: no QWEN36_PREFETCH line at exit: " + run["stderr"][-3000:])
+            self.assertGreater(counts["taken"], 0, f"{what}: no copy taken: " + run["stderr"][-3000:])
+            self.assertEqual(counts["failed"], 0, f"{what}: copies failed: " + run["stderr"][-3000:])
+            self.assertNotIn("QWEN36_PREFETCH: a copy failed", run["stderr"], what)
+            return counts
+
+        early = 0
+        for mode in (EXACT, {}, fast, dict(fast, QWEN36_FAST_GUESSED="2"), {"QWEN36_CACHE_EXPECTED": "0"}):
+            base = self.run_engine(PROMPT, 6, mode, SMALL_CACHE, qc)
+            run = self.run_engine(PROMPT, 6, mode, SMALL_CACHE, qc, on)
+            self.assert_ran(run, True)
+            self.assertIn("QWEN36_PREFETCH=1: a decode step copies the next layer's guesses", run["stderr"])
+            early += copies(run, str(mode))["early"]
+            for key in ("layers", "logits", "stdout"):
+                self.assertEqual(run[key], base[key], f"{mode}: {key}")
+        self.assertGreater(early, 0, "no copy was computed early")
+        prompt_only = self.run_engine(PROMPT, 1, SMALL_CACHE, qc, on)
+        counts = prefetch_counts(prompt_only)
+        self.assertIsNotNone(counts, prompt_only["stderr"][-3000:])
+        self.assertEqual((counts["copied"], counts["taken"]), (0, 0), prompt_only["stderr"][-3000:])
+        head = self.mtp_snap()      # the drafts of the MTP head: verifies, which copy nothing, between plain steps
+        base = self.run_engine(MTP_PROMPTS[0][0], 24, SMALL_CACHE, head, qc, fast)
+        run = self.run_engine(MTP_PROMPTS[0][0], 24, SMALL_CACHE, head, qc, fast, on)
+        self.assert_ran(run, True)
+        self.assertGreater(drafts(run)[1], 0, run["stderr"][-3000:])
+        copies(run, "drafts")
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(run[key], base[key], f"drafts: {key}")
+        # serve mode: the second turn's prompt comes after the first turn's decode steps, with copies beside the
+        # cache, and gives the layers and text it gives without them. With the larger cache the prompt's readers
+        # (qwen36_prefill_stream.h) read the longer second turn layer by layer, and their loads can take copies.
+        second = PROMPT + "Fox<|im_end|>\n" + chat(("user", "And the dog?"))
+        longer = PROMPT + "Fox<|im_end|>\n" + chat(("user", long_text(300)))
+        for cache, turn, what in ((SMALL_CACHE, second, "serve"), (STREAM_CACHE, longer, "serve, prompt by layer")):
+            turns = []
+            for extra in ({}, on):
+                session = Serve(self, cache, qc, fast, extra)
+                turns.append([session.ask("a", PROMPT, 6), session.ask("b", turn, 6)])
+                log = session.close()
+            self.assertEqual(turns[1], turns[0], what)
+            copies({"stderr": log}, what)
+        bad = self.run_engine(PROMPT, 6, SMALL_CACHE, qc, {"QWEN36_PREFETCH": "2"})
+        self.assertIn("QWEN36_PREFETCH=2 ignored: 1 turns it on, 0 (the default) off", bad["stderr"])
+        self.assertIsNone(prefetch_counts(bad))
+        self.assertEqual(bad["logits"], self.run_engine(PROMPT, 6, SMALL_CACHE, qc)["logits"])
+        without = self.run_engine(PROMPT, 6, SMALL_CACHE, on)
+        self.assertIn("QWEN36_PREFETCH=1 ignored: it copies from experts.qc, which is not in use", without["stderr"])
+        self.assertIsNone(prefetch_counts(without))
+        self.assertEqual(without["logits"], self.run_engine(PROMPT, 6, SMALL_CACHE)["logits"])
 
     def test_cpu_share_matches_the_gpu(self):
         """The products the CPU's matrix unit takes in a fast prompt (DeltaNet's z,

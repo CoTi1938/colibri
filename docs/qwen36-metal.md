@@ -93,7 +93,9 @@ matrices are converted, while one named by `QWEN_DENSE_CACHE` stops the start.
 
 The routed-expert cache defaults to a sixteenth of the RAM (512 MiB on an
 8 GB Mac); `QWEN_EXPERT_CACHE_BYTES=<bytes>` changes it. A larger cache means
-fewer disk reads, as long as the rest of the working set still fits.
+fewer disk reads, as long as the rest of the working set still fits. With
+`QWEN36_PREFETCH=1` eight more expert slots sit beside the cache (14.2 MB on
+the 35B model, see below).
 
 The batch tensors hold the rows of the current forward: up to 2048 for a
 prompt while the system reports no memory pressure, 1024
@@ -205,6 +207,28 @@ checksum: damage inside a file of the right size is not detected, and a read
 error during a run stops the engine, as one in the checkpoint does. The
 converter writes a temporary file, syncs it to the disk (`F_FULLFSYNC` on
 macOS) and publishes it by rename.
+
+With `experts.qc`, `QWEN36_PREFETCH=1` copies the experts guessed for the
+next layer (those announced to the disk) while this layer computes, on two
+queues of their own, into eight slots beside the expert cache, one expert
+each: 14.2 MB on the 35B model, on top of the expert cache's budget
+(`QWEN_EXPERT_CACHE_BYTES`). A layer that misses one of them takes the copy
+instead of reading the record while the step waits, and waits for a copy
+still reading: the cache's slot and the copy's trade their storage. A copy
+done when the layer starts is computed early, with the experts the cache
+holds, while the layer's other misses read. The
+cache makes the same choices as without the copies and its slots end up with
+the same bytes, so the output does not change, in any mode. Only decode steps
+of one token copy; a verify of the MTP head's drafts copies nothing. A guess
+is not copied when the cache holds it, when its layer has read its experts
+already, or when the system's file cache does not hold every page of its
+record (asked with `mincore`): a cold one would hold a queue for a disk read,
+and is only announced, as before. Unset or 0, the default, keeps it off;
+another value and the variable without `experts.qc` are refused with a line.
+A line at start gives the slots' bytes, and one at exit counts the copies,
+those their layer took or computed early, and why the others were not made.
+The speed on an 8 GB M1 is in
+[the experiment's record](experiments/qwen36-prefetch-2026-10-18/README.md).
 
 In serve mode (`SERVE=1`, what `coli chat` and the OpenAI server drive) chat
 clients resend the whole conversation at every turn. The forward keeps a copy

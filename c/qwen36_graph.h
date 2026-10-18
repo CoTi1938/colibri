@@ -87,7 +87,8 @@ struct Qwen36Graph {
      * runs them through the head once the token after the last is known. */
     int verify, no_tail, tail_keep;             /* tail_keep: a prompt's last rows that run the last layer whole (qg_layer_tail) */
     int vadv_layer, vadv_n, vadv_ids[8 * Q36_SPEC_ROWS];    /* a verify's guesses for the next layer (qg_advise_ahead) */
-    int guess_layer, guess_n, guess_ids[8 * Q36_SPEC_ROWS];  /* QWEN36_FAST_GUESSED: the guesses for guess_layer */
+    int guess_layer, guess_n, guess_ids[8 * Q36_SPEC_ROWS];  /* QWEN36_FAST_GUESSED, QWEN36_PREFETCH: the
+                                                              * guesses for guess_layer */
     q36_tensor *last_rows, *head_rows;          /* final norms and logits of a verify's rows */
     float *h_rows; size_t h_cap;                /* host: final residuals of the forward's rows */
     QgDense mtp_fc;
@@ -569,7 +570,8 @@ static void qg_dump_row(FILE *lf, q36_tensor *t, int row, int width) {
     if (lf) fwrite((const float *)q36_tensor_data(t) + (size_t)row * width, sizeof(float), (size_t)width, lf);
 }
 
-/* After a sync: write the deferred MoE dump row, release the deferred lease. */
+/* After a sync: write the deferred MoE dump row, release the deferred lease
+ * and the copies lent to the layer before (QWEN36_PREFETCH). */
 static void qg_settle(Model *m, Qwen36Graph *g, int ok) {
     if (g->dump_pending && ok) qg_dump_row(g->dump_pending, g->dump_x, g->dump_row, m->c.hidden);
     g->dump_pending = NULL;
@@ -578,6 +580,7 @@ static void qg_settle(Model *m, Qwen36Graph *g, int ok) {
     g->lease_pending = 0;
     if (g->stream_pending && !qll_finish(&g->stream_loader, !ok)) abort();
     g->stream_pending = 0;
+    qwen_prefetch_settle();
 }
 
 /* A copy of the sequence state after the first tokens of a prompt, so a later
@@ -750,7 +753,7 @@ static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il, int row) {
     /* with fast experts the others are used only when the cache holds them: nothing to announce */
     if (qg_fast_experts(m->c.topk) && K > qg_fast_experts(m->c.topk)) K = qg_fast_experts(m->c.topk);
     n = qas_top(l, m->c.n_experts, K, top);
-    if (qg_fast_guessed(m->c.topk)) {           /* the next layer's guesses for its rule: every row's, once each */
+    if (qg_fast_guessed(m->c.topk) || qpf_on) {   /* the next layer's guesses, every row's, once each */
         if (g->guess_layer != il + 1) { g->guess_layer = il + 1; g->guess_n = 0; }
         for (int j = 0; j < n; j++) {
             int k = 0;
@@ -968,6 +971,10 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
     int whole = rows > 1 && rows <= Q36_SPEC_ROWS && ne > K && ne <= (int)m->global_cache->group_cap;
     int ng = whole ? ne : ne < K ? ne : K;
     for (int j = 0; j < ng; j++) keys[j] = il * E + experts[j];
+    /* QWEN36_PREFETCH: a decode step borrows the copies of its experts done before their loads start */
+    q36_tensor *lent[8] = {0};
+    if (qpf_on && rows == 1 && !g->verify && g->defer_decode_advice && il < c->n_layers && ng == ne)
+        for (int j = 0; j < ng; j++) lent[j] = qwen_prefetch_lend(keys[j]);
     if (!qsl_start(&g->loader, keys, (unsigned)ng)) return 0;
     qg_advise(m, il, experts, ng, ng + K < ne ? ng + K : ne);
     /* The shared expert runs on the GPU while the worker reads from disk. */
@@ -981,25 +988,28 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
         int a = first[experts[g0]], done = 0;
         Slot *slots[QGC_MAX_GROUP] = {0};
         q36_tensor *gpu[8] = {0};
-        /* Decode: the experts the cache already holds are computed while the
-         * misses read, in a GPU batch of their own; the misses' pairs follow
-         * theirs. An expert's pairs stay together: with fast experts a
-         * left-out choice is another pair of the heaviest expert. Each choice
-         * is computed alone and expert_sum adds them in the router's order:
-         * the same bits in any order. */
+        /* Decode: the experts the cache already holds, and those whose copy
+         * was lent to the group, are computed while the misses read, in a GPU
+         * batch of their own; the misses' pairs follow theirs. An expert's
+         * pairs stay together: with fast experts a left-out choice is another
+         * pair of the heaviest expert. Each choice is computed alone and
+         * expert_sum adds them in the router's order: the same bits in any
+         * order. */
         if (ok && rows == 1 && ng == ne) {
             Slot *hit[8] = {0};
-            unsigned held = qsl_wait_hits(&g->loader, (void **)hit);
-            if (held > 0 && held < (unsigned)ng) {
+            unsigned held = qsl_wait_hits(&g->loader, (void **)hit), copied = 0;
+            for (int j = 0; j < ng; j++) copied += !hit[j] && lent[j];
+            if (held + copied > 0 && held + copied < (unsigned)ng) {
                 uint32_t order[8];
                 int o = 0;
+                for (int j = 0; j < ng; j++) gpu[j] = hit[j] ? hit[j]->gpu : lent[j];
                 for (int j = 0; j < ng; j++)
-                    if (hit[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
+                    if (gpu[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
                 done = o;
                 for (int j = 0; j < ng; j++)
-                    if (!hit[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
+                    if (!gpu[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
                 memcpy(pairs + a, order, (size_t)o * sizeof(uint32_t));
-                for (int j = 0; j < ng; j++) gpu[j] = hit[j] ? hit[j]->gpu : NULL;
+                qpf_early += copied;
                 ok = q36_expert_gate_up(g->eh, g->post, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
                      q36_expert_down(g->ey, g->eh, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
                      q36_gpu_flush();
@@ -1010,6 +1020,9 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
         if (tm_on()) g->ms[6] += tm_now() - t;
         if (ok && (rows == 1 || rows == g->verify) && il + 1 < c->n_layers)
             for (int r = 0; r < rows; r++) qg_advise_ahead(m, g, il, r);
+        /* QWEN36_PREFETCH: a decode step's guesses start copying now, while this layer's experts compute */
+        if (ok && rows == 1 && !g->verify && g->defer_decode_advice && il + 1 < c->n_layers && g->guess_layer == il + 1)
+            qwen_prefetch_issue(m, il + 1, g->guess_ids, g->guess_n);
         for (int s0 = 0; ok && s0 < ng; s0 += K) {      /* sub-groups of top-k slots (one when ng <= K) */
             int nk = ng - s0 < K ? ng - s0 : K;
             int a1 = s0 ? first[experts[g0 + s0]] : a + done, b1 = first[experts[g0 + s0 + nk - 1] + 1];
