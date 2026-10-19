@@ -23,8 +23,17 @@ test checks that line and skips the comparisons.
 
 With qwen36-canonical (QWEN36_CANONICAL_TOOL) it also writes the fixture's
 experts.qc and checks the experts read from it and QWEN36_PREFETCH.
+
+A second fixture is a GGUF (write_gguf_fixture), the same kind of model as
+llama.cpp's converter writes it, with the ggml block types of a Q4_K_M file and
+the others the graph reads: the graph on it against the CPU engine on the
+same file (Qwen36GgufGraphTest).
 """
+import contextlib
+import importlib.util
+import io
 import json
+import math
 import os
 import random
 import re
@@ -35,6 +44,7 @@ import sys
 import tempfile
 import unittest
 from array import array
+from pathlib import Path
 
 ENGINE = os.environ.get("QWEN36_GRAPH_ENGINE")
 CANONICAL = os.environ.get("QWEN36_CANONICAL_TOOL")    # qwen36-canonical, which writes experts.qc
@@ -165,6 +175,11 @@ def write_fixture(snap, nan_norm=False):
                    "rope_theta": 10000000, "attn_output_gate": True, "has_qk_norm": True, "has_bias": True,
                    "dn_vheads": DN_VHEADS, "dn_kheads": DN_KHEADS, "dn_kdim": DN_KDIM, "dn_vdim": DN_VDIM,
                    "dn_convk": DN_CONVK, "dn_conv_dim": DN_CONV}, f)
+    write_tokenizer(snap)
+
+
+def write_tokenizer(snap):
+    """tokenizer.json, VOCAB tokens with the chat ones."""
     # Byte-level pieces, one per character: the printable ASCII, then the
     # space and the newline as GPT-2 maps them, then pairs to fill the rows.
     pieces = [chr(c) for c in range(33, 127)] + ["Ġ", "Ċ"]
@@ -235,6 +250,207 @@ def write_clef_head(snap, width=8, heads=2, feedforward=16):
     with open(os.path.join(snap, "joint_head_config.json"), "w") as f:
         json.dump({"hidden_size": HIDDEN, "width": W, "routing_layers": 1, "layers": 1, "heads": heads,
                    "feedforward": F}, f)
+
+
+# The GGUF fixture (write_gguf_fixture): the model llama.cpp's converter writes for qwen35moe, at the graph's
+# geometry, its matrices in ggml blocks as a Q4_K_M file keeps them (gguf_type) and the other types the graph reads
+# in a few of them. Two DeltaNet key heads, not one: with one, every value head reads key head 0 in the file's tiled
+# order and in the grouped one alike. Experts 256 wide: whole 256-weight blocks in down too.
+G_INTER, G_DN_KHEADS, G_DN_VHEADS = 256, 2, 4
+G_DN_CONV = 2 * G_DN_KHEADS * DN_KDIM + G_DN_VHEADS * DN_VDIM
+# A type's ggml id, weights and bytes per block, and the deviation of its weights for a block scale of 1 with random
+# codes and sub-block scales (a K type's minimum, d times its codes' mean, centres them).
+GGML = {"F32": (0, 1, 4, 1.0), "Q4_0": (2, 32, 18, 4.61), "Q8_0": (8, 32, 34, 73.9), "Q4_K": (12, 256, 144, 258.3),
+        "Q5_K": (13, 256, 176, 526.9), "Q6_K": (14, 256, 210, 1365.7), "IQ4_NL": (20, 32, 18, 67.2),
+        "IQ3_S": (21, 256, 110, 170.3), "IQ4_XS": (23, 256, 136, 1246.2)}
+G_OTHER = {"output.weight": "Q6_K", "blk.1.attn_gate.weight": "Q5_K", "blk.2.ssm_out.weight": "IQ4_NL",
+           "blk.3.attn_output.weight": "IQ4_XS", "blk.4.ffn_up_shexp.weight": "Q6_K",
+           "blk.5.ffn_gate_inp.weight": "Q8_0", "blk.7.attn_k.weight": "Q4_K",
+           "blk.2.ffn_gate_exps.weight": "IQ4_XS", "blk.2.ffn_up_exps.weight": "IQ4_XS",
+           "blk.4.ffn_gate_exps.weight": "IQ4_NL", "blk.4.ffn_up_exps.weight": "IQ4_NL",
+           "blk.4.ffn_down_exps.weight": "Q8_0", "blk.6.ffn_down_exps.weight": "Q6_K",
+           "blk.7.ffn_down_exps.weight": "Q6_K"}
+G_EXPERTS = (("gate", HIDDEN, G_INTER), ("up", HIDDEN, G_INTER), ("down", G_INTER, HIDDEN))   # input, rows
+# ".scale" companions, a factor on a matrix's products (one per expert for the fused experts), as NVFP4 files and
+# llama.cpp's generic per-tensor scales have them
+G_SCALES = {"output.weight": 0.8, "blk.0.attn_qkv.weight": 1.5, "blk.3.attn_q.weight": 0.7,
+            "blk.1.ffn_down_exps.weight": None, "blk.5.ffn_up_exps.weight": None, "blk.6.ffn_gate_exps.weight": None}
+# A router bias (exp_probs_b) that puts four experts of layer 1 first for every row: a verify then reads that layer's
+# experts in one lease (qg_moe_verify), with the per-expert factors of its down. The fixture has no bias otherwise, as
+# the 35B model's files have none.
+G_ROUTE = {1: {e: 20.0 for e in (5, 22, 39, 58)}}
+
+
+def gguf_type(name, types=None):
+    """A matrix's type in the GGUF fixture: the dense ones Q8_0, the router F32, gate and up Q4_K, down Q5_K, but
+    for G_OTHER and `types`."""
+    given = dict(G_OTHER, **(types or {}))
+    if name in given:
+        return given[name]
+    if name.endswith("_exps.weight"):
+        return "Q5_K" if "_down_" in name else "Q4_K"
+    return "F32" if name.endswith("ffn_gate_inp.weight") else "Q8_0"
+
+
+def gguf_payload(types=None):
+    """The bytes of the GGUF fixture's largest expert: a slot of the graph's expert cache."""
+    return max(sum(n // GGML[gguf_type(f"blk.{i}.ffn_{part}_exps.weight", types)][1] *
+                   GGML[gguf_type(f"blk.{i}.ffn_{part}_exps.weight", types)][2] * rows for part, n, rows in G_EXPERTS)
+               for i in range(LAYERS))
+
+
+def gguf_blocks(rng, kind, n, sd):
+    """n weights of a block type as random codes, with block scales that give them about this deviation."""
+    _, per, size, unit = GGML[kind]
+    data = bytearray(rng.randbytes(n // per * size))
+    for o in range(0, len(data), size):
+        d = sd / unit * (0.5 + rng.random())
+        if kind in ("Q4_K", "Q5_K"):
+            data[o:o + 4] = struct.pack("<ee", d, d * (7.5 if kind == "Q4_K" else 15.5))
+        elif kind == "Q6_K":
+            data[o + 208:o + 210] = struct.pack("<e", d)
+        else:
+            data[o:o + 2] = struct.pack("<e", d)
+    return bytes(data)
+
+
+def write_gguf(path, metadata, tensors):
+    """GGUF v3 as tests/gguf_fixture.py writes it: metadata (key, type, value) of the types 4 (u32), 6 (f32) and
+    8 (string), tensors (name, dimensions from the row's, ggml type, bytes), the data aligned to 32 bytes."""
+    def string(text):
+        data = text.encode()
+        return struct.pack("<Q", len(data)) + data
+
+    out, offset = [b"GGUF", struct.pack("<IQQ", 3, len(tensors), len(metadata))], 0
+    for key, kind, value in metadata:
+        out.append(string(key) + struct.pack("<I", kind) +
+                   (string(value) if kind == 8 else struct.pack("<I" if kind == 4 else "<f", value)))
+    for name, ne, kind, data in tensors:
+        out.append(string(name) + struct.pack(f"<I{len(ne)}QIQ", len(ne), *ne, kind, offset))
+        offset += -(-len(data) // 32) * 32
+    head = b"".join(out)
+    with open(path, "wb") as f:
+        f.write(head + b"\0" * (-len(head) % 32))
+        for *_, data in tensors:
+            f.write(data + b"\0" * (-len(data) % 32))
+
+
+def write_gguf_fixture(snap, types=None, bias=None):
+    """model.gguf, gguf.json naming it and tokenizer.json, as `coli import --mode link` makes a model directory.
+    As llama.cpp writes them, the norms are full gamma (1 + w), A_log is A = -exp(A_log), and the DeltaNet value
+    heads are in the file's (tiled) order; a random model, so nothing has to be permuted. A few matrices have a
+    ".scale" (G_SCALES). types: a matrix's type by name, over gguf_type's. bias: a router bias by layer and expert
+    (G_ROUTE), else none."""
+    rng = random.Random(2)
+    tensors = []
+
+    def floats(n, scale, center=0.0):
+        return array("f", [center + (rng.random() * 2 - 1) * 3 ** 0.5 * scale for _ in range(n)]).tobytes()
+
+    def vector(name, values):
+        tensors.append((name, [len(values)], 0, array("f", values).tobytes()))
+
+    def matrix(name, ne, sd):
+        kind = gguf_type(name, types)
+        n = 1
+        for d in ne:
+            n *= d
+        tensors.append((name, ne, GGML[kind][0], floats(n, sd) if kind == "F32" else gguf_blocks(rng, kind, n, sd)))
+        if name in G_SCALES:
+            factors = [G_SCALES[name]] if G_SCALES[name] else [0.5 + 1.5 * rng.random() for _ in range(EXPERTS)]
+            vector(name[:-len(".weight")] + ".scale", factors)
+
+    def norm(name, n):
+        tensors.append((name, [n], 0, floats(n, 0.1, 1.0)))
+
+    matrix("token_embd.weight", [HIDDEN, VOCAB], 1.0)
+    matrix("output.weight", [HIDDEN, VOCAB], 0.25)
+    norm("output_norm.weight", HIDDEN)
+    for i in range(LAYERS):
+        p = f"blk.{i}."
+        norm(p + "attn_norm.weight", HIDDEN)
+        norm(p + "post_attention_norm.weight", HIDDEN)
+        if i % 4 == 3:
+            norm(p + "attn_q_norm.weight", HEAD_DIM)
+            norm(p + "attn_k_norm.weight", HEAD_DIM)
+            matrix(p + "attn_q.weight", [HIDDEN, Q_HEADS * HEAD_DIM * 2], HIDDEN ** -0.5)
+            matrix(p + "attn_k.weight", [HIDDEN, KV_HEADS * HEAD_DIM], HIDDEN ** -0.5)
+            matrix(p + "attn_v.weight", [HIDDEN, KV_HEADS * HEAD_DIM], HIDDEN ** -0.5)
+            matrix(p + "attn_output.weight", [Q_HEADS * HEAD_DIM, HIDDEN], (Q_HEADS * HEAD_DIM) ** -0.5)
+        else:
+            matrix(p + "attn_qkv.weight", [HIDDEN, G_DN_CONV], HIDDEN ** -0.5)
+            matrix(p + "attn_gate.weight", [HIDDEN, G_DN_VHEADS * DN_VDIM], HIDDEN ** -0.5)
+            for part in ("ssm_alpha", "ssm_beta"):   # in_proj_a and in_proj_b, floats as the loader reads them
+                tensors.append((p + part + ".weight", [HIDDEN, G_DN_VHEADS], 0,
+                                floats(HIDDEN * G_DN_VHEADS, HIDDEN ** -0.5)))
+            tensors.append((p + "ssm_conv1d.weight", [DN_CONVK, G_DN_CONV], 0, floats(DN_CONVK * G_DN_CONV, 0.5)))
+            vector(p + "ssm_dt.bias", [rng.random() - 0.5 for _ in range(G_DN_VHEADS)])
+            vector(p + "ssm_a", [-math.exp(0.5 + 1.5 * rng.random()) for _ in range(G_DN_VHEADS)])
+            tensors.append((p + "ssm_norm.weight", [DN_VDIM], 0, floats(DN_VDIM, 0.1, 1.0)))
+            matrix(p + "ssm_out.weight", [G_DN_VHEADS * DN_VDIM, HIDDEN], (G_DN_VHEADS * DN_VDIM) ** -0.5)
+        matrix(p + "ffn_gate_inp.weight", [HIDDEN, EXPERTS], 3 * HIDDEN ** -0.5)
+        if bias:   # in every layer: the loader looks for layer 0's
+            vector(p + "exp_probs_b.bias", [bias.get(i, {}).get(e, 0.0) for e in range(EXPERTS)])
+        matrix(p + "ffn_gate_shexp.weight", [HIDDEN, SHARED], HIDDEN ** -0.5)
+        matrix(p + "ffn_up_shexp.weight", [HIDDEN, SHARED], HIDDEN ** -0.5)
+        matrix(p + "ffn_down_shexp.weight", [SHARED, HIDDEN], SHARED ** -0.5)
+        tensors.append((p + "ffn_gate_inp_shexp.weight", [HIDDEN], 0, floats(HIDDEN, HIDDEN ** -0.5)))
+        for part, n, rows in G_EXPERTS:
+            matrix(p + f"ffn_{part}_exps.weight", [n, rows, EXPERTS], n ** -0.5)
+    a = "qwen35moe."
+    write_gguf(os.path.join(snap, "model.gguf"), [
+        ("general.architecture", 8, "qwen35moe"), (a + "block_count", 4, LAYERS), (a + "embedding_length", 4, HIDDEN),
+        (a + "attention.head_count", 4, Q_HEADS), (a + "attention.head_count_kv", 4, KV_HEADS),
+        (a + "attention.key_length", 4, HEAD_DIM), (a + "attention.value_length", 4, HEAD_DIM),
+        (a + "attention.layer_norm_rms_epsilon", 6, 1e-6), (a + "rope.freq_base", 6, 10000000.0),
+        (a + "rope.dimension_count", 4, HEAD_DIM // 4), (a + "full_attention_interval", 4, 4),
+        (a + "expert_count", 4, EXPERTS), (a + "expert_used_count", 4, TOPK),
+        (a + "expert_feed_forward_length", 4, G_INTER), (a + "expert_shared_feed_forward_length", 4, SHARED),
+        (a + "ssm.group_count", 4, G_DN_KHEADS), (a + "ssm.time_step_rank", 4, G_DN_VHEADS),
+        (a + "ssm.state_size", 4, DN_KDIM), (a + "ssm.inner_size", 4, G_DN_VHEADS * DN_VDIM),
+        (a + "ssm.conv_kernel", 4, DN_CONVK)], tensors)
+    with open(os.path.join(snap, "gguf.json"), "w") as f:
+        json.dump({"gguf": "model.gguf"}, f)
+    write_tokenizer(snap)
+
+
+def gguf_dense_bytes(types=None):
+    """The bytes of the GGUF fixture's dense matrices that the graph sees in the file (the others, floats, it
+    copies): its line at start says them."""
+    own = {True: [("attn_q", HIDDEN, Q_HEADS * HEAD_DIM * 2), ("attn_k", HIDDEN, KV_HEADS * HEAD_DIM),
+                  ("attn_v", HIDDEN, KV_HEADS * HEAD_DIM), ("attn_output", Q_HEADS * HEAD_DIM, HIDDEN)],
+           False: [("attn_qkv", HIDDEN, G_DN_CONV), ("attn_gate", HIDDEN, G_DN_VHEADS * DN_VDIM),
+                   ("ssm_out", G_DN_VHEADS * DN_VDIM, HIDDEN)]}
+    both = [("ffn_gate_inp", HIDDEN, EXPERTS), ("ffn_gate_shexp", HIDDEN, SHARED), ("ffn_up_shexp", HIDDEN, SHARED),
+            ("ffn_down_shexp", SHARED, HIDDEN)]
+    mats = [("output.weight", HIDDEN, VOCAB)] + [(f"blk.{i}.{part}.weight", n, rows) for i in range(LAYERS)
+                                                 for part, n, rows in own[i % 4 == 3] + both]
+    total = 0
+    for name, n, rows in mats:
+        _, per, size, _ = GGML[gguf_type(name, types)]
+        total += 0 if gguf_type(name, types) == "F32" else n // per * size * rows
+    return total
+
+
+def write_packed_copy(snap, out):
+    """The GGUF fixture in snap as `coli import --mode copy` lays it out, in the new directory out: the dense tensors
+    copied as they are and each layer's routed experts one per 4 KiB slot, gate | up | down, so that one read fetches
+    an expert (tools/gguf_import.py's write_packed, which `coli import` runs)."""
+    spec = importlib.util.spec_from_file_location(
+        "gguf_import", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "gguf_import.py"))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    os.mkdir(out)
+    parts, readers, meta, tensors = tool.open_model(Path(snap) / "model.gguf")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):   # its progress line
+            tool.write_packed(parts, readers, meta, tensors, LAYERS, Path(out) / "model.colibri.gguf")
+    finally:
+        for r in readers:
+            r.close()
+    with open(os.path.join(out, "gguf.json"), "w") as f:
+        json.dump({"gguf": "model.colibri.gguf"}, f)
+    shutil.copy(os.path.join(snap, "tokenizer.json"), out)
 
 
 def write_mtp_head(snap):
@@ -323,14 +539,16 @@ def relative_gap(a, b):
     return max(abs(x - y) for x, y in zip(a, b)) / max(abs(x) for x in a)
 
 
-@unittest.skipUnless(ENGINE, "make -C c test-qwen36-graph METAL=1 runs it (QWEN36_GRAPH_ENGINE)")
-class Qwen36GraphTest(unittest.TestCase):
+class GraphRuns(unittest.TestCase):
+    """Runs of the engine on a fixture and their checks, for both fixtures' tests."""
+
     @classmethod
-    def setUpClass(cls):
-        cls.dir = tempfile.mkdtemp(prefix="qwen36-graph-")
+    def start(cls, prefix, write):
+        """The fixture write() writes, in a new directory, and a first run that says whether the graph runs."""
+        cls.dir = tempfile.mkdtemp(prefix=prefix)
         cls.snap = os.path.join(cls.dir, "snap")
         os.mkdir(cls.snap)
-        write_fixture(cls.snap)
+        write(cls.snap)
         cls.runs = 0
         probe = cls.run_engine(PROMPT, 1, EXACT)
         if probe["code"] != 0:
@@ -374,17 +592,6 @@ class Qwen36GraphTest(unittest.TestCase):
             run[key] = floats_of(path) if os.path.exists(path) else array("f")
         return run
 
-    @classmethod
-    def mtp_snap(cls):
-        """The fixture with an MTP head beside it (write_mtp_head), written once."""
-        snap = os.path.join(cls.dir, "mtp")
-        if not os.path.isdir(snap):
-            os.mkdir(snap)
-            for name in os.listdir(cls.snap):
-                os.symlink(os.path.join(cls.snap, name), os.path.join(snap, name))
-            write_mtp_head(snap)
-        return {"SNAP": snap}
-
     def graph(self):
         if self.off:
             self.skipTest(self.off)
@@ -399,6 +606,24 @@ class Qwen36GraphTest(unittest.TestCase):
         for key in ("layers", "logits"):
             gap = relative_gap(a[key], b[key])
             self.assertLess(gap, tol, f"{what}: {key} differ by {gap:.3g} of their largest value")
+
+
+@unittest.skipUnless(ENGINE, "make -C c test-qwen36-graph METAL=1 runs it (QWEN36_GRAPH_ENGINE)")
+class Qwen36GraphTest(GraphRuns):
+    @classmethod
+    def setUpClass(cls):
+        cls.start("qwen36-graph-", write_fixture)
+
+    @classmethod
+    def mtp_snap(cls):
+        """The fixture with an MTP head beside it (write_mtp_head), written once."""
+        snap = os.path.join(cls.dir, "mtp")
+        if not os.path.isdir(snap):
+            os.mkdir(snap)
+            for name in os.listdir(cls.snap):
+                os.symlink(os.path.join(cls.snap, name), os.path.join(snap, name))
+            write_mtp_head(snap)
+        return {"SNAP": snap}
 
     @classmethod
     def experts_qc(cls):
@@ -1026,6 +1251,219 @@ class Qwen36GraphTest(unittest.TestCase):
                 keys = ("stdout", "logits", "layers") if mode else ("stdout",)
                 for key in keys:
                     self.assertEqual(spec[key], plain[key], f"{force}: {key}")
+
+
+# The CPU engine in the arithmetic of the graph's exact mode on a GGUF: the products of the file's blocks summed in
+# order (gq_matmul_f32), the floats' as the graph's router computes them in both modes.
+G_CPU = {"COLI_METAL": "0", "GQ_EXACT": "1"}
+G_SMALL_CACHE = {"QWEN_EXPERT_CACHE_BYTES": str(24 * gguf_payload())}    # 24 slots for 512 experts
+G_STREAM_CACHE = {"QWEN_EXPERT_CACHE_BYTES": str(300 * gguf_payload())}  # enough for the prompt windows
+G_PRODUCTS = re.compile(r"\[qwen36-metal\] GGUF: (\d+) products with the file's dense matrices and (\d+) with its "
+                        r"routed experts ran on the GPU")
+
+
+@unittest.skipUnless(ENGINE, "make -C c test-qwen36-graph METAL=1 runs it (QWEN36_GRAPH_ENGINE)")
+class Qwen36GgufGraphTest(GraphRuns):
+    """The graph on a GGUF (write_gguf_fixture) against the CPU engine on the same file: its matrices and routed
+    experts as the file's ggml blocks, of every type the graph reads, with their ".scale" factors, and the
+    DeltaNet's value heads and A as the file keeps them."""
+
+    # qwen_graph_eligible's reasons that are the device's: only they may keep the graph off this file
+    DEVICE = ("no Metal device", "the Apple Paravirtual device of a virtual machine",
+              "the Metal device cannot run the graph's kernels")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.start("qwen36-gguf-graph-", write_gguf_fixture)
+        if cls.off and not any(f"the Metal graph is off: {why};" in cls.off for why in cls.DEVICE):
+            cls.tearDownClass()
+            raise AssertionError("the Metal graph does not take the GGUF fixture: " + cls.off)
+
+    def assert_gguf(self, run):
+        """A graph run on the GGUF: the dense matrices seen in the file, its lines, and its products on the GPU."""
+        self.assert_ran(run, True)
+        self.assertIn("dense=mapped kv=", run["stderr"])
+        self.assertIn(f"({gguf_dense_bytes()} bytes mapped)", run["stderr"])
+        self.assertIn("[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the "
+                      "routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K)", run["stderr"])
+        m = G_PRODUCTS.search(run["stderr"])
+        self.assertTrue(m and int(m.group(1)) > 0 and int(m.group(2)) > 0, run["stderr"][-3000:])
+
+    def test_exact_matches_the_cpu_engine(self):
+        """Prompt and decode with an expert cache of 24 slots for 512 experts, decode with 300 (a step computes the
+        experts the cache holds while it reads the others), and a prompt of 1600 tokens in batches of 1024 rows:
+        the CPU engine's layers and logits within 1e-4 of their largest value (about 7e-6 when written), and its
+        text."""
+        self.graph()
+        long = (long_text(1600), 2, 24, {"QWEN36_PROMPT_ROWS": "1024"})
+        for text, n_new, slots, env in ((PROMPT, 1, 24, {}), (PROMPT, 6, 24, {}), (PROMPT, 6, 300, {}), long):
+            g = self.run_engine(text, n_new, EXACT, {"QWEN_EXPERT_CACHE_BYTES": str(slots * gguf_payload())}, env)
+            c = self.run_engine(text, n_new, G_CPU)
+            self.assert_gguf(g)
+            self.assert_ran(c, False)
+            self.assertIn(f"slots={slots} ", g["stderr"])
+            self.assert_close(g, c, 1e-4, f"exact graph and CPU engine, {n_new} tokens after {len(text)} characters")
+            self.assertEqual(g["stdout"], c["stdout"])
+
+    def test_fast_is_close_to_exact(self):
+        """The fast kernels, the prompt in windows of the batch with the experts after them, and decode with
+        experts evicted (about 4e-5 when written)."""
+        self.graph()
+        for n, rows in ((1600, "2048"), (2100, "1024")):
+            text, env = long_text(n), {"QWEN36_PROMPT_ROWS": rows}
+            f = self.run_engine(text, 2, G_STREAM_CACHE, env)
+            x = self.run_engine(text, 2, EXACT, G_STREAM_CACHE, env)
+            self.assert_gguf(f)
+            self.assertNotIn("prompt experts load eight at a time", f["stderr"])
+            self.assert_close(x, f, 3e-4, f"fast and exact graph, {n} tokens in batches of {rows} rows")
+        f = self.run_engine(PROMPT, 6, G_SMALL_CACHE)
+        x = self.run_engine(PROMPT, 6, EXACT, G_SMALL_CACHE)
+        self.assert_gguf(f)
+        self.assert_close(x, f, 3e-4, "fast and exact graph, decode")
+        self.assertEqual(x["stdout"], f["stdout"])
+
+    def test_fast_experts(self):
+        """QWEN36_FAST_EXPERTS, and QWEN36_FAST_GUESSED on top: the same output in every run, another than without."""
+        self.graph()
+        base = self.run_engine(PROMPT, 6, G_SMALL_CACHE)
+        for env in ({"QWEN36_FAST_EXPERTS": "2"}, {"QWEN36_FAST_EXPERTS": "3", "QWEN36_FAST_GUESSED": "2"}):
+            a = self.run_engine(PROMPT, 6, G_SMALL_CACHE, env)
+            b = self.run_engine(PROMPT, 6, G_SMALL_CACHE, env)
+            self.assert_gguf(a)
+            self.assertNotEqual(a["logits"], base["logits"], env)
+            for key in ("layers", "logits", "stdout"):
+                self.assertEqual(a[key], b[key], f"{env}: {key}")
+
+    def test_serve_resumes_from_the_copy(self):
+        """A second chat turn from the state where the first one's last turn opened: the layers and text of an
+        engine that reads it all, in exact mode."""
+        self.graph()
+        second = PROMPT + "Fox<|im_end|>\n" + chat(("user", "And the dog?"))
+        session = Serve(self, EXACT, G_SMALL_CACHE)
+        session.ask("a", PROMPT, 3)
+        layers, text = session.ask("b", second, 3)
+        log = session.close()
+        self.assertIn("from the previous turn", log)
+        fresh = Serve(self, EXACT, G_SMALL_CACHE)
+        flayers, ftext = fresh.ask("f", second, 3)
+        flog = fresh.close()
+        for err in (log, flog):   # on the graph: the CPU engine would resume from the copy too
+            self.assertIn("graph ready", err)
+            self.assertIn(f"({gguf_dense_bytes()} bytes mapped)", err)
+            m = G_PRODUCTS.search(err)
+            self.assertTrue(m and int(m.group(1)) > 0 and int(m.group(2)) > 0, err[-3000:])
+        self.assertEqual(layers, flayers)
+        self.assertEqual(text, ftext)
+
+    def test_forced_drafts(self):
+        """A verify on a GGUF. Nothing drafts there (no MTP head), so in ref.json mode the reference's own tokens are
+        forced as drafts (COLI_LOOKUP_FORCE=mixed: every other verify with a wrong one): the layers, logits and
+        tokens of plain decoding, bit for bit in exact mode. On a file whose router bias puts four experts of layer 1
+        first (G_ROUTE): a verify reads that layer's experts in one lease (qg_moe_verify), with their ".scale"
+        factors, and the other layers' in sub-groups of top-k slots. With the bias the graph matches the CPU engine
+        too."""
+        self.graph()
+        snap = os.path.join(self.dir, "routed")
+        os.mkdir(snap)
+        write_gguf_fixture(snap, bias=G_ROUTE)
+        routed = {"SNAP": snap}
+        g = self.run_engine(PROMPT, 4, EXACT, G_SMALL_CACHE, routed)
+        c = self.run_engine(PROMPT, 4, G_CPU, routed)
+        self.assert_gguf(g)
+        self.assert_ran(c, False)
+        self.assert_close(g, c, 1e-4, "exact graph and CPU engine with a router bias")
+        self.assertEqual(g["stdout"], c["stdout"])
+        ids = list(range(3, 21))
+        first = self.run_engine("", 10, EXACT, G_SMALL_CACHE, routed, ref=(ids, ids + [0] * 10))
+        tokens = [int(t) for t in re.search(rb"C engine : ((?:[0-9]+ )+)", first["stdout"]).group(1).split()]
+        ref = (ids, ids + tokens)
+        plain = self.run_engine("", 10, EXACT, G_SMALL_CACHE, routed, ref=ref)
+        drafts = {"COLI_LOOKUP": "1", "COLI_SPEC_GATE": "0", "COLI_LOOKUP_FORCE": "mixed", "COLI_LOOKUP_DRAFTS": "3"}
+        forced = self.run_engine("", 10, EXACT, G_SMALL_CACHE, routed, drafts, ref=ref)
+        for run in (plain, forced):
+            self.assert_gguf(run)
+            self.assertIn(b"Matching tokens: 10/10", run["stdout"])
+        m = re.search(r"\(([0-9]+)/([0-9]+) drafts in ([0-9]+) verifies\)", forced["stderr"])
+        self.assertTrue(m and int(m.group(3)) > 0 and int(m.group(1)) < int(m.group(2)), forced["stderr"][-3000:])
+        for key in ("layers", "logits", "stdout"):
+            self.assertEqual(forced[key], plain[key], key)
+
+    def test_packed_copy(self):
+        """The layout of `coli import --mode copy`, an expert in one read: the layers, logits and text of the file it
+        was copied from, bit for bit, in exact decode and in a fast prompt layer by layer; and with experts of a type
+        the graph's kernels do not read, the line, from the layout's own list of the experts' types."""
+        self.graph()
+        packed = os.path.join(self.dir, "packed")
+        write_packed_copy(self.snap, packed)
+        for prompt, n_new, envs in ((PROMPT, 4, (EXACT, G_SMALL_CACHE)),
+                                    (long_text(2100), 2, (G_STREAM_CACHE, {"QWEN36_PROMPT_ROWS": "1024"}))):
+            plain = self.run_engine(prompt, n_new, *envs)
+            run = self.run_engine(prompt, n_new, *envs, {"SNAP": packed})
+            self.assert_gguf(run)
+            for key in ("layers", "logits", "stdout"):
+                self.assertEqual(run[key], plain[key], key)
+        name = "blk.1.ffn_gate_exps.weight"
+        snap = os.path.join(self.dir, "packed-IQ3_S-source")
+        os.mkdir(snap)
+        write_gguf_fixture(snap, {name: "IQ3_S"})
+        write_packed_copy(snap, packed + "-IQ3_S")
+        run = self.run_engine(PROMPT, 2, {"SNAP": packed + "-IQ3_S"})
+        self.assert_ran(run, False)
+        self.assertIn(f"[qwen36-metal] the Metal graph is off: {name} is IQ3_S, a type its kernels do not read (Q8_0, "
+                      "Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS); the CPU engine runs the model", run["stderr"])
+
+    def test_steps_aside_with_a_line(self):
+        """A matrix of a type the graph's kernels do not read: the CPU engine runs the file, as with COLI_METAL=0,
+        and a line names the tensor and its type. A dense matrix of Q4_0, and routed experts of IQ3_S, as the
+        UD-IQ4_XS and UD-IQ4_NL files keep their gate and up."""
+        for name, kind, more in (("blk.0.attn_qkv.weight", "Q4_0", ", and floats in a dense matrix"),
+                                 ("blk.1.ffn_gate_exps.weight", "IQ3_S", "")):
+            snap = os.path.join(self.dir, kind)
+            os.mkdir(snap)
+            write_gguf_fixture(snap, {name: kind})
+            run = self.run_engine(PROMPT, 2, {"SNAP": snap})
+            cpu = self.run_engine(PROMPT, 2, {"SNAP": snap, "COLI_METAL": "0"})
+            self.assert_ran(run, False)
+            self.assertIn(f"[qwen36-metal] the Metal graph is off: {name} is {kind}, a type its kernels do not read "
+                          f"(Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS{more}); the CPU engine runs the model",
+                          run["stderr"])
+            for key in ("layers", "logits", "stdout"):
+                self.assertEqual(run[key], cpu[key], f"{kind}: {key}")
+
+    def test_header_check(self):
+        """GGUF_CHECK=1, the check of a header alone (docs/gguf.md), in a Metal build: the CPU engine's loader checks
+        the model as before, and a line says that the graph would run it, or, for experts of IQ3_S, why not."""
+        self.graph()
+        snap = os.path.join(self.dir, "check-IQ3_S")
+        os.mkdir(snap)
+        write_gguf_fixture(snap, {"blk.1.ffn_gate_exps.weight": "IQ3_S"})
+        for env, line in (({}, "[qwen36-metal] GGUF_CHECK: the Metal graph would run this model"),
+                          ({"SNAP": snap}, "[qwen36-metal] the Metal graph is off: blk.1.ffn_gate_exps.weight is "
+                                           "IQ3_S, a type its kernels do not read")):
+            run = self.run_engine(PROMPT, 1, {"GGUF_CHECK": "1"}, env)
+            # 2 for a GGUF that carries no tokenizer, as the fixture's (its tokenizer.json is beside it)
+            self.assertIn(run["code"], (0, 2), run["stderr"][-3000:])
+            self.assertIn(b"GGUF CHECK OK", run["stdout"], run["stderr"][-3000:])
+            self.assertIn(line, run["stderr"])
+            self.assertNotIn("graph ready", run["stderr"])
+
+    def test_options_of_our_format(self):
+        """The options of our own format on a GGUF change nothing, with a line: the MTP head (QWEN36_MTP=1),
+        experts.qc (QWEN36_EXPERTS_QC) and the copies of guesses from it (QWEN36_PREFETCH=1)."""
+        self.graph()
+        base = self.run_engine(PROMPT, 4, EXACT, G_SMALL_CACHE)
+        qc = os.path.join(self.dir, "experts.qc")
+        lines = (({"QWEN36_MTP": "1"}, "[qwen36-mtp] no drafts: the graph reads no MTP head from a GGUF model"),
+                 ({"QWEN36_EXPERTS_QC": qc}, f"[qwen-experts] QWEN36_EXPERTS_QC={qc} ignored: a GGUF model's experts "
+                                              "are read from the file"),
+                 ({"QWEN36_PREFETCH": "1"}, "QWEN36_PREFETCH=1 ignored: it copies from experts.qc, which is not "
+                                            "in use"))
+        for env, line in lines:
+            run = self.run_engine(PROMPT, 4, EXACT, G_SMALL_CACHE, env)
+            self.assert_gguf(run)
+            self.assertIn(line, run["stderr"])
+            for key in ("layers", "logits", "stdout"):
+                self.assertEqual(run[key], base[key], f"{env}: {key}")
 
 
 class Serve:

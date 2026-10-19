@@ -325,6 +325,19 @@ q36_map *q36_map_new(const void *base, size_t bytes) {
     return m;
 }
 
+/* A new window, [begin, end) of the mapping, and the view at offset in it. */
+static q36_tensor *q36_map_window(q36_map *m, size_t begin, size_t end, size_t offset, size_t bytes) {
+    if (end - begin > (size_t)g_device.maxBufferLength) return NULL;
+    id<MTLBuffer> window = [g_device newBufferWithBytesNoCopy:(void *)(m->base + begin) length:end - begin
+                                                      options:MTLResourceStorageModeShared deallocator:nil];
+    if (!window) return NULL;
+    m->offset[m->count] = begin;
+    m->length[m->count] = end - begin;
+    m->window[m->count] = window;
+    m->count++;
+    return q36_tensor_make(window, offset - begin, bytes);
+}
+
 /* Windows start on multiples of half their size, so any tensor up to 32 MiB
  * fits in one of them; a larger tensor gets a window of its own. */
 q36_tensor *q36_map_view(q36_map *m, size_t offset, size_t bytes) {
@@ -345,15 +358,12 @@ q36_tensor *q36_map_view(q36_map *m, size_t offset, size_t bytes) {
         begin = offset & ~(m->page - 1);
         end = (offset + bytes + m->page - 1) & ~(m->page - 1);
     }
-    if (end - begin > (size_t)g_device.maxBufferLength) return NULL;
-    id<MTLBuffer> window = [g_device newBufferWithBytesNoCopy:(void *)(m->base + begin) length:end - begin
-                                                      options:MTLResourceStorageModeShared deallocator:nil];
-    if (!window) return NULL;
-    m->offset[m->count] = begin;
-    m->length[m->count] = end - begin;
-    m->window[m->count] = window;
-    m->count++;
-    return q36_tensor_make(window, offset - begin, bytes);
+    return q36_map_window(m, begin, end, offset, bytes);
+}
+
+q36_tensor *q36_map_view_own(q36_map *m, size_t offset, size_t bytes) {
+    if (!m || !bytes || offset > m->bytes || bytes > m->bytes - offset || m->count == Q36_MAX_WINDOWS) return NULL;
+    return q36_map_window(m, offset & ~(m->page - 1), (offset + bytes + m->page - 1) & ~(m->page - 1), offset, bytes);
 }
 
 void q36_map_free(q36_map *m) {

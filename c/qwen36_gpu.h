@@ -49,6 +49,9 @@ q36_tensor *q36_tensor_upload(const void *data, size_t bytes);   /* new + copy *
  * of its views. */
 q36_map *q36_map_new(const void *base, size_t bytes);
 q36_tensor *q36_map_view(q36_map *m, size_t offset, size_t bytes);
+/* A view in a window of its own, of the pages it touches only: for a file whose other bytes the
+ * GPU must not hold resident (a GGUF keeps its experts between its dense tensors). */
+q36_tensor *q36_map_view_own(q36_map *m, size_t offset, size_t bytes);
 void q36_map_free(q36_map *m);
 
 int q36_gpu_flush(void);

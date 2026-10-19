@@ -104,7 +104,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_gpu.h"
 #include "qwen36_expert_source.h" /* optional experts.qc: checkpoint stamp and fixed planar records */
 #include <dispatch/dispatch.h>
-#include <sys/mman.h>     /* QWEN36_PREFETCH: experts.qc mapped to ask mincore */
+#include <sys/mman.h>     /* QWEN36_PREFETCH: experts.qc mapped to ask mincore; a GGUF mapped (qwen_gguf_map) */
 #include <sys/sysctl.h>
 #endif
 #ifdef COLI_VULKAN
@@ -1097,7 +1097,8 @@ typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; fl
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
                  uint8_t *gq; int gq_type; float gs;
-                 int mapped; /* q/sc are canonical.qc's pages (qwen_dense_mapped): never freed */
+                 int mapped; /* q/sc are canonical.qc's pages (qwen_dense_mapped), or gq the GGUF's
+                              * (the Metal graph, qwen_gguf_map): never freed */
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
@@ -1105,8 +1106,8 @@ static void qw_free(QW *w) {
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
     free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
 #endif
-    if (!w->mapped) { q36_wfree(w->q); free(w->sc); }
-    free((void*)w->w); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
+    if (!w->mapped) { q36_wfree(w->q); free(w->sc); free(w->gq); }
+    free((void*)w->w); free(w->q4); free(w->sg); q36_wfree(w->h);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL; w->mapped = 0;
 }
 
@@ -2781,6 +2782,35 @@ static int q36_gq_held(int type, int rows, int cols) {
 #endif
     return type;
 }
+#ifdef QWEN36_METAL_GRAPH
+/* GGUF mode under the Metal graph: every part of the file mapped read-only. The graph sees the
+ * dense matrices in it in place (qg_dense) and the CPU reads the embedding rows from it, as
+ * canonical.qc's matrices are read: nothing is copied, and the system's file cache holds what was
+ * read. The experts are read into the expert cache's slots (load_expert_merged). */
+static const uint8_t **g_gg_map;
+static size_t *g_gg_map_bytes;
+static int qwen_gguf_map(void) {
+    g_gg_map = calloc((size_t)g_gg.n_files, sizeof *g_gg_map);
+    g_gg_map_bytes = calloc((size_t)g_gg.n_files, sizeof *g_gg_map_bytes);
+    int p = 0;
+    for (; g_gg_map && g_gg_map_bytes && p < g_gg.n_files; p++) {
+        struct stat st;
+        if (fstat(g_gg.fds[p], &st)) break;
+        if (st.st_size <= 0) { errno = EINVAL; break; }   /* an empty part: errno holds no reason */
+        void *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, g_gg.fds[p], 0);
+        if (base == MAP_FAILED) break;
+        g_gg_map[p] = base;
+        g_gg_map_bytes[p] = (size_t)st.st_size;
+    }
+    if (g_gg_map && g_gg_map_bytes && p == g_gg.n_files) return 1;
+    int error = errno;   /* the reason, for the caller's line */
+    while (p-- > 0) munmap((void *)g_gg_map[p], g_gg_map_bytes[p]);
+    free(g_gg_map); free(g_gg_map_bytes);
+    g_gg_map = NULL; g_gg_map_bytes = NULL;
+    errno = error;
+    return 0;
+}
+#endif
 /* ---- canonical.qc: the INT8 dense matrices converted once (qwen36-canonical)
  * and read from the file at start instead of converted again. */
 typedef struct { int count; QdfSpec *spec; char (*name)[QDF_NAME]; } QwenDenseList;
@@ -2986,6 +3016,12 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
+#ifdef QWEN36_METAL_GRAPH
+        if (QWEN_GRAPH(m) && g_gg_map) {   /* the Metal graph reads the file's blocks in place (qg_dense) */
+            out->gq = (uint8_t *)g_gg_map[t->file] + t->off; out->gq_type = t->type; out->mapped = 1;
+            return;
+        }
+#endif
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
@@ -3421,10 +3457,12 @@ static void gguf_expert_scales(Model *m, int L) {
     }
 }
 
-/* Layer x's experts as a slot holds them (q36_gq_held) and the slot size that needs. */
+/* Layer x's experts as a slot holds them (q36_gq_held; the Metal graph's kernels read the file's
+ * rows) and the slot size that needs. */
 static void gguf_expert_held(Model *m, GqExp *x) {
     const int D = q36_eh(&m->c), I = m->c.inter;
     x->hg = q36_gq_held(x->tg, I, D); x->hu = q36_gq_held(x->tu, I, D); x->hd = q36_gq_held(x->td, D, I);
+    if (QWEN_GRAPH(m)) { x->hg = x->tg; x->hu = x->tu; x->hd = x->td; }
     x->hb_g = x->hg == x->tg ? x->eb_g : gq_row_bytes(x->hg, D) * I;
     x->hb_u = x->hu == x->tu ? x->eb_u : gq_row_bytes(x->hu, D) * I;
     x->hb_d = x->hd == x->td ? x->eb_d : gq_row_bytes(x->hd, I) * D;
@@ -3536,16 +3574,65 @@ static int gguf_report_unused(const Cfg *c) {
 }
 
 #ifdef QWEN36_METAL_GRAPH
-/* Whether the Metal graph runs this model: the INT8 dense trunk, the packed INT4
- * experts with groups of 64, the geometry of its kernels and a GPU that runs
- * them. Otherwise the CPU engine runs it, and one line says why. */
+/* GGUF mode: why the Metal graph's kernels cannot read the file, NULL when they can. They read the
+ * dense matrices in place as the file's blocks of six types, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL and
+ * IQ4_XS (q36_gq_row_bytes), at even offsets (their f16 fields are read as halves), and a dense
+ * matrix of floats (F32, F16 or BF16, as the published files keep the router) as the CPU engine
+ * holds it, in F32; the routed experts in the six types. A tensor that is not there, or of another
+ * shape, is the loader's to report. */
+static const char *qwen_gguf_graph_off(const Cfg *c, char *text, size_t cap) {
+    static const char *const attn[] = {"attn_q", "attn_k", "attn_v", "attn_output"};
+    static const char *const delta[] = {"attn_qkv", "attn_gate", "ssm_out"};
+    static const char *const ffn[] = {"ffn_gate_inp", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                                      "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    const char *layout = gguf_get_str(&g_gg, "colibri.layout");
+    const int packed = layout && !strcmp(layout, "expert-packed-v1");
+    char name[96];
+    int type = 0, experts = 0;
+    for (int i = -1; i < c->n_layers; i++) {   /* the head, then each layer */
+        int own = i < 0 ? 0 : c->is_attn[i] ? 4 : 3, n = i < 0 ? 1 : own + 7;
+        for (int k = 0; k < n; k++) {
+            experts = i >= 0 && k - own >= 4;
+            const char *part = i < 0 ? NULL : k < own ? (c->is_attn[i] ? attn : delta)[k] : ffn[k - own];
+            if (part) snprintf(name, sizeof name, "blk.%d.%s.weight", i, part);
+            else snprintf(name, sizeof name, "%s", gguf_find(&g_gg, "output.weight") ? "output.weight"
+                                                                                     : "token_embd.weight");   /* tied */
+            const gguf_tensor *t = experts && packed ? NULL : gguf_find(&g_gg, name);   /* packed: below */
+            int floats = t && (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16);
+            if (!t || t->ne[0] > INT_MAX || (floats && !experts)) continue;
+            if (!q36_gq_row_bytes(type = t->type, (int)t->ne[0])) goto refused;
+            if (!experts && t->off % 2) {
+                snprintf(text, cap, "%s lies at an odd offset of the file", name);
+                return text;
+            }
+        }
+    }
+    const gguf_kv *types = packed ? gguf_get(&g_gg, "colibri.expert_types") : NULL;   /* checked by the loader */
+    if (types && types->type == GGUF_T_ARRAY && types->atype == GGUF_T_U32 && types->n == (uint64_t)3 * c->n_layers)
+        for (int i = 0; i < 3 * c->n_layers; i++)
+            if (!q36_gq_row_bytes(type = (int)((const uint32_t *)types->arr)[i], i % 3 == 2 ? c->inter : c->hidden)) {
+                snprintf(name, sizeof name, "blk.%d.ffn_%s_exps.weight", i / 3,
+                         (const char *[]){"gate", "up", "down"}[i % 3]);
+                experts = 1;
+                goto refused;
+            }
+    return NULL;
+refused:
+    snprintf(text, cap, "%s is %s, a type its kernels do not read (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS%s)", name,
+             gq_type_name(type), experts ? "" : ", and floats in a dense matrix");
+    return text;
+}
+
+/* Whether the Metal graph runs this model: the INT8 dense trunk and the packed INT4 experts
+ * with groups of 64, or a GGUF's blocks (qwen_gguf_graph_off), the geometry of its kernels and
+ * a GPU that runs them. Otherwise the CPU engine runs it, and one line says why. */
 static int qwen_graph_eligible(Model *m) {
     const Cfg *c = &m->c;
     const char *qpack = getenv("QWEN36_QPACK"), *why = NULL;
-    char text[200];
-    if (g_gguf) why = "a GGUF model";
-    else if (!dense_i8_on() || dense_bits() != 8) why = "the dense weights are not INT8 (COLI_DENSE_I8=0 or COLI_DENSE_BITS)";
-    else if (getenv("COLI_KEEP_F32")) why = "COLI_KEEP_F32 keeps the f32 dense weights";
+    char text[200], gguf[300];
+    if (!g_gguf && (!dense_i8_on() || dense_bits() != 8))
+        why = "the dense weights are not INT8 (COLI_DENSE_I8=0 or COLI_DENSE_BITS)";
+    else if (!g_gguf && getenv("COLI_KEEP_F32")) why = "COLI_KEEP_F32 keeps the f32 dense weights";
     else if (qpack && *qpack) why = "a qpack container (QWEN36_QPACK)";
     else if (q36_waligned()) why = "COLI_VULKAN=1 runs the Vulkan dense chain";
     else if (g_q36_mux_slots > 1) {
@@ -3563,6 +3650,7 @@ static int qwen_graph_eligible(Model *m) {
               "dim<=128, hidden and expert sizes multiples of 64)";
     else if (g_tok_exact)   /* main sets it before model_init exactly when the snapshot has a Clef head */
         why = "a Clef decision head (DECIDE reads every position's hidden state, the graph returns the last one)";
+    else if (g_gguf) why = qwen_gguf_graph_off(c, gguf, sizeof gguf);
     else {
         g_xf_quiet = 1; int packed = xf_mode(m); g_xf_quiet = 0;
         size_t bytes = (size_t)3 * c->hidden * c->inter / 2;
@@ -3624,6 +3712,15 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
      * graph can (qwen_graph_eligible); COLI_METAL=0 keeps the CPU engine. */
     const char *metal_option = getenv("COLI_METAL");
     if (full_model && (!metal_option || atoi(metal_option))) m->metal_graph = qwen_graph_eligible(m);
+    if (m->metal_graph && g_gguf_dry) {   /* GGUF_CHECK: a header, checked by the CPU engine's loader */
+        fprintf(stderr, "[qwen36-metal] GGUF_CHECK: the Metal graph would run this model\n");
+        m->metal_graph = 0;
+    }
+    if (m->metal_graph && g_gguf && !qwen_gguf_map()) {
+        fprintf(stderr, "[qwen36-metal] the Metal graph is off: the GGUF file cannot be mapped (%s); the CPU engine "
+                        "runs the model\n", strerror(errno));
+        m->metal_graph = 0;
+    }
 #endif
     qwen_dense_file_open(m, snap, full_model);
     /* Quantize during load only for the full-model path (main()'s static Model,
@@ -3645,8 +3742,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else if (et && gq_blk_decoder(et->type)) {
             /* rows decoded per token in step(): a Q8_0 embedding stays ~1 byte/weight */
             m->embed_type = et->type; m->embed_rb = gq_row_bytes(et->type, c->hidden);
-            m->embed_gq = malloc((size_t)et->nbytes);
-            if (!m->embed_gq || et->ne[0] != c->hidden || et->ne[1] != c->vocab || gguf_read(&g_gg, et, m->embed_gq, 0, et->nbytes)) {
+            int in_place = 0;
+#ifdef QWEN36_METAL_GRAPH
+            /* the Metal graph maps the file: the rows are read from it in place (540 MB on the 35B) */
+            if ((in_place = QWEN_GRAPH(m) && g_gg_map)) m->embed_gq = (uint8_t *)g_gg_map[et->file] + et->off;
+#endif
+            if (!in_place) m->embed_gq = malloc((size_t)et->nbytes);
+            if (!m->embed_gq || et->ne[0] != c->hidden || et->ne[1] != c->vocab ||
+                (!in_place && gguf_read(&g_gg, et, m->embed_gq, 0, et->nbytes))) {
                 fprintf(stderr, "GGUF token_embd.weight: read failed\n"); exit(1);
             }
         } else {
@@ -3941,6 +4044,14 @@ static void qwen36_graph_mtp_load(Model *m) {
     if (v && *v && strcmp(v, "0") && strcmp(v, "1"))
         fprintf(stderr, "[qwen36-mtp] QWEN36_MTP=%s ignored: 0 turns the head off, 1 (the default) on\n", v);
     if (v && !strcmp(v, "0")) return;
+    if (g_gguf) {   /* the head comes from model-mtp.safetensors (tools/convert_qwen36.py), beside our own format */
+        char key[96];
+        const char *arch = gguf_get_str(&g_gg, "general.architecture");
+        snprintf(key, sizeof key, "%s.nextn_predict_layers", arch ? arch : "?");
+        if ((v && !strcmp(v, "1")) || gguf_get_int(&g_gg, key, 0) > 0)
+            fprintf(stderr, "[qwen36-mtp] no drafts: the graph reads no MTP head from a GGUF model\n");
+        return;
+    }
     if (!st_find(&m->S, "mtp.fc.weight")) {
         if (v && !strcmp(v, "1"))
             fprintf(stderr, "[qwen36-mtp] QWEN36_MTP=1 ignored: the container has no MTP head (tools/convert_qwen36.py "
@@ -4395,11 +4506,18 @@ static int container_layer_is_int4(Model *m, int layer) {
 #ifdef QWEN36_METAL_GRAPH
 /* ---- The Metal graph's expert cache (qwen36_global_cache.h): one budget for
  * the whole model instead of a cache per layer, slots that are Metal buffers
- * (the planar int4 weights, then the scales: what the graph's kernels read),
- * reads announced to the disk before they are made, and a group's misses
- * loaded in parallel. The CPU engine keeps its per-layer cache. */
+ * (the planar int4 weights, then the scales, or a GGUF's blocks: what the
+ * graph's kernels read), reads announced to the disk before they are made,
+ * and a group's misses loaded in parallel. The CPU engine keeps its per-layer
+ * cache. */
 static int qwen_slot_storage(Model *m, Slot *s) {
     Cfg *c = &m->c;
+    if (g_gguf) {   /* a GGUF's expert as the file holds it, gate | up | down (load_expert_merged) */
+        s->gpu = q36_tensor_new((size_t)m->gqe_max);
+        if (!s->gpu) return 0;
+        s->gqe = q36_tensor_data(s->gpu); s->eid = -1; s->is_int4 = 0;
+        return 1;
+    }
     size_t packed = (size_t)3 * c->hidden * c->inter / 2;
     size_t gu = (size_t)scale_count_gu(c), ns = 2 * gu + (size_t)scale_count_d(c);
     s->gpu = q36_tensor_new(packed + ns * sizeof(float));
@@ -4431,6 +4549,17 @@ static void qwen_expert_advise(Model *m, int layer, int eid) {
         uint64_t key = (uint64_t)(uint32_t)layer * h->experts + (uint32_t)eid;
         uint64_t offset = h->data_offset + key * h->stride;
         posix_fadvise(m->expert_file.fd, (off_t)offset, (off_t)h->record_bytes, POSIX_FADV_WILLNEED);
+        return;
+    }
+    if (g_gguf) {   /* the expert's rows in the layer's three tensors (load_expert_merged), or its packed slot */
+        if (layer < 0 || layer >= m->c.n_layers || eid < 0 || eid >= m->c.n_experts) return;
+        const GqExp *x = &m->gqx[layer];
+        const gguf_tensor *t[3] = {x->packed ? x->packed : x->g, x->u, x->d};
+        int64_t bytes[3] = {x->packed ? x->eb_g + x->eb_u + x->eb_d : x->eb_g, x->eb_u, x->eb_d};
+        int64_t stride[3] = {x->packed ? x->stride : x->eb_g, x->eb_u, x->eb_d};
+        for (int k = 0; k < (x->packed ? 1 : 3); k++)
+            posix_fadvise(g_gg.fds[t[k]->file], (off_t)(t[k]->off + (uint64_t)eid * stride[k]), (off_t)bytes[k],
+                          POSIX_FADV_WILLNEED);
         return;
     }
     char nm[256], qsnm[256]; int la = m->active_of[layer];
@@ -4584,13 +4713,14 @@ static int qwen_global_cache_init(Model *m) {
      * keeps the frequency policy, to measure. */
     const char *expected_env = getenv("QWEN36_CACHE_EXPECTED");
     int expected_on = !expected_env || strcmp(expected_env, "0");
-    if (!xf_mode(m) || c->topk < 1 || c->topk > QGC_MAX_GROUP ||
+    if ((!xf_mode(m) && !g_gguf) || c->topk < 1 || c->topk > QGC_MAX_GROUP ||
         c->n_layers < 1 || c->n_experts < 1 || c->n_layers > INT_MAX / c->n_experts) {
         fprintf(stderr, "[qwen-cache] the Metal graph needs the packed INT4 experts\n"); return 0;
     }
     if (c->hidden <= 0 || c->inter <= 0 || (uint64_t)c->hidden > (uint64_t)INT64_MAX / 3 / (uint64_t)c->inter) return 0;
     size_t packed = (size_t)3 * c->hidden * c->inter / 2;
     size_t scales = (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
+    if (g_gguf) { packed = (size_t)m->gqe_max; scales = 0; }   /* a GGUF's experts: its blocks (qwen_slot_storage) */
     if (!packed || packed > SIZE_MAX - scales) return 0;
     size_t layers = (size_t)c->n_layers + (m->mtp ? 1 : 0);   /* the MTP head's experts: one more layer */
     size_t payload = packed + scales, keys = layers * c->n_experts;
@@ -4605,8 +4735,8 @@ static int qwen_global_cache_init(Model *m) {
         return 0;
     }
     if (slots > keys + group) slots = keys + group;
-    /* One physical representation for every slot: check every expert first. */
-    for (int l = 0; l < c->n_layers; l++) for (int e = 0; e < c->n_experts; e++) {
+    /* One physical representation for every slot: check every expert first (a GGUF's, gguf_map_experts). */
+    for (int l = 0; !g_gguf && l < c->n_layers; l++) for (int e = 0; e < c->n_experts; e++) {
         char name[256]; snprintf(name, sizeof name, "model.layers.%d.mlp.experts.%d.merged_weight", m->active_of[l], e);
         st_tensor *t = st_find(&m->S, name);
         if (!t || t->nbytes != (int64_t)packed) { fprintf(stderr, "[qwen-cache] incompatible packed expert %s\n", name); return 0; }
@@ -4638,6 +4768,12 @@ fail:
 static void qwen_expert_file_open(Model *m, const char *snap) {
     char path[2048], error[2300]; struct stat info;
     const char *named = getenv("QWEN36_EXPERTS_QC");
+    if (g_gguf) {   /* a GGUF's experts are read from it */
+        if (named && *named && strcmp(named, "0"))
+            fprintf(stderr, "[qwen-experts] QWEN36_EXPERTS_QC=%s ignored: a GGUF model's experts are read from the "
+                            "file\n", named);
+        return;
+    }
     if (named && !strcmp(named, "0")) {
         fprintf(stderr, "[qwen-experts] QWEN36_EXPERTS_QC=0: the experts are read from the checkpoint\n");
         return;
@@ -7444,8 +7580,10 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
                 said_graph = 1;
                 fprintf(stderr, sp->graph_mtp ? "[qwen36] COLI_LOOKUP=1: the Metal graph drafts with the checkpoint's "
                                                 "MTP head only (model-mtp.safetensors); no prompt lookup\n"
-                                              : "[qwen36] COLI_LOOKUP=1: no prompt lookup on the Metal graph, and its "
-                                                "MTP head is off or absent (model-mtp.safetensors)\n");
+                                : g_gguf ? "[qwen36] COLI_LOOKUP=1: the Metal graph drafts with a checkpoint's MTP head "
+                                           "only, which it does not read beside a GGUF model: no drafts\n"
+                                : "[qwen36] COLI_LOOKUP=1: no prompt lookup on the Metal graph, and its MTP head is off "
+                                  "or absent (model-mtp.safetensors)\n");
             }
         }
         if (!sp->force) sp->lookup = 0;

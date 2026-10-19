@@ -27,21 +27,21 @@ Unlike the other engines' Metal paths, which `COLI_METAL=1` turns on
 default; the release archives build qwen36 without it, so their qwen36 is the
 CPU engine. `COLI_METAL=0` keeps the CPU engine. It also runs instead, with one
 line that says why, where the graph cannot: with a qpack container
-(`QWEN36_QPACK`), a GGUF model ([gguf.md](gguf.md)), `COLI_DENSE_I8=0`,
-`COLI_DENSE_BITS=4` or `16` or `COLI_KEEP_F32` (the graph reads the INT8 dense
-weights), `COLI_VULKAN=1` in a `VK=1` build (the Vulkan dense chain),
-`CACHE_ROUTE=1` (cache-aware routing is the CPU engine's), routed experts that
-are not planar INT4 with groups of 64 or `QWEN_EXPERT_KERNEL=0`, a model without
-routed experts or without a shared expert, a model with sigmoid routing,
-attention sinks, a sliding window or dense layers (Flint, Muse Spark: the CPU
-engine runs them), a geometry outside its kernels (top-k up to 8, up to 256
-experts, heads of up to 256, DeltaNet keys of up to 128, widths in multiples of
-64), a Clef decision head ([clef.md](clef.md): DECIDE reads the hidden state of
-every position, and the graph returns only the last one), no Metal device or one
-that cannot build the kernels, and the Apple Paravirtual device of virtual
-machines and CI runners. A serve of several conversations at once (`KV_SLOTS`
-above 1) keeps the CPU engine too: the graph holds one conversation's state on
-the GPU.
+(`QWEN36_QPACK`), a GGUF with a matrix of a type the graph does not read (see
+[GGUF](#gguf)), `COLI_DENSE_I8=0`, `COLI_DENSE_BITS=4` or `16` or
+`COLI_KEEP_F32` (the graph reads the INT8 dense weights), `COLI_VULKAN=1` in a
+`VK=1` build (the Vulkan dense chain), `CACHE_ROUTE=1` (cache-aware routing is
+the CPU engine's), routed experts that are not planar INT4 with groups of 64 or
+`QWEN_EXPERT_KERNEL=0`, a model without routed experts or without a shared
+expert, a model with sigmoid routing, attention sinks, a sliding window or dense
+layers (Flint, Muse Spark: the CPU engine runs them), a geometry outside its
+kernels (top-k up to 8, up to 256 experts, heads of up to 256, DeltaNet keys of
+up to 128, widths in multiples of 64), a Clef decision head ([clef.md](clef.md):
+DECIDE reads the hidden state of every position, and the graph returns only the
+last one), no Metal device or one that cannot build the kernels, and the Apple
+Paravirtual device of virtual machines and CI runners. A serve of several
+conversations at once (`KV_SLOTS` above 1) keeps the CPU engine too: the graph
+holds one conversation's state on the GPU.
 
 The graph takes no images: the vision tower is not loaded (a line at start says
 so), so a chat turn with an image is refused, and through the gateway the
@@ -58,6 +58,58 @@ above, `PILOT`, `HOT`, `COLIBRI_RESIDENT`) is not used: the graph has one cache,
 cache; its profile has the wall time, the counts and the disk time (summed over
 the readers, which read in parallel), and its phase columns stay 0 unless
 `COLI_TIMERS=1`.
+
+## GGUF
+
+A GGUF of a Qwen3.5 or Qwen3.6 MoE model (`qwen35moe`, [gguf.md](gguf.md)) runs
+on the graph too, read in place: its dense matrices and routed experts are
+computed as the file's ggml blocks, with one decoder per type and no second
+quantization. The model's own format (`canonical.qc`, `experts.qc`) and its
+kernels are unchanged beside it.
+
+- The graph reads Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS, in the dense
+  matrices and in the experts, each matrix and each layer of its own type, as
+  published files mix them, and a dense matrix of floats (F32, F16 or BF16; the
+  published files keep the router in F32) as the CPU engine holds it, in F32.
+  Of unsloth's Qwen3.6-35B-A3B files, UD-Q4_K_S, UD-Q4_K_M, UD-Q4_K_XL,
+  UD-Q5_K_M, UD-Q6_K and Q8_0 hold only these. UD-IQ4_XS and UD-IQ4_NL keep
+  their experts' gate and up in IQ3_S: a file with a matrix of another type
+  runs on the CPU engine, with a line that names the matrix and its type.
+- The dense matrices are seen in the file's mapping, each in a Metal buffer of
+  its own pages, since the file keeps the experts between them and the GPU holds
+  a buffer resident whole: nothing is copied. The embedding rows are read from
+  the mapping too. A matrix's `.scale` companion multiplies its products, per
+  matrix or per expert.
+- The routed experts go into the expert cache's slots as the file holds them,
+  gate, up and down one after the other, in three reads (one with `coli import
+  --mode copy`). A slot is as large as the file's largest expert: 2.0 MB on the
+  35B model's UD-Q4_K_M, against 1.8 MB in the model's own format, so the same
+  `QWEN_EXPERT_CACHE_BYTES` holds fewer of them. At an 8 GB Mac's default (a
+  sixteenth of the RAM, 512 MiB) the 35B model's files leave fewer than the 256
+  retained slots the layer-by-layer prompt needs (UD-Q4_K_M: 263 slots, 255
+  retained; the larger types fewer): a prompt then loads its experts eight at a
+  time, with a line, unless `QWEN_EXPERT_CACHE_BYTES` holds top-k + 256 slots
+  (538509312 bytes for UD-Q4_K_M).
+- The file's three differences from the checkpoint are taken as it stores
+  them, as the CPU engine takes them: full-gamma norms, `A = -exp(A_log)`, and
+  DeltaNet value heads in llama.cpp's tiled order (value head h reads key head
+  h modulo the key heads).
+- Exact mode (`QWEN36_METAL_EXACT=1`) sums each product as the CPU engine does
+  under `GQ_EXACT=1` (each product rounded, added in input order), and the F32
+  router as the CPU engine does in both modes: the test finds the CPU engine's
+  layers and logits within 1e-4 of their largest value (about 7e-6 measured).
+  In a `METAL=1` build that CPU path is `COLI_METAL=0 GQ_EXACT=1`. Fast mode
+  sums the dense products by SIMD groups in a decode step and on the matrix
+  units in a prompt; the experts' kernels are the same in both modes.
+- Not with a GGUF: the CPU's share of a fast prompt (`QWEN36_CPU_MATMUL`: its
+  products take INT8 weights), the MTP head, the graph's only drafter (no
+  drafts; a line says so when the file has one, or with `QWEN36_MTP=1` or
+  `COLI_LOOKUP=1`), `experts.qc` and `QWEN36_PREFETCH` (both
+  ignored, with a line). At exit a line counts the products with the file's
+  matrices and experts that ran on the GPU.
+- `GGUF_CHECK=1` (a header alone, [gguf.md](gguf.md)) builds no graph: the CPU
+  engine's loader checks the model, and a line says whether the graph would
+  run it.
 
 ## Memory
 
@@ -522,13 +574,32 @@ Without the head, prompt lookup's forced drafts (`COLI_LOOKUP_FORCE`) check
 verifies of up to six rows against plain decoding. On the Apple Paravirtual
 device it checks only the steps aside.
 
+It also writes the same kind of model as a GGUF, in the form `coli import`
+gives a model (`gguf.json` beside the file), as llama.cpp's converter writes
+`qwen35moe`: full-gamma norms, A instead of A_log, two DeltaNet key heads for
+four value heads in the file's tiled order, experts 256 wide, the dense
+matrices in Q8_0 and the experts' gate and up in Q4_K and down in Q5_K, as a
+Q4_K_M file has them, with every other type the graph reads in some matrices
+and layers, and `.scale` companions on a few. It checks the exact graph against
+the CPU engine on the same file (`GQ_EXACT=1`), the fast graph against the
+exact one, fast experts, a serve turn resumed from the copy, verifies of
+drafts forced in ref.json mode (`COLI_LOOKUP_FORCE`: nothing drafts on a GGUF)
+with plain decoding's bits, on a copy of the file whose router bias puts four
+experts of a layer first, so a verify reads that layer's experts in one lease
+(the 35B model's files have no bias), the line and the CPU engine with a dense
+matrix of Q4_0 and with experts of IQ3_S, the layout of
+`coli import --mode copy` (the same bits as the file it was copied from), the
+header check (`GGUF_CHECK=1`), and that the model's own format's options
+change nothing there.
+
 `DUMP_LAYERS=<file>` writes the projection, residual and MoE output of every
 layer for the last token, and `DUMP=<file>` the last logits. Two builds can be
 compared layer by layer this way.
 
 ## Limits
 
-- The routed experts must be in the planar INT4 format with groups of 64.
+- The routed experts must be in the planar INT4 format with groups of 64, or
+  a GGUF's blocks of the types in [GGUF](#gguf).
 - Exact mode keeps attention keys and values and the DeltaNet state in
   float32; fast mode keeps keys and values in half precision where a KV head
   serves eight query heads. The KV cache grows on demand.

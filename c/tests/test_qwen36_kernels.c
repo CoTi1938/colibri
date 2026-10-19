@@ -13,7 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 #include "../qwen36_gpu.h"
 #include "../qwen36_cpu_mm.h"
 #include "../ggml_quants.h"
@@ -1302,6 +1304,46 @@ static void test_map_views(void) {
     free(base);
 }
 
+/* Views of their own pages (q36_map_view_own: a GGUF's dense tensors, beside experts the GPU must not hold
+ * resident). A hole in the mapping stands for the pages that are not a view's: Metal refuses a buffer over it,
+ * so q36_map_view's window, which spans it, is refused, and the views around it are not. Their bytes, at
+ * offsets a GGUF gives its tensors (multiples of 32, not of a page), across a page and in the mapping's last
+ * partial page, are the mapping's, for the CPU and through a kernel. */
+static void test_map_views_own(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE), bytes = 6 * page + 96;
+    char *base = mmap(NULL, 7 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) { puts("map views of own pages: mmap failed"); g_failures++; return; }
+    for (size_t i = 0; i < 7 * page / 4; i++) ((float *)base)[i] = (float)(i % 1000003);   /* exact under +0 */
+    munmap(base + 3 * page, page);                                                    /* the hole: page 3 */
+    q36_map *m = q36_map_new(base, bytes);
+    q36_tensor *wide = q36_map_view(m, page + 32, 64);   /* first, with no window to reuse: one over the hole */
+    int refused = !wide;
+    q36_tensor_free(wide);
+    size_t offs[] = {32, 2 * page - 32, 4 * page + 96, 6 * page + 32};   /* pages 0, 1-2, 4-5, 6 */
+    size_t lens[] = {64, 64, 2 * page - 96, 64};
+    int bad = 0;
+    for (int i = 0; i < 4; i++) {
+        q36_tensor *v = q36_map_view_own(m, offs[i], lens[i]);
+        if (!v || q36_tensor_bytes(v) != lens[i] || memcmp(q36_tensor_data(v), base + offs[i], lens[i])) bad++;
+        if (v) {   /* the GPU sees the same bytes: the first word through a kernel */
+            q36_tensor *out = q36_tensor_new(4), *zero = q36_tensor_new(4);
+            q36_add(out, v, zero, 1);
+            q36_gpu_sync();
+            if (memcmp(q36_tensor_data(out), base + offs[i], 4)) bad++;
+            q36_tensor_free(zero);
+            q36_tensor_free(out);
+        }
+        q36_tensor_free(v);
+    }
+    refused = refused && !q36_map_view_own(m, bytes - 32, 64) && !q36_map_view_own(m, bytes + 32, 32) &&
+              !q36_map_view_own(m, 64, 0);
+    printf("%-34s %s  views=4 bad=%d refused=%d\n", "map views of their own pages", bad || !refused ? "FAIL" : "ok  ",
+           bad, refused);
+    if (bad || !refused) g_failures++;
+    q36_map_free(m);
+    munmap(base, 7 * page);
+}
+
 /* Two single-token updates use the same compensated state and outputs as an
  * exact two-row batch, including the first token's snapshot. Nonzero low
  * planes and dimensions that leave partial SIMD groups exercise the handoff. */
@@ -1926,6 +1968,7 @@ int main(void) {
     test_experts(128, 64, 4, 13, 33);
 
     test_map_views();
+    test_map_views_own();
 
     /* last, so the cases above keep their random inputs */
     test_dot(2, 72, 5, 1);                      /* no fma tail, a scalar run after the 16-wide loads */

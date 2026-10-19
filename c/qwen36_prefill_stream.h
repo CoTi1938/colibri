@@ -108,7 +108,7 @@ static int qg_cpu_moe_start(Model *m, Qwen36Graph *g, QgLayer *L, int il, int ro
  * topk, as the slots in the pairs do. */
 static int qg_stream_groups(Model *m, Qwen36Graph *g, int il, int rows, int from, int to, const int *first) {
     Cfg *c = &m->c;
-    int H = c->hidden, K = c->topk, E = c->n_experts, ok = 1;
+    int K = c->topk, E = c->n_experts, ok = 1;
     static q36_tensor *gpu[QLL_MAX_KEYS][8];   /* a group per topk experts: up to 256 groups */
     for (int r = from; ok && r < to;) {
         int end = r;
@@ -123,20 +123,20 @@ static int qg_stream_groups(Model *m, Qwen36Graph *g, int il, int rows, int from
             double t = tm_on() ? tm_now() : 0;
             ok = qll_wait(&g->stream_loader, keys, (unsigned)n, payloads);
             if (tm_on()) g->ms[6] += tm_now()-t;
-            for (int j = 0; j < 8; j++) gg[j] = NULL;
+            int eids[8];
+            for (int j = 0; j < 8; j++) { gg[j] = NULL; eids[j] = j < n ? g->stream_order[end+j] : -1; }
             for (int j = 0; ok && j < n; j++) {
                 Slot *slot = payloads[j];
                 ok = (gg[j] = slot ? slot->gpu : NULL) != NULL;
             }
-            ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, first[end], first[end+n]-first[end],
-                                         gg, rows, H, c->inter, K, g->slot_scales);
+            ok = ok && qg_experts(m, g, il, 0, first[end], first[end+n]-first[end], gg, eids, rows);
             end += n;
         }
         q36_gpu_barrier();
         for (int s = r; ok && s < end; s += K) {
-            int n = end-s < K ? end-s : K;
-            ok = q36_expert_down(g->ey, g->eh, g->pairs, first[s], first[s+n]-first[s],
-                                 gpu[(s-r)/K], rows, H, c->inter, K, g->slot_scales);
+            int n = end-s < K ? end-s : K, eids[8];
+            for (int j = 0; j < 8; j++) eids[j] = j < n ? g->stream_order[s+j] : -1;
+            ok = qg_experts(m, g, il, 1, first[s], first[s+n]-first[s], gpu[(s-r)/K], eids, rows);
         }
         q36_gpu_concurrent(0);
         /* Submit useful work before a possible next-group IO wait. No sync is

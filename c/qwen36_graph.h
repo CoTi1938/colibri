@@ -27,7 +27,10 @@
 #include "qwen36_cpu_mm.h"
 #include "qwen36_fast_experts.h"
 
-typedef struct { q36_tensor *q, *sc; int in, out; } QgDense;
+/* A dense matrix: INT8 rows q with a scale per row sc (canonical.qc's, or converted at start), or with gq a
+ * GGUF's (qg_dense_gguf): q the file's rows of ggml blocks of `type` times gs, or of floats (type GQ_F32), and
+ * sc NULL. */
+typedef struct { q36_tensor *q, *sc; int in, out; int gq, type; float gs; } QgDense;
 
 typedef struct {
     q36_tensor *in_ln, *post_ln;
@@ -47,6 +50,8 @@ struct Qwen36Graph {
     q36_map *map;                               /* the dense cache file */
     const char *map_base;
     size_t map_bytes;
+    q36_map **gmap;                             /* a GGUF's parts (qwen_gguf_map), and the bytes seen in them */
+    size_t gmap_bytes;
     QgLayer *L;
     QgDense head;
     /* batch tensors, `rows` rows each */
@@ -120,9 +125,35 @@ static int qg_mapped(const Qwen36Graph *g, const void *p, size_t bytes) {
     return g->map && at >= base && at - base <= g->map_bytes && bytes <= g->map_bytes - (at - base);
 }
 
+/* A GGUF's matrix: its blocks seen in place, each in a window of its own (the experts lie between the dense
+ * tensors, and the GPU holds a window resident whole); a matrix of floats as the CPU engine loaded it
+ * (load_t_n: F32, F16 and BF16 in F32, times its ".scale"), copied once. */
+static int qg_dense_gguf(Qwen36Graph *g, const QW *w, QgDense *out) {
+    out->in = w->I;
+    out->out = w->O;
+    out->gq = 1;
+    out->gs = 1.f;
+    if (w->w) {
+        out->type = GQ_F32;
+        return (out->q = q36_tensor_upload(w->w, (size_t)w->I * w->O * sizeof(float))) != NULL;
+    }
+    size_t bytes = (size_t)q36_gq_row_bytes(w->gq_type, w->I) * w->O;
+    for (int p = 0; w->gq && bytes && g->gmap && p < g_gg.n_files; p++) {
+        uintptr_t at = (uintptr_t)w->gq, base = (uintptr_t)g_gg_map[p];
+        if (at < base || at - base >= g_gg_map_bytes[p]) continue;
+        out->type = w->gq_type;
+        out->gs = w->gs;
+        out->q = q36_map_view_own(g->gmap[p], (size_t)(at - base), bytes);
+        if (out->q) g->gmap_bytes += bytes;
+        return out->q != NULL;
+    }
+    return 0;
+}
+
 /* A matrix of canonical.qc is seen in place; without the file it is copied
  * once. */
 static int qg_dense(Qwen36Graph *g, const QW *w, QgDense *out) {
+    if (g_gguf) return qg_dense_gguf(g, w, out);
     if (!w->q || !w->sc) return 0;
     size_t qb = (size_t)w->I * w->O, sb = (size_t)w->O * sizeof(float);
     const char *q = (const char *)w->q, *sc = (const char *)w->sc;
@@ -144,8 +175,31 @@ static void qg_dense_free(QgDense *d) {
     memset(d, 0, sizeof(*d));
 }
 
+/* The products with a GGUF's dense matrices and with its routed experts (a dispatch each), for the line at exit
+ * (qg_gguf_report): a test sees that the GPU computed them. */
+static unsigned long long qg_gguf_products, qg_gguf_experts;
+
 static int qg_mm(q36_tensor *y, q36_tensor *x, const QgDense *w, int rows) {
+    if (w->gq) {
+        qg_gguf_products++;
+        return w->type == GQ_F32 ? q36_dot_f32(y, x, w->q, rows, w->in, w->out)
+                                 : q36_dot_gq(y, x, w->q, w->type, w->gs, rows, w->in, w->out);
+    }
     return q36_dot_i8(y, x, w->q, w->sc, rows, w->in, w->out);
+}
+
+/* The router's logits: INT8 with ordered sums in exact mode (q36_router_dot), a GGUF's as qg_mm computes them
+ * (for floats the CPU engine's arithmetic in both modes, q36_dot_f32). The shared expert's products likewise. */
+static int qg_router(q36_tensor *y, q36_tensor *x, const QgDense *w, int rows) {
+    return w->gq ? qg_mm(y, x, w, rows) : q36_router_dot(y, x, w->q, w->sc, rows, w->in, w->out);
+}
+static int qg_shared_mm(q36_tensor *y, q36_tensor *x, const QgDense *w, int rows) {
+    return w->gq ? qg_mm(y, x, w, rows) : q36_shared_dot(y, x, w->q, w->sc, rows, w->in, w->out);
+}
+
+static void qg_gguf_report(void) {
+    fprintf(stderr, "[qwen36-metal] GGUF: %llu products with the file's dense matrices and %llu with its routed "
+                    "experts ran on the GPU\n", qg_gguf_products, qg_gguf_experts);
 }
 
 /* Whether the CPU's matrix unit takes products of this batch (qwen36_cpu_mm.h). */
@@ -377,6 +431,8 @@ static void qg_free(Model *m) {
     qg_dense_free(&g->mtp_fc);
     free(g->h_rows); free(g->mtp_pend);
     q36_map_free(g->map);
+    for (int p = 0; g->gmap && p < g_gg.n_files; p++) q36_map_free(g->gmap[p]);
+    free(g->gmap);
     free(g->snap_ids);
 #if QCM_ON
     if (g->cpu_shared.queue) dispatch_release(g->cpu_shared.queue);
@@ -412,16 +468,22 @@ static int qg_create(Model *m) {
                     QLL_MAX_KEYS);
     }
 #if QCM_ON
+    /* a GGUF's products are all the GPU's: the CPU's take INT8 weights */
     const char *cpu_mm = getenv("QWEN36_CPU_MATMUL");
-    g->cpu_mm = !cpu_mm || strcmp(cpu_mm, "0");
+    g->cpu_mm = !g_gguf && (!cpu_mm || strcmp(cpu_mm, "0"));
     if (g->cpu_mm) qcm_init();
 #endif
-    /* The matrices of canonical.qc are seen in place through its mapping. */
+    /* The matrices of canonical.qc are seen in place through its mapping, a GGUF's through its parts'. */
     if (m->dense_file.base) {
         g->map_base = (const char *)m->dense_file.base;
         g->map_bytes = m->dense_file.bytes;
         g->map = q36_map_new(g->map_base, g->map_bytes);
         if (!g->map) goto failed;
+    }
+    if (g_gguf) {
+        if (!g_gg_map || !(g->gmap = calloc((size_t)g_gg.n_files, sizeof *g->gmap))) goto failed;
+        for (int p = 0; p < g_gg.n_files; p++)
+            if (!(g->gmap[p] = q36_map_new(g_gg_map[p], g_gg_map_bytes[p]))) goto failed;
     }
     g->L = calloc((size_t)c->n_layers + m->mtp, sizeof(QgLayer));
     if (!g->L) goto failed;
@@ -462,7 +524,8 @@ static int qg_create(Model *m) {
         if (!L->bias) goto failed;
         /* Without canonical.qc the matrices were copied: the CPU's copies go, so the
          * dense weights are in memory once (a graph that fails stops the start, and
-         * the graph never runs the CPU engine's forward). */
+         * the graph never runs the CPU engine's forward). A GGUF's blocks stay in the
+         * file's mapping (qw_free leaves them), its floats go. */
         if (!g->map) {
             QW *w[] = {&l->q, &l->k, &l->v, &l->o, &l->dn_qkv, &l->dn_z, &l->dn_out,
                        &l->gate, &l->sh_g, &l->sh_u, &l->sh_d};
@@ -489,8 +552,15 @@ static int qg_create(Model *m) {
     if (!qsl_init(&g->loader, m->global_cache)) goto failed;
     fprintf(stderr, "[qwen36-metal] graph ready on %s: rows<=%d dense=%s kv=%s (%zu bytes mapped); the experts in the "
                     "global cache, not in the per-layer one\n",
-            q36_gpu_device_name(), qg_prompt_rows(), g->map ? "mapped" : "copied", g->kv_bytes == 2 ? "half" : "float",
-            g->map_bytes);
+            q36_gpu_device_name(), qg_prompt_rows(), g->map || g_gguf ? "mapped" : "copied",
+            g->kv_bytes == 2 ? "half" : "float", g_gguf ? g->gmap_bytes : g->map_bytes);
+    if (g_gguf) {
+        fprintf(stderr, "[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the "
+                        "routed experts as its blocks too (layer 0: gate %s, up %s, down %s), with no second "
+                        "quantization\n", gq_type_name(m->gqx[0].hg), gq_type_name(m->gqx[0].hu),
+                gq_type_name(m->gqx[0].hd));
+        atexit(qg_gguf_report);
+    }
     qg_fast_experts(c->topk);                   /* its line, if QWEN36_FAST_EXPERTS is set */
     qg_fast_guessed(c->topk);                   /* and QWEN36_FAST_GUESSED's */
     return 1;
@@ -785,10 +855,8 @@ static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il, int row) {
 /* The shared expert of the batch on the GPU, into g->shared. */
 static int qg_shared_gpu(Model *m, Qwen36Graph *g, QgLayer *L, int rows) {
     int H = m->c.hidden, SI = m->c.shared_inter;
-    return q36_shared_dot(g->sg, g->post, L->sh_g.q, L->sh_g.sc, rows, H, SI) &&
-           q36_shared_dot(g->su, g->post, L->sh_u.q, L->sh_u.sc, rows, H, SI) &&
-           q36_silu_mul(g->sh, g->sg, g->su, rows * SI) &&
-           q36_shared_dot(g->shared, g->sh, L->sh_d.q, L->sh_d.sc, rows, SI, H) &&
+    return qg_shared_mm(g->sg, g->post, &L->sh_g, rows) && qg_shared_mm(g->su, g->post, &L->sh_u, rows) &&
+           q36_silu_mul(g->sh, g->sg, g->su, rows * SI) && qg_shared_mm(g->shared, g->sh, &L->sh_d, rows) &&
            q36_shared_gate(g->scalar, g->post, L->sh_gate, rows, H) &&
            q36_scale_rows(g->shared, g->scalar, rows, H);
 }
@@ -855,6 +923,29 @@ static void qg_route_degrade(Model *m, Qwen36Graph *g, int il, int first, int ro
     }
 }
 
+/* The routed experts of slots gpu[0..8) for pairs [first, first + n): gate and up into eh, or down (down = 1)
+ * into ey. A GGUF's in its layer's types, with the ".scale" factors of each slot's expert, eids[j] for slot j
+ * (-1: none). */
+static int qg_experts(Model *m, Qwen36Graph *g, int il, int down, int first, int n, q36_tensor *const gpu[8],
+                      const int eids[8], int rows) {
+    Cfg *c = &m->c;
+    int H = c->hidden, I = c->inter, K = c->topk;
+    if (!g_gguf)
+        return down ? q36_expert_down(g->ey, g->eh, g->pairs, first, n, gpu, rows, H, I, K, g->slot_scales)
+                    : q36_expert_gate_up(g->eh, g->post, g->pairs, first, n, gpu, rows, H, I, K, g->slot_scales);
+    const GqExp *x = &m->gqx[il];
+    q36_gq_experts t = {x->hg, x->hu, x->hd, {0}, {0}, {0}};
+    for (int j = 0; j < 8; j++) {
+        int e = eids[j];
+        t.sg[j] = x->sg && e >= 0 ? x->sg[e] : 1.f;
+        t.su[j] = x->su && e >= 0 ? x->su[e] : 1.f;
+        t.sd[j] = x->sd && e >= 0 ? x->sd[e] : 1.f;
+    }
+    qg_gguf_experts++;
+    return down ? q36_expert_down_gq(g->ey, g->eh, g->pairs, first, n, gpu, rows, H, I, K, &t)
+                : q36_expert_gate_up_gq(g->eh, g->post, g->pairs, first, n, gpu, rows, H, I, K, &t);
+}
+
 /* The routed experts, by expert. The batch's choices are sorted by expert;
  * the distinct experts are read in groups of top-k (one cache lease each, the
  * first while the GPU computes the shared expert) and each group computes all
@@ -867,7 +958,7 @@ static void qg_route_degrade(Model *m, Qwen36Graph *g, int il, int first, int ro
 static int qg_moe_verify(Model *m, Qwen36Graph *g, int il, int rows, int ne, const int *experts, const int *first,
                          uint32_t *pairs) {
     Cfg *c = &m->c;
-    int H = c->hidden, K = c->topk, n = rows * K, ord[QGC_MAX_GROUP], at[QGC_MAX_GROUP + 1], o = 0, ok = 1;
+    int K = c->topk, n = rows * K, ord[QGC_MAX_GROUP], at[QGC_MAX_GROUP + 1], o = 0, ok = 1;
     uint32_t moved[8 * Q36_SPEC_ROWS];
     Slot *hit[QGC_MAX_GROUP] = {0}, *slots[QGC_MAX_GROUP] = {0};
     q36_tensor *gpu[8] = {0};
@@ -895,15 +986,15 @@ static int qg_moe_verify(Model *m, Qwen36Graph *g, int il, int rows, int ne, con
         }
         for (int s0 = from; ok && s0 < to; s0 += K) {
             int nk = to - s0 < K ? to - s0 : K;
+            int eids[8];
+            for (int j = 0; j < 8; j++) eids[j] = j < nk ? experts[ord[s0 + j]] : -1;
             for (int j = 0; j < K; j++) {
                 Slot *s = j >= nk ? NULL : part ? slots[ord[s0 + j]] : hit[ord[s0 + j]];
                 gpu[j] = s ? s->gpu : NULL;
                 if (j < nk && !gpu[j]) ok = 0;
             }
-            ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, at[s0], at[s0 + nk] - at[s0], gpu, rows, H,
-                                          c->inter, K, g->slot_scales) &&
-                 q36_expert_down(g->ey, g->eh, g->pairs, at[s0], at[s0 + nk] - at[s0], gpu, rows, H, c->inter, K,
-                                 g->slot_scales);
+            ok = ok && qg_experts(m, g, il, 0, at[s0], at[s0 + nk] - at[s0], gpu, eids, rows) &&
+                 qg_experts(m, g, il, 1, at[s0], at[s0 + nk] - at[s0], gpu, eids, rows);
         }
     }
     return ok;
@@ -1010,9 +1101,10 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
                     if (!gpu[j]) for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) order[o++] = pairs[q];
                 memcpy(pairs + a, order, (size_t)o * sizeof(uint32_t));
                 qpf_early += copied;
-                ok = q36_expert_gate_up(g->eh, g->post, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
-                     q36_expert_down(g->ey, g->eh, g->pairs, a, done, gpu, rows, H, c->inter, K, g->slot_scales) &&
-                     q36_gpu_flush();
+                int eids[8];
+                for (int j = 0; j < 8; j++) eids[j] = j < ng ? experts[j] : -1;
+                ok = qg_experts(m, g, il, 0, a, done, gpu, eids, rows) &&
+                     qg_experts(m, g, il, 1, a, done, gpu, eids, rows) && q36_gpu_flush();
             }
         }
         double t = tm_on() ? tm_now() : 0;
@@ -1025,11 +1117,11 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
             qwen_prefetch_issue(m, il + 1, g->guess_ids, g->guess_n);
         for (int s0 = 0; ok && s0 < ng; s0 += K) {      /* sub-groups of top-k slots (one when ng <= K) */
             int nk = ng - s0 < K ? ng - s0 : K;
-            int a1 = s0 ? first[experts[g0 + s0]] : a + done, b1 = first[experts[g0 + s0 + nk - 1] + 1];
+            int a1 = s0 ? first[experts[g0 + s0]] : a + done, b1 = first[experts[g0 + s0 + nk - 1] + 1], eids[8];
             for (int j = 0; ok && j < K; j++) ok = j >= nk || (gpu[j] = slots[s0 + j] ? slots[s0 + j]->gpu : NULL) != NULL;
-            ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, a1, b1 - a1, gpu, rows, H, c->inter, K,
-                                          g->slot_scales) &&
-                 q36_expert_down(g->ey, g->eh, g->pairs, a1, b1 - a1, gpu, rows, H, c->inter, K, g->slot_scales);
+            for (int j = 0; j < 8; j++) eids[j] = j < nk ? experts[g0 + s0 + j] : -1;
+            ok = ok && qg_experts(m, g, il, 0, a1, b1 - a1, gpu, eids, rows) &&
+                 qg_experts(m, g, il, 1, a1, b1 - a1, gpu, eids, rows);
         }
         if (!ok || (g0 += ng) == ne) break;
         ok = qg_cut(g, 2);
@@ -1183,7 +1275,7 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
     int H = c->hidden;
     q36_shape s = {rows, H, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
                    c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap,
-                   snap, 0, 0};
+                   snap, g_dn_tiled, g_ssm_a_direct};
     int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, H, c->eps, 0), width;
     const QgDense *wo;
     if (c->is_attn[il]) {
@@ -1237,16 +1329,18 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
     /* Decode: the next layer's router on this layer's residual guesses the
      * experts it will choose, so qg_moe can start reading them early. The two
      * routers go in one dispatch. */
-    if (ok && decode_ahead && rows == 1 && il + 1 < c->n_layers)
+    const QgDense *next = il + 1 < c->n_layers ? &g->L[il + 1].router : NULL;
+    if (ok && decode_ahead && rows == 1 && next)   /* a GGUF's two routers in two dispatches */
         ok = q36_rmsnorm(g->ahead, t->sum, g->L[il + 1].post_ln, 1, H, c->eps, 0) &&
-             q36_router_dot2(t->logits, t->post, L->router.q, L->router.sc, g->ahead_logits, g->ahead,
-                             g->L[il + 1].router.q, g->L[il + 1].router.sc, H, c->n_experts);
-    else if (ok && rows == g->verify && il + 1 < c->n_layers)   /* a verify: the same guess for each row */
-        ok = q36_router_dot(t->logits, t->post, L->router.q, L->router.sc, rows, H, c->n_experts) &&
+             (L->router.gq ? qg_router(t->logits, t->post, &L->router, 1) &&
+                             qg_router(g->ahead_logits, g->ahead, next, 1)
+                           : q36_router_dot2(t->logits, t->post, L->router.q, L->router.sc, g->ahead_logits, g->ahead,
+                                             next->q, next->sc, H, c->n_experts));
+    else if (ok && rows == g->verify && next)   /* a verify: the same guess for each row */
+        ok = qg_router(t->logits, t->post, &L->router, rows) &&
              q36_rmsnorm(g->ahead, t->sum, g->L[il + 1].post_ln, rows, H, c->eps, 0) &&
-             q36_router_dot(g->ahead_logits, g->ahead, g->L[il + 1].router.q, g->L[il + 1].router.sc, rows, H,
-                            c->n_experts);
-    else ok = ok && q36_router_dot(t->logits, t->post, L->router.q, L->router.sc, rows, H, c->n_experts);
+             qg_router(g->ahead_logits, g->ahead, next, rows);
+    else ok = ok && qg_router(t->logits, t->post, &L->router, rows);
     ok = ok && q36_router_softmax(t->prob, t->logits, L->bias, rows, c->n_experts) &&
          q36_router_select(t->ids, t->weights, t->prob, rows, c->n_experts, c->topk, groups, c->topk_group) &&
          qg_cut(g, 4);
@@ -1261,7 +1355,7 @@ static int qg_trunk_kv(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, i
     QgLayer *L = &g->L[il];
     q36_shape s = {rows, c->hidden, c->q_heads, c->kv_heads, c->head_dim, c->q_head_dim, c->rotary_dim,
                    c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim, pos, g->cap, 0,
-                   0, 0};
+                   g_dn_tiled, g_ssm_a_direct};
     int ok = q36_rmsnorm(t->normal, t->x, L->in_ln, rows, c->hidden, c->eps, 0) &&
              qg_mm(t->p1, t->normal, &L->k, rows) && qg_mm(t->p2, t->normal, &L->v, rows);
     if (ok && L->kn) ok = q36_rmsnorm(t->p1, t->p1, L->kn, rows * c->kv_heads, c->head_dim, c->eps, 0);
@@ -1371,10 +1465,11 @@ static void qg_dense_pages(void *arg) {
     madvise(g_dense_pages.at, g_dense_pages.bytes, MADV_WILLNEED);
 }
 static void qg_prefetch_dense(Qwen36Graph *g, int whole) {
-    if (!g->map || !g->head.q) return;          /* copied weights stay in memory */
+    int mapped = g->map || (g->head.gq && g->head.type != GQ_F32);   /* a GGUF's head in its file */
+    if (!mapped || !g->head.q) return;          /* copied weights stay in memory */
     uintptr_t page = (uintptr_t)getpagesize(), at = (uintptr_t)q36_tensor_data(g->head.q);
     size_t bytes = q36_tensor_bytes(g->head.q);
-    if (whole) {
+    if (whole && g->map) {                      /* a GGUF: the head only, its file holds the experts too */
         at = (uintptr_t)g->map_base;
         bytes = g->map_bytes;
     }
