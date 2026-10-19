@@ -2709,7 +2709,7 @@ constant uint Q36_GQ_Q8_0 = 8, Q36_GQ_Q4_K = 12, Q36_GQ_Q5_K = 13, Q36_GQ_Q6_K =
               Q36_GQ_IQ4_XS = 23;
 constant uint Q36_BDT_IQ4NL = 214;  // blockdec_table.h's BDT_IQ4NL: kvalues_iq4nl, as int
 
-struct q36_gq_args { uint rows, in, out, type, row_bytes; float scale; };
+struct q36_gq_args { uint rows, in, out, type, row_bytes; float scale; uint lpr; };
 
 inline float4 q36_gq_kv4(device const int *tab, uint4 i, float d) {
     return d * float4(tab[Q36_BDT_IQ4NL + i.x], tab[Q36_BDT_IQ4NL + i.y], tab[Q36_BDT_IQ4NL + i.z],
@@ -2827,44 +2827,264 @@ kernel void q36_dot_gq_exact(device const uchar *w [[buffer(0)]],
     y[z] = p.scale != 1.f ? acc * p.scale : acc;
 }
 
-// The same in fast mode for up to 8 rows (decode, a verify): one SIMD group per output, lane l on
-// steps l, l + 32, ..., each step decoded once for every row and a float4 fma chain per row, then
-// simd_sum. A row's operations do not depend on the others: in a batch it gets its bits alone.
+// Fast mode's matrix-vector products (up to 8 rows of x: decode, a verify; the experts of a decode step): lpr lanes
+// of a SIMD group on a row of weights, a power of two, spread over its blocks as llama.cpp's matrix-vector kernels
+// spread them (Q8_0: 4 lanes a block, 8 weights each; Q4_K and Q5_K: 8 lanes a block, 4 runs of 8 weights; Q6_K: 16
+// lanes a block, 4 runs of 4), the scales applied to the integer sums (d * sc * sum(q x) - dmin * m * sum(x)) rather
+// than to each weight. IQ4_NL and IQ4_XS take whole steps, lane at on steps at, at + lpr, ... A lane returns its part
+// of the row's dot product with x; q36_gq_lanes_sum adds a row's parts. Float, not the CPU's order of additions.
+inline float q36_gqf_q8_0(device const uchar *r, device const float *x, uint nb, uint at, uint lpr) {
+    uint il = at % 4;
+    float acc = 0;
+    for (uint b = at / 4; b < nb; b += lpr / 4) {
+        // blocks are 34 bytes: the lane's 8 int8 sit at a 2-byte boundary, one load of halves' alignment
+        device const uchar *blk = r + 34 * ulong(b);
+        ushort4 u = ushort4(*(device const packed_ushort4 *)(blk + 2 + 8 * il));
+        float4 q0 = float4(float2(as_type<char2>(u.x)), float2(as_type<char2>(u.y)));
+        float4 q1 = float4(float2(as_type<char2>(u.z)), float2(as_type<char2>(u.w)));
+        device const float *xp = x + 32 * b + 8 * il;
+        acc = fma(float(*(device const half *)blk), dot(q0, q36_load4(xp)) + dot(q1, q36_load4(xp + 4)), acc);
+    }
+    return acc;
+}
+
+// Q4_K and Q5_K: lane it of a block takes weights 8 ir .. 8 ir + 7 of groups g = 2 iq and g + 1 (the low and high
+// nibbles of the 8 bytes at qs + 32 iq + 8 ir) and of g + 4 and g + 5 (the 8 bytes 64 on); Q5_K's fifth bits are
+// the groups' bits of qh's bytes 8 ir .. 8 ir + 7.
+inline float q36_gqf_q45_k(uint t, device const uchar *r, device const float *x, uint nb, uint at, uint lpr) {
+    uint it = at % 8, iq = it / 4, ir = it % 4, g = 2 * iq, five = t == Q36_GQ_Q5_K;
+    float acc = 0;
+    for (uint b = at / 8; b < nb; b += lpr / 8) {
+        device const uchar *blk = r + (five ? 176 : 144) * ulong(b), *s = blk + 4;
+        device const uchar *qs = blk + (five ? 48 : 16) + 32 * iq + 8 * ir;
+        uint s0 = s[g], s1 = s[g + 1], s4 = s[g + 4], s5 = s[g + 5], s8 = s[g + 8], s9 = s[g + 9];
+        float4 sc = float4(uint4(s0 & 63u, s1 & 63u, (s8 & 15u) | ((s0 >> 2) & 0x30u),
+                                 (s9 & 15u) | ((s1 >> 2) & 0x30u)));
+        float4 mn = float4(uint4(s4 & 63u, s5 & 63u, (s8 >> 4) | ((s4 >> 2) & 0x30u), (s9 >> 4) | ((s5 >> 2) & 0x30u)));
+        uint4 l0 = q36_gq_bytes4(qs), l1 = q36_gq_bytes4(qs + 4);
+        uint4 h0 = q36_gq_bytes4(qs + 64), h1 = q36_gq_bytes4(qs + 68);
+        uint4 v[8] = {l0 & 15u, l1 & 15u, l0 >> 4, l1 >> 4, h0 & 15u, h1 & 15u, h0 >> 4, h1 >> 4};
+        if (five) {
+            uint4 e0 = q36_gq_bytes4(blk + 16 + 8 * ir), e1 = q36_gq_bytes4(blk + 20 + 8 * ir);
+            for (uint k = 0; k < 4; k++) {
+                uint gk = g + (k & 1) + 4 * (k >> 1);    // run k's group: g, g + 1, g + 4, g + 5
+                v[2 * k] |= ((e0 >> gk) & 1u) << 4;
+                v[2 * k + 1] |= ((e1 >> gk) & 1u) << 4;
+            }
+        }
+        device const float *xp = x + 256 * b + 64 * iq + 8 * ir;
+        float4 dq, sx;
+        for (uint k = 0; k < 4; k++) {
+            device const float *xk = xp + 32 * (k & 1) + 128 * (k >> 1);
+            float4 x0 = q36_load4(xk), x1 = q36_load4(xk + 4);
+            dq[k] = dot(float4(v[2 * k]), x0) + dot(float4(v[2 * k + 1]), x1);
+            sx[k] = dot(x0 + x1, float4(1));
+        }
+        acc += float(*(device const half *)blk) * dot(sc, dq) - float(*(device const half *)(blk + 2)) * dot(mn, sx);
+    }
+    return acc;
+}
+
+// Q6_K: lane tid of a block takes weights l0 .. l0 + 3 of the four runs (32 apart) of half ip: ql's low nibbles of
+// the run's bytes for the first two runs and high for the last two, qh's bits 0-1, 2-3, 4-5, 6-7, a scale each.
+inline float q36_gqf_q6_k(device const uchar *r, device const float *x, uint nb, uint at, uint lpr) {
+    uint tid = at % 16, ip = tid / 8, l0 = 4 * (tid % 8);
+    float acc = 0;
+    for (uint b = at / 16; b < nb; b += lpr / 16) {
+        device const uchar *blk = r + 210 * ulong(b), *ql = blk + 64 * ip + l0;
+        device const char *sc = (device const char *)(blk + 192 + 8 * ip + l0 / 16);
+        uint4 a = q36_gq_bytes4(ql), c = q36_gq_bytes4(ql + 32), h = q36_gq_bytes4(blk + 128 + 32 * ip + l0);
+        float4 v0 = float4(int4((a & 15u) | ((h & 3u) << 4)) - 32);
+        float4 v1 = float4(int4((c & 15u) | (((h >> 2) & 3u) << 4)) - 32);
+        float4 v2 = float4(int4((a >> 4) | (((h >> 4) & 3u) << 4)) - 32);
+        float4 v3 = float4(int4((c >> 4) | ((h >> 6) << 4)) - 32);
+        device const float *xp = x + 256 * b + 128 * ip + l0;
+        float4 dq = float4(dot(v0, q36_load4(xp)), dot(v1, q36_load4(xp + 32)), dot(v2, q36_load4(xp + 64)),
+                           dot(v3, q36_load4(xp + 96)));
+        acc = fma(float(*(device const half *)(blk + 208)),
+                  dot(dq, float4(float(sc[0]), float(sc[2]), float(sc[4]), float(sc[6]))), acc);
+    }
+    return acc;
+}
+
+inline float q36_gqf_steps(uint t, device const uchar *r, device const float *x, uint steps, uint at, uint lpr,
+                           device const int *tab) {
+    float4 acc = 0;
+    for (uint q = at; q < steps; q += lpr) {
+        float4 w[8];
+        q36_gq_step(t, r, q, tab, w);
+        for (uint k = 0; k < 8; k++) acc = fma(w[k], q36_load4(x + 32 * q + 4 * k), acc);
+    }
+    return (acc.x + acc.y) + (acc.z + acc.w);
+}
+
+// A lane's part of row r's dot product with x (in inputs); lpr is at least the type's lanes a block (the host's
+// q36_gq_lanes).
+inline float q36_gqf_part(uint t, device const uchar *r, device const float *x, uint in, uint at, uint lpr,
+                          device const int *tab) {
+    if (t == Q36_GQ_Q8_0) return q36_gqf_q8_0(r, x, in / 32, at, lpr);
+    if (t == Q36_GQ_Q4_K || t == Q36_GQ_Q5_K) return q36_gqf_q45_k(t, r, x, in / 256, at, lpr);
+    if (t == Q36_GQ_Q6_K) return q36_gqf_q6_k(r, x, in / 256, at, lpr);
+    return q36_gqf_steps(t, r, x, in / 32, at, lpr, tab);
+}
+
+inline float q36_gq_lanes_sum(float a, uint lpr) {
+    for (ushort d = ushort(lpr / 2); d > 0; d >>= 1) a += simd_shuffle_down(a, d);
+    return a;
+}
+
+// y[row][o] = scale * sum_i w[o][i] * x[row][i] in fast mode for up to 8 rows: 32 / lpr outputs a SIMD group, each
+// row of x on its own, so a row gets its bits alone in a batch. Lanes past the last output read it again, as every
+// lane reaches the shuffles. LPR > 0 fixes the lanes a row at compile time (q36_dot_gq_row32: one row of x and 32
+// lanes, the decode of every matrix of the 35B model), which an M1 runs 4-12% faster than p.lpr.
+template <uint LPR>
+inline void q36_dot_gq_lanes(device const uchar *w, device const int *tab, device const float *x, device float *y,
+                             constant q36_gq_args &p, uint rows, uint tg, ushort lane) {
+    uint lpr = LPR ? LPR : p.lpr, sh = ctz(lpr), o = (tg << (5 - sh)) + (lane >> sh), at = lane & (lpr - 1);
+    device const uchar *wr = w + ulong(min(o, p.out - 1)) * p.row_bytes;
+    for (uint r = 0; r < rows; r++) {
+        float sum = q36_gq_lanes_sum(q36_gqf_part(p.type, wr, x + ulong(r) * p.in, p.in, at, lpr, tab), lpr);
+        if (o < p.out && at == 0) y[ulong(r) * p.out + o] = p.scale != 1.f ? sum * p.scale : sum;
+    }
+}
+
 kernel void q36_dot_gq_vec(device const uchar *w [[buffer(0)]],
                            device const int *tab [[buffer(1)]],
                            device const float *x [[buffer(2)]],
                            device float *y [[buffer(3)]],
                            constant q36_gq_args &p [[buffer(4)]],
-                           uint o [[threadgroup_position_in_grid]],
+                           uint tg [[threadgroup_position_in_grid]],
                            ushort lane [[thread_index_in_simdgroup]]) {
-    if (o >= p.out) return;
-    device const uchar *wr = w + ulong(o) * p.row_bytes;
-    float4 acc[8];
-    for (uint r = 0; r < 8; r++) acc[r] = 0;
-    for (uint q = lane; q < p.in / 32; q += 32) {
-        float4 v[8];
-        q36_gq_step(p.type, wr, q, tab, v);
-        for (uint r = 0; r < 8; r++) {
-            if (r >= p.rows) break;
-            device const float *xr = x + ulong(r) * p.in + 32 * q;
-            for (uint k = 0; k < 8; k++) acc[r] = fma(v[k], q36_load4(xr + 4 * k), acc[r]);
-        }
+    q36_dot_gq_lanes<0>(w, tab, x, y, p, p.rows, tg, lane);
+}
+
+kernel void q36_dot_gq_row32(device const uchar *w [[buffer(0)]],
+                             device const int *tab [[buffer(1)]],
+                             device const float *x [[buffer(2)]],
+                             device float *y [[buffer(3)]],
+                             constant q36_gq_args &p [[buffer(4)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             ushort lane [[thread_index_in_simdgroup]]) {
+    q36_dot_gq_lanes<32>(w, tab, x, y, p, 1, tg, lane);
+}
+
+// Weights 4 m .. 4 m + 3 of step q of the row at r (q36_gq_step's w[m], the same operations): the prompt kernels'
+// lanes decode their own weights straight into the matrix operands.
+inline float4 q36_gq_four(uint t, device const uchar *r, uint q, uint m, device const int *tab) {
+#pragma clang fp contract(off)
+    if (t == Q36_GQ_Q8_0) {
+        device const uchar *b = r + 34 * ulong(q);
+        return float4(char4(*(device const packed_char4 *)(b + 2 + 4 * m))) * float(*(device const half *)b);
     }
-    for (uint r = 0; r < 8; r++) {
-        if (r >= p.rows) break;
-        float sum = simd_sum((acc[r].x + acc[r].y) + (acc[r].z + acc[r].w));
-        if (lane == 0) y[ulong(r) * p.out + o] = p.scale != 1.f ? sum * p.scale : sum;
+    if (t == Q36_GQ_Q4_K || t == Q36_GQ_Q5_K) {
+        uint g = q & 7;
+        device const uchar *b = r + (t == Q36_GQ_Q4_K ? 144 : 176) * ulong(q >> 3), *s = b + 4;
+        float d = float(*(device const half *)b), dmin = float(*(device const half *)(b + 2));
+        uint sc = g < 4 ? s[g] & 63 : (s[g + 4] & 15) | ((s[g - 4] >> 2) & 0x30);
+        uint mn = g < 4 ? s[g + 4] & 63 : (s[g + 4] >> 4) | ((s[g] >> 2) & 0x30);
+        float d1 = d * float(sc), m1 = dmin * float(mn);
+        device const uchar *qs = b + (t == Q36_GQ_Q4_K ? 16 : 48) + 32 * (g >> 1) + 4 * m;
+        uint4 v = (q36_gq_bytes4(qs) >> (4 * (g & 1))) & 15u;
+        if (t == Q36_GQ_Q5_K) v |= ((q36_gq_bytes4(b + 16 + 4 * m) >> g) & 1u) << 4;
+        return d1 * float4(v) - m1;
+    }
+    if (t == Q36_GQ_Q6_K) {
+        uint j = q & 7, n = j >> 2, mm = j & 3;
+        device const uchar *b = r + 210 * ulong(q >> 3), *ql = b + 64 * n + 32 * (mm & 1), *qh = b + 128 + 32 * n;
+        device const char *sc = (device const char *)(b + 192 + 2 * j);
+        float s = float(*(device const half *)(b + 208)) * float(sc[m >> 2]);
+        uint4 v = ((q36_gq_bytes4(ql + 4 * m) >> (4 * (mm >> 1))) & 15u) |
+                  (((q36_gq_bytes4(qh + 4 * m) >> (2 * mm)) & 3u) << 4);
+        return s * float4(int4(v) - 32);
+    }
+    device const uchar *qs;
+    float d;
+    if (t == Q36_GQ_IQ4_NL) {
+        device const uchar *b = r + 18 * ulong(q);
+        d = float(*(device const half *)b);
+        qs = b + 2;
+    } else {
+        uint ib = q & 7;
+        device const uchar *b = r + 136 * ulong(q >> 3);
+        uint shi = *(device const ushort *)(b + 2);
+        int ls = int(((b[4 + (ib >> 1)] >> (4 * (ib & 1))) & 15) | (((shi >> (2 * ib)) & 3) << 4));
+        d = float(*(device const half *)b) * float(ls - 32);
+        qs = b + 8 + 16 * ib;
+    }
+    uint4 v = q36_gq_bytes4(qs + 4 * (m & 3));
+    return q36_gq_kv4(tab, m < 4 ? v & 15u : v >> 4, d);
+}
+
+// A lane's decoder of one weight row in the experts' prompt kernels: q36_gq_four's 4 weights a step, Q4_K and Q5_K
+// taking a block's d, dmin, scale bytes and (Q5_K) the fifth bits of the lane's inputs in every group (qh's bytes
+// 4 m .. 4 m + 3) once for its 8 steps (q36_gq_rowdec_block at each step 8 b) instead of at every step. The same
+// operations as q36_gq_four, so the same weights.
+struct q36_gq_rowdec {
+    device const uchar *r;
+    uint dd, s0, s1, s2, qh;        // d and dmin (two halves), the 12 scale bytes, Q5_K's fifth bits
+};
+
+inline uint q36_gq_word(device const uchar *p) { return as_type<uint>(uchar4(*(device const packed_uchar4 *)p)); }
+
+inline void q36_gq_rowdec_block(thread q36_gq_rowdec &dc, uint t, uint m, uint b) {
+    if (t != Q36_GQ_Q4_K && t != Q36_GQ_Q5_K) return;
+    device const uchar *k = dc.r + (t == Q36_GQ_Q4_K ? 144 : 176) * ulong(b);
+    dc.dd = q36_gq_word(k);
+    dc.s0 = q36_gq_word(k + 4);
+    dc.s1 = q36_gq_word(k + 8);
+    dc.s2 = q36_gq_word(k + 12);
+    dc.qh = t == Q36_GQ_Q5_K ? q36_gq_word(k + 16 + 4 * m) : 0;
+}
+
+inline float4 q36_gq_rowdec_four(thread const q36_gq_rowdec &dc, uint t, uint m, uint q, device const int *tab) {
+#pragma clang fp contract(off)
+    if (t != Q36_GQ_Q4_K && t != Q36_GQ_Q5_K) return q36_gq_four(t, dc.r, q, m, tab);
+    // gq_scale_min_k4 from the words: bytes g and g + 4 (g < 4), or 8 + g' with the top bits of g' and 4 + g'
+    uint g = q & 7, sh = 8 * (g & 3), b0 = (dc.s0 >> sh) & 255, b1 = (dc.s1 >> sh) & 255, b2 = (dc.s2 >> sh) & 255;
+    uint sc = g < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4), mn = g < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+    float2 dm = float2(as_type<half2>(dc.dd));
+    float d1 = dm.x * float(sc), m1 = dm.y * float(mn);
+    device const uchar *qs = dc.r + (t == Q36_GQ_Q4_K ? 144 : 176) * ulong(q >> 3) + (t == Q36_GQ_Q4_K ? 16 : 48) +
+                             32 * (g >> 1) + 4 * m;
+    uint v = (q36_gq_word(qs) >> (4 * (g & 1))) & 0x0f0f0f0fu;
+    if (t == Q36_GQ_Q5_K) v |= ((dc.qh >> g) & 0x01010101u) << 4;
+    return d1 * float4(as_type<uchar4>(v)) - m1;
+}
+
+// One step of the prompt kernels below: the x tile (32 rows, a step of 32 inputs, staged by the threadgroup into
+// threadgroup memory in q36_dot_i8_mm's order: 8x8 blocks [sub-step j][row block][row][m] for input 4 m + j) times
+// the lane's weights wv (q36_gq_four of its 8 output rows: 8 cb + sn and + 1 for cb = 0..3), into the SIMD group's
+// 16 accumulators. Accumulators live as float2 and become matrices only around each operation, as q36_dot_i8_mm
+// keeps them.
+inline void q36_gq_mm_step(threadgroup const float *xs, thread const float4 *wv, thread float2 *acc) {
+    for (uint j = 0; j < 4; j++) {
+        simdgroup_float8x8 a[4];
+        for (uint rb = 0; rb < 4; rb++) simdgroup_load(a[rb], xs + (j * 4 + rb) * 64, 8);
+        float2 bf[4];
+        for (uint cb = 0; cb < 4; cb++) bf[cb] = float2(wv[2 * cb][j], wv[2 * cb + 1][j]);
+        for (uint rb = 0; rb < 4; rb++)
+            for (uint cb = 0; cb < 4; cb++) {
+                simdgroup_float8x8 bm, cm;
+                reinterpret_cast<thread float2 &>(bm.thread_elements()) = bf[cb];
+                reinterpret_cast<thread float2 &>(cm.thread_elements()) = acc[4 * rb + cb];
+                simdgroup_multiply_accumulate(cm, a[rb], bm, cm);
+                acc[4 * rb + cb] = reinterpret_cast<thread float2 &>(cm.thread_elements());
+            }
     }
 }
 
-// Prompt batches in fast mode, on the 8x8 matrix operations: a threadgroup of 4 SIMD groups computes
-// 32 rows x 128 outputs, a step of 32 inputs at a time. Every thread decodes its output's step into
-// threadgroup memory (inputs along the rows of the tile, 136 floats apart) and stages 8 values of
-// the step's 32 rows of x (40 apart); each SIMD group then multiplies the x tile by its 32 outputs'
-// weights. Accumulators as q36_dot_i8_mm keeps them. Outputs past out decode the last row and are not
-// stored; rows past rows read the last one. Float, but not q36_dot_gq_exact's order of additions.
-#define Q36_GQ_WLD 136
-#define Q36_GQ_XLD 40
+inline void q36_gq_mm_stage(threadgroup float *xs, uint xrow, uint xc, thread const float *xv, uint n) {
+    for (uint i = 0; i < n; i++) {
+        uint c = xc + i;
+        xs[(c % 4 * 4 + xrow / 8) * 64 + 8 * (xrow % 8) + c / 4] = xv[i];
+    }
+}
+
+// Prompt batches in fast mode, on the 8x8 matrix operations, as q36_dot_i8_mm: a threadgroup of 4 SIMD groups
+// computes 32 rows x 128 outputs, each SIMD group all 32 rows of its own 32 outputs, a step of 32 inputs at a time;
+// every lane decodes its weights from the blocks straight into the matrix operands, and only the x tile goes
+// through threadgroup memory. Outputs past out decode the last row and are not stored; rows past rows read the
+// last one. Float, but not q36_dot_gq_exact's order of additions.
 kernel void q36_dot_gq_mm(device const uchar *w [[buffer(0)]],
                           device const int *tab [[buffer(1)]],
                           device const float *x [[buffer(2)]],
@@ -2875,45 +3095,29 @@ kernel void q36_dot_gq_mm(device const uchar *w [[buffer(0)]],
                           ushort tid [[thread_index_in_threadgroup]],
                           ushort sg [[simdgroup_index_in_threadgroup]],
                           ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup float *ws = shared, *xs = shared + 32 * Q36_GQ_WLD;
-    const uint r0 = tg.x * 32, o0 = tg.y * 128, nr = min(32u, p.rows - r0);
-    device const uchar *wr = w + ulong(min(o0 + tid, p.out - 1)) * p.row_bytes;
-    const uint xrow = tid / 4, xc = 8 * (tid % 4);
-    device const float *xp = x + ulong(r0 + min(xrow, nr - 1)) * p.in + xc;
+    const uint r0 = tg.x * 32, o0 = tg.y * 128 + 32 * sg, nr = min(32u, p.rows - r0);
     const ushort2 pl = q36_lane_place(lane);
     const ushort sn = pl.x, sm = pl.y;
+    device const uchar *wr[8];
+    for (uint k = 0; k < 8; k++) wr[k] = w + ulong(min(o0 + 8 * (k / 2) + sn + k % 2, p.out - 1)) * p.row_bytes;
+    const uint xrow = tid / 4, xc = 8 * (tid % 4);
+    device const float *xp = x + ulong(r0 + min(xrow, nr - 1)) * p.in + xc;
     float2 acc[16];
     for (uint i = 0; i < 16; i++) acc[i] = float2(0.f);
     for (uint q = 0; q < p.in / 32; q++) {
-        float4 v[8];
-        q36_gq_step(p.type, wr, q, tab, v);
-        float4 xa = q36_load4(xp + 32 * q), xb = q36_load4(xp + 32 * q + 4);
-        threadgroup_barrier(mem_flags::mem_threadgroup);     // the last step's tiles are read
-        for (uint k = 0; k < 8; k++)
-            for (uint e = 0; e < 4; e++) ws[(4 * k + e) * Q36_GQ_WLD + tid] = v[k][e];
-        *(threadgroup float4 *)(xs + xrow * Q36_GQ_XLD + xc) = xa;
-        *(threadgroup float4 *)(xs + xrow * Q36_GQ_XLD + xc + 4) = xb;
+        float4 xv[2] = {q36_load4(xp + 32 * q), q36_load4(xp + 32 * q + 4)}, wv[8];
+        for (uint k = 0; k < 8; k++) wv[k] = q36_gq_four(p.type, wr[k], q, sm, tab);
+        threadgroup_barrier(mem_flags::mem_threadgroup);     // the last step's tile is read
+        q36_gq_mm_stage(shared, xrow, xc, (thread const float *)xv, 8);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kb = 0; kb < 4; kb++) {
-            simdgroup_float8x8 a[4], b[4];
-            for (uint rb = 0; rb < 4; rb++) simdgroup_load(a[rb], xs + 8 * rb * Q36_GQ_XLD + 8 * kb, Q36_GQ_XLD);
-            for (uint cb = 0; cb < 4; cb++)
-                simdgroup_load(b[cb], ws + 8 * kb * Q36_GQ_WLD + 32 * sg + 8 * cb, Q36_GQ_WLD);
-            for (uint rb = 0; rb < 4; rb++)
-                for (uint cb = 0; cb < 4; cb++) {
-                    simdgroup_float8x8 cm;
-                    reinterpret_cast<thread float2 &>(cm.thread_elements()) = acc[4 * rb + cb];
-                    simdgroup_multiply_accumulate(cm, a[rb], b[cb], cm);
-                    acc[4 * rb + cb] = reinterpret_cast<thread float2 &>(cm.thread_elements());
-                }
-        }
+        q36_gq_mm_step(shared, wv, acc);
     }
     for (uint rb = 0; rb < 4; rb++) {
         uint row = 8 * rb + sm;
         if (row >= nr) continue;
         device float *yr = y + ulong(r0 + row) * p.out;
         for (uint cb = 0; cb < 4; cb++) {
-            uint o = o0 + 32 * sg + 8 * cb + sn;
+            uint o = o0 + 8 * cb + sn;
             float2 s = p.scale != 1.f ? acc[4 * rb + cb] * p.scale : acc[4 * rb + cb];
             if (o < p.out) yr[o] = s.x;
             if (o + 1 < p.out) yr[o + 1] = s.y;
@@ -2941,13 +3145,15 @@ kernel void q36_dot_f32(device const float *w [[buffer(0)]],
 
 // A GGUF's routed experts. A slot holds an expert's three matrices as the file's rows, gate | up |
 // down, each of the type of the layer's tensor; the slot's scales (".scale" companions, else 1) are
-// in the arguments, by slot. Bound and paired as q36_expert_gate_up. One thread per output and
-// choice, the sums of q36_gq_row_dot: moe_gq_run's operations, the SwiGLU of q36_expert_gate_up.
+// in the arguments, by slot. Bound and paired as q36_expert_gate_up. Exact mode: one thread per
+// output and choice, the sums of q36_gq_row_dot: moe_gq_run's operations, the SwiGLU of
+// q36_expert_gate_up. Fast mode: the _vec kernels below.
 struct q36_expert_gq_args {
     uint H, I, K, rows, first, n;
     uint tg, tu, td, rbg, rbu, rbd;     // the three types, and their rows' bytes
     ulong up, down;                     // where up and down start in a slot
     float sg[8], su[8], sd[8];
+    uint lpr;                           // fast mode: a row's lanes (q36_expert_*_gq_vec)
 };
 
 // h[choice][i] = silu(sg * gate_i . x[row]) * (su * up_i . x[row])
@@ -2983,3 +3189,298 @@ kernel void q36_expert_down_gq(device const float *h [[buffer(0)]],
     device const uchar *w = ws[s] + p.down + ulong(at.x) * p.rbd;
     y[ulong(choice) * p.H + at.x] = q36_gq_row_dot(p.td, w, h + ulong(choice) * p.I, p.I, tab) * p.sd[s];
 }
+
+// Fast mode: the experts' rows as q36_dot_gq_vec's (lpr lanes a row, 32 / lpr rows a SIMD group: the down of a
+// 512-wide Q5_K expert, two blocks, takes half a group), the lanes fixed at compile time where LPR > 0. A pair's
+// operations do not depend on the others: in a batch it gets its bits alone. Lanes past the last row read it again,
+// as every lane reaches the shuffles.
+template <uint LPR>
+inline void q36_gate_up_gq_lanes(device const float *x, device float *h, constant q36_expert_gq_args &p,
+                                 device const uchar *w, uint choice, uint s, device const int *tab, uint tx,
+                                 ushort lane) {
+    uint lpr = LPR ? LPR : p.lpr, sh = ctz(lpr), i = (tx << (5 - sh)) + (lane >> sh), at = lane & (lpr - 1);
+    uint ir = min(i, p.I - 1);
+    device const float *row = x + ulong(choice / p.K) * p.H;
+    float g = q36_gq_lanes_sum(q36_gqf_part(p.tg, w + ulong(ir) * p.rbg, row, p.H, at, lpr, tab), lpr);
+    float u = q36_gq_lanes_sum(q36_gqf_part(p.tu, w + p.up + ulong(ir) * p.rbu, row, p.H, at, lpr, tab), lpr);
+    if (i >= p.I || at) return;
+    g *= p.sg[s];
+    u *= p.su[s];
+    float z = g / (1.f + exp(-g));
+    h[ulong(choice) * p.I + i] = z * u;
+}
+
+template <uint LPR>
+inline void q36_down_gq_lanes(device const float *h, device float *y, constant q36_expert_gq_args &p,
+                              device const uchar *w, uint choice, uint s, device const int *tab, uint tx, ushort lane) {
+    uint lpr = LPR ? LPR : p.lpr, sh = ctz(lpr), o = (tx << (5 - sh)) + (lane >> sh), at = lane & (lpr - 1);
+    device const uchar *wr = w + p.down + ulong(min(o, p.H - 1)) * p.rbd;
+    float v = q36_gq_lanes_sum(q36_gqf_part(p.td, wr, h + ulong(choice) * p.I, p.I, at, lpr, tab), lpr);
+    if (o >= p.H || at) return;
+    y[ulong(choice) * p.H + o] = v * p.sd[s];
+}
+
+#define Q36_EXPERT_GQ_VEC(name, body, LPR, in, out) \
+    kernel void name(device const float *in [[buffer(0)]], device const uint *pairs [[buffer(1)]], \
+                     device float *out [[buffer(2)]], constant q36_expert_gq_args &p [[buffer(3)]], Q36_SLOTS, \
+                     device const int *tab [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]], \
+                     ushort lane [[thread_index_in_simdgroup]]) { \
+        if (tg.y >= p.n) return; \
+        device const uchar *ws[8] = {w0, w1, w2, w3, w4, w5, w6, w7}; \
+        uint pair = pairs[p.first + tg.y], s = pair >> 28; \
+        body<LPR>(in, out, p, ws[s], pair & 0x0fffffffu, s, tab, tg.x, lane); \
+    }
+Q36_EXPERT_GQ_VEC(q36_expert_gate_up_gq_vec, q36_gate_up_gq_lanes, 0, x, h)
+Q36_EXPERT_GQ_VEC(q36_expert_gate_up_gq_vec32, q36_gate_up_gq_lanes, 32, x, h)
+Q36_EXPERT_GQ_VEC(q36_expert_down_gq_vec, q36_down_gq_lanes, 0, h, y)
+Q36_EXPERT_GQ_VEC(q36_expert_down_gq_vec16, q36_down_gq_lanes, 16, h, y)
+Q36_EXPERT_GQ_VEC(q36_expert_down_gq_vec32, q36_down_gq_lanes, 32, h, y)
+
+// Prompt batches of the experts in fast mode, on the 8x8 matrix operations, as q36_expert_gate_up_mm and
+// q36_expert_down_mm compute our int4 slots: a threadgroup of 4 SIMD groups takes up to 64 choices of one slot (their
+// range in pairs, q36_expert_ranges) and 64 columns, SIMD group sg 16 of the columns for all the choices (gate_up:
+// the gate rows, column block 0, and the up rows, block 1, of outputs 8 sg .. 8 sg + 7 of the threadgroup's 32;
+// down: outputs 16 sg .. 16 sg + 15 of its 64). Every lane decodes the weights of its 4 output rows straight from
+// the blocks into the matrix operands (q36_gq_four: 4 inputs a row and step), and a slot of up to 64 choices decodes
+// them once. Row blocks of 8 past the slot's last choice are skipped (nrb, a constant). Tiles of 5 to 8 row blocks
+// stage the choices' rows through threadgroup memory a step at a time, in the weights' order (thread t stages row
+// t / 2, inputs 16 (t % 2) .. + 15 of the step); the last tile of each slot when it has 1 to 4 row blocks runs in
+// q36_expert_*_gq_mm4, each lane reading its own elements of the inputs straight from memory (lane row m of row
+// block rb: choice 8 rb + m, inputs 32 q + 4 sn .. + 7 of step q), with no threadgroup memory and no barriers.
+// Choices past the slot's read its last one and outputs past the last read it; neither is stored.
+//   wrow(cb, t): output row t (0, 1) of column block cb; wt(cb): its type; xrowp(r): choice r's inputs.
+#define Q36_GQE_MM_LOOP(steps, wrow, wt, nrb) \
+    { \
+    q36_gq_rowdec dc[4] = {{wrow(0, 0)}, {wrow(0, 1)}, {wrow(1, 0)}, {wrow(1, 1)}}; \
+    for (uint q = 0; q < (steps); q++) { \
+        float4 wv[4], xv4[4]; \
+        if (q % 8 == 0) \
+            _Pragma("unroll") for (uint k = 0; k < 4; k++) q36_gq_rowdec_block(dc[k], wt(k / 2), sm, q / 8); \
+        _Pragma("unroll") for (uint k = 0; k < 4; k++) wv[k] = q36_gq_rowdec_four(dc[k], wt(k / 2), sm, q, tab); \
+        _Pragma("unroll") for (uint k = 0; k < 4; k++) xv4[k] = q36_load4(xp + 32 * q + 4 * k); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        _Pragma("unroll") for (uint i = 0; i < 16; i++) { \
+            uint c = xc + i; \
+            shared[(c % 4 * 8 + xrow / 8) * 64 + 8 * (xrow % 8) + c / 4] = xv4[i / 4][i % 4]; \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        _Pragma("unroll") for (uint j = 0; j < 4; j++) { \
+            float2 bf[2] = {float2(wv[0][j], wv[1][j]), float2(wv[2][j], wv[3][j])}; \
+            _Pragma("unroll") for (uint rb = 0; rb < 8; rb++) { \
+                if (rb >= nrb) continue; \
+                simdgroup_float8x8 a; \
+                simdgroup_load(a, shared + (j * 8 + rb) * 64, 8); \
+                _Pragma("unroll") for (uint cb = 0; cb < 2; cb++) { \
+                    simdgroup_float8x8 bm, cm; \
+                    reinterpret_cast<thread float2 &>(bm.thread_elements()) = bf[cb]; \
+                    reinterpret_cast<thread float2 &>(cm.thread_elements()) = acc[2 * rb + cb]; \
+                    simdgroup_multiply_accumulate(cm, a, bm, cm); \
+                    acc[2 * rb + cb] = reinterpret_cast<thread float2 &>(cm.thread_elements()); \
+                } \
+            } \
+        } \
+    } \
+    }
+
+#define Q36_GQE_MM_DIRECT(steps, wrow, wt, nrb, xrowp) \
+    { \
+    q36_gq_rowdec dc[4] = {{wrow(0, 0)}, {wrow(0, 1)}, {wrow(1, 0)}, {wrow(1, 1)}}; \
+    device const float *xd[4]; \
+    _Pragma("unroll") for (uint rb = 0; rb < (nrb); rb++) xd[rb] = xrowp(min(8 * rb + sm, nc - 1)); \
+    for (uint q = 0; q < (steps); q++) { \
+        float4 wv[4], xa[4], xb[4]; \
+        if (q % 8 == 0) \
+            _Pragma("unroll") for (uint k = 0; k < 4; k++) q36_gq_rowdec_block(dc[k], wt(k / 2), sm, q / 8); \
+        _Pragma("unroll") for (uint k = 0; k < 4; k++) wv[k] = q36_gq_rowdec_four(dc[k], wt(k / 2), sm, q, tab); \
+        _Pragma("unroll") for (uint rb = 0; rb < (nrb); rb++) { \
+            xa[rb] = q36_load4(xd[rb] + 32 * q + 4 * sn); \
+            xb[rb] = q36_load4(xd[rb] + 32 * q + 4 * sn + 4); \
+        } \
+        _Pragma("unroll") for (uint j = 0; j < 4; j++) { \
+            float2 bf[2] = {float2(wv[0][j], wv[1][j]), float2(wv[2][j], wv[3][j])}; \
+            _Pragma("unroll") for (uint rb = 0; rb < (nrb); rb++) { \
+                simdgroup_float8x8 a; \
+                reinterpret_cast<thread float2 &>(a.thread_elements()) = float2(xa[rb][j], xb[rb][j]); \
+                _Pragma("unroll") for (uint cb = 0; cb < 2; cb++) { \
+                    simdgroup_float8x8 bm, cm; \
+                    reinterpret_cast<thread float2 &>(bm.thread_elements()) = bf[cb]; \
+                    reinterpret_cast<thread float2 &>(cm.thread_elements()) = acc[2 * rb + cb]; \
+                    simdgroup_multiply_accumulate(cm, a, bm, cm); \
+                    acc[2 * rb + cb] = reinterpret_cast<thread float2 &>(cm.thread_elements()); \
+                } \
+            } \
+        } \
+    } \
+    }
+
+#define Q36_GQE_MM_SWITCH(steps, wrow, wt) \
+    switch (nrb) { \
+    case 5: Q36_GQE_MM_LOOP(steps, wrow, wt, 5u) break; \
+    case 6: Q36_GQE_MM_LOOP(steps, wrow, wt, 6u) break; \
+    case 7: Q36_GQE_MM_LOOP(steps, wrow, wt, 7u) break; \
+    default: Q36_GQE_MM_LOOP(steps, wrow, wt, 8u) break; \
+    }
+
+#define Q36_GQE_MM_DIRECT_SWITCH(steps, wrow, wt, xrowp) \
+    switch (nrb) { \
+    case 1: Q36_GQE_MM_DIRECT(steps, wrow, wt, 1u, xrowp) break; \
+    case 2: Q36_GQE_MM_DIRECT(steps, wrow, wt, 2u, xrowp) break; \
+    case 3: Q36_GQE_MM_DIRECT(steps, wrow, wt, 3u, xrowp) break; \
+    default: Q36_GQE_MM_DIRECT(steps, wrow, wt, 4u, xrowp) break; \
+    }
+
+// h[choice][o] = silu(sg gate_o . x) * (su up_o . x), from gate_up's accumulators (row block rb: acc[2 rb] the gate
+// sums of outputs o0 + sn, + 1, acc[2 rb + 1] the up sums)
+inline void q36_gqe_swiglu(device float *h, device const uint *pc, constant q36_expert_gq_args &p, uint j0, uint nc,
+                           uint o0, ushort sn, ushort sm, thread const float2 *acc, uint nrb) {
+    for (uint rb = 0; rb < nrb; rb++) {
+        uint row = 8 * rb + sm;
+        if (row >= nc) continue;
+        device float *hr = h + ulong(pc[row] & 0x0fffffffu) * p.I;
+        float2 g = acc[2 * rb] * p.sg[j0], u = acc[2 * rb + 1] * p.su[j0], z = g / (1.f + exp(-g)) * u;
+        if (o0 + sn < p.I) hr[o0 + sn] = z.x;
+        if (o0 + sn + 1 < p.I) hr[o0 + sn + 1] = z.y;
+    }
+}
+
+// y[choice][o] = sd down_o . h, from down's accumulators (acc[2 rb + cb]: outputs o0 + 8 cb + sn, + 1)
+inline void q36_gqe_down_store(device float *y, device const uint *pc, constant q36_expert_gq_args &p, uint j0,
+                               uint nc, uint o0, ushort sn, ushort sm, thread const float2 *acc, uint nrb) {
+    for (uint rb = 0; rb < nrb; rb++) {
+        uint row = 8 * rb + sm;
+        if (row >= nc) continue;
+        device float *yr = y + ulong(pc[row] & 0x0fffffffu) * p.H;
+        for (uint cb = 0; cb < 2; cb++) {
+            uint o = o0 + 8 * cb + sn;
+            float2 v = acc[2 * rb + cb] * p.sd[j0];
+            if (o < p.H) yr[o] = v.x;
+            if (o + 1 < p.H) yr[o + 1] = v.y;
+        }
+    }
+}
+
+#define Q36_GU_GQ_WROW(cb, t) \
+    ((cb) ? w + p.up + ulong(min(o0 + sn + (t), p.I - 1)) * p.rbu : w + ulong(min(o0 + sn + (t), p.I - 1)) * p.rbg)
+#define Q36_GU_GQ_WT(cb) ((cb) ? p.tu : p.tg)
+#define Q36_GU_GQ_XROW(r) (x + ulong((pc[r] & 0x0fffffffu) / p.K) * p.H)
+#define Q36_DN_GQ_WROW(cb, t) (w + p.down + ulong(min(o0 + 8 * (cb) + sn + (t), p.H - 1)) * p.rbd)
+#define Q36_DN_GQ_WT(cb) p.td
+#define Q36_DN_GQ_XROW(r) (hin + ulong(pc[r] & 0x0fffffffu) * p.I)
+
+// Tiles of 5 to 8 row blocks. Grid (choices / 64, I / 32, 8).
+kernel void q36_expert_gate_up_gq_mm(device const float *x [[buffer(0)]],
+                                     device const uint *pairs [[buffer(1)]],
+                                     device float *h [[buffer(2)]],
+                                     constant q36_expert_gq_args &p [[buffer(3)]],
+                                     Q36_SLOTS,
+                                     device const int *tab [[buffer(12)]],
+                                     constant q36_expert_ranges &rg [[buffer(13)]],
+                                     threadgroup float *shared [[threadgroup(0)]],
+                                     uint3 tg [[threadgroup_position_in_grid]],
+                                     ushort tid [[thread_index_in_threadgroup]],
+                                     ushort sg [[simdgroup_index_in_threadgroup]],
+                                     ushort lane [[thread_index_in_simdgroup]]) {
+    const uint j0 = tg.z, c0 = tg.x * 64;
+    if (j0 >= 8 || c0 >= rg.cnt[j0]) return;
+    const uint nc = min(64u, rg.cnt[j0] - c0), nrb = (nc + 7) / 8, o0 = tg.y * 32 + 8 * sg;
+    if (nrb <= 4) return;                       // q36_expert_gate_up_gq_mm4's
+    device const uchar *ws8[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    device const uchar *w = ws8[j0];
+    device const uint *pc = pairs + p.first + rg.off[j0] + c0;
+    const ushort2 pl = q36_lane_place(lane);
+    const ushort sn = pl.x, sm = pl.y;
+    const uint xrow = tid / 2, xc = 16 * (tid % 2);
+    device const float *xp = Q36_GU_GQ_XROW(min(xrow, nc - 1)) + xc;
+    float2 acc[16];
+    for (uint i = 0; i < 16; i++) acc[i] = float2(0.f);
+    Q36_GQE_MM_SWITCH(p.H / 32, Q36_GU_GQ_WROW, Q36_GU_GQ_WT)
+    q36_gqe_swiglu(h, pc, p, j0, nc, o0, sn, sm, acc, nrb);
+}
+
+// The last tile of each slot with 1 to 4 row blocks. Grid (1, I / 32, 8).
+kernel void q36_expert_gate_up_gq_mm4(device const float *x [[buffer(0)]],
+                                      device const uint *pairs [[buffer(1)]],
+                                      device float *h [[buffer(2)]],
+                                      constant q36_expert_gq_args &p [[buffer(3)]],
+                                      Q36_SLOTS,
+                                      device const int *tab [[buffer(12)]],
+                                      constant q36_expert_ranges &rg [[buffer(13)]],
+                                      uint3 tg [[threadgroup_position_in_grid]],
+                                      ushort sg [[simdgroup_index_in_threadgroup]],
+                                      ushort lane [[thread_index_in_simdgroup]]) {
+    const uint j0 = tg.z;
+    if (j0 >= 8 || !rg.cnt[j0]) return;
+    const uint c0 = (rg.cnt[j0] - 1) / 64 * 64, nc = rg.cnt[j0] - c0, nrb = (nc + 7) / 8, o0 = tg.y * 32 + 8 * sg;
+    if (nrb > 4) return;
+    device const uchar *ws8[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    device const uchar *w = ws8[j0];
+    device const uint *pc = pairs + p.first + rg.off[j0] + c0;
+    const ushort2 pl = q36_lane_place(lane);
+    const ushort sn = pl.x, sm = pl.y;
+    float2 acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = float2(0.f);
+    Q36_GQE_MM_DIRECT_SWITCH(p.H / 32, Q36_GU_GQ_WROW, Q36_GU_GQ_WT, Q36_GU_GQ_XROW)
+    q36_gqe_swiglu(h, pc, p, j0, nc, o0, sn, sm, acc, nrb);
+}
+
+// The down projection: the slot's down rows, the inputs the choices' h rows. Grid (choices / 64, H / 64, 8).
+kernel void q36_expert_down_gq_mm(device const float *hin [[buffer(0)]],
+                                  device const uint *pairs [[buffer(1)]],
+                                  device float *y [[buffer(2)]],
+                                  constant q36_expert_gq_args &p [[buffer(3)]],
+                                  Q36_SLOTS,
+                                  device const int *tab [[buffer(12)]],
+                                  constant q36_expert_ranges &rg [[buffer(13)]],
+                                  threadgroup float *shared [[threadgroup(0)]],
+                                  uint3 tg [[threadgroup_position_in_grid]],
+                                  ushort tid [[thread_index_in_threadgroup]],
+                                  ushort sg [[simdgroup_index_in_threadgroup]],
+                                  ushort lane [[thread_index_in_simdgroup]]) {
+    const uint j0 = tg.z, c0 = tg.x * 64;
+    if (j0 >= 8 || c0 >= rg.cnt[j0]) return;
+    const uint nc = min(64u, rg.cnt[j0] - c0), nrb = (nc + 7) / 8, o0 = tg.y * 64 + 16 * sg;
+    if (nrb <= 4) return;                       // q36_expert_down_gq_mm4's
+    device const uchar *ws8[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    device const uchar *w = ws8[j0];
+    device const uint *pc = pairs + p.first + rg.off[j0] + c0;
+    const ushort2 pl = q36_lane_place(lane);
+    const ushort sn = pl.x, sm = pl.y;
+    const uint xrow = tid / 2, xc = 16 * (tid % 2);
+    device const float *xp = Q36_DN_GQ_XROW(min(xrow, nc - 1)) + xc;
+    float2 acc[16];
+    for (uint i = 0; i < 16; i++) acc[i] = float2(0.f);
+    Q36_GQE_MM_SWITCH(p.I / 32, Q36_DN_GQ_WROW, Q36_DN_GQ_WT)
+    q36_gqe_down_store(y, pc, p, j0, nc, o0, sn, sm, acc, nrb);
+}
+
+// The last tile of each slot with 1 to 4 row blocks. Grid (1, H / 64, 8).
+kernel void q36_expert_down_gq_mm4(device const float *hin [[buffer(0)]],
+                                   device const uint *pairs [[buffer(1)]],
+                                   device float *y [[buffer(2)]],
+                                   constant q36_expert_gq_args &p [[buffer(3)]],
+                                   Q36_SLOTS,
+                                   device const int *tab [[buffer(12)]],
+                                   constant q36_expert_ranges &rg [[buffer(13)]],
+                                   uint3 tg [[threadgroup_position_in_grid]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]]) {
+    const uint j0 = tg.z;
+    if (j0 >= 8 || !rg.cnt[j0]) return;
+    const uint c0 = (rg.cnt[j0] - 1) / 64 * 64, nc = rg.cnt[j0] - c0, nrb = (nc + 7) / 8, o0 = tg.y * 64 + 16 * sg;
+    if (nrb > 4) return;
+    device const uchar *ws8[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    device const uchar *w = ws8[j0];
+    device const uint *pc = pairs + p.first + rg.off[j0] + c0;
+    const ushort2 pl = q36_lane_place(lane);
+    const ushort sn = pl.x, sm = pl.y;
+    float2 acc[8];
+    for (uint i = 0; i < 8; i++) acc[i] = float2(0.f);
+    Q36_GQE_MM_DIRECT_SWITCH(p.I / 32, Q36_DN_GQ_WROW, Q36_DN_GQ_WT, Q36_DN_GQ_XROW)
+    q36_gqe_down_store(y, pc, p, j0, nc, o0, sn, sm, acc, nrb);
+}
+#undef Q36_GU_GQ_WROW
+#undef Q36_GU_GQ_WT
+#undef Q36_GU_GQ_XROW
+#undef Q36_DN_GQ_WROW
+#undef Q36_DN_GQ_WT
+#undef Q36_DN_GQ_XROW

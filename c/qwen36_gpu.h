@@ -183,9 +183,11 @@ int q36_expert_sum(q36_tensor *out, q36_tensor *y, q36_tensor *weights, q36_tens
 uint64_t q36_gq_row_bytes(int type, int n);
 /* y[r][o] = scale * sum_i w[o][i] * x[r][i], w out rows of `in` weights (scale: an ".scale"
  * companion, else 1). Exact mode: a thread per output with the CPU's exact-mode sums
- * (gq_matmul_f32: each product rounded, added in input order), so its bits. Fast mode: a SIMD
- * group per output up to 8 rows (a row's bits do not depend on the batch), the matrix units
- * for more. 0, with nothing encoded, for a type or shape it does not take. */
+ * (gq_matmul_f32: each product rounded, added in input order), so its bits. Fast mode, up to 8
+ * rows: a row of weights on up to 32 lanes of a SIMD group spread over its blocks as llama.cpp's
+ * matrix-vector kernels spread them, the scales applied to the integer sums (a row's bits do
+ * not depend on the batch); more rows on the matrix units, each lane decoding its own weights.
+ * 0, with nothing encoded, for a type or shape it does not take. */
 int q36_dot_gq(q36_tensor *y, q36_tensor *x, q36_tensor *w, int type, float scale, int rows, int in, int out);
 /* The decoded weights of `rows` rows, gq_dequant_row's bits (the decoders' test). */
 int q36_gq_dequant(q36_tensor *y, q36_tensor *w, int type, int rows, int in);
@@ -195,7 +197,9 @@ int q36_dot_f32(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, i
 /* A GGUF layer's routed experts, bound and paired as for q36_expert_gate_up and q36_expert_down. A
  * slot holds gate (inter rows of hidden), up (the same) and down (hidden rows of inter) as the
  * file's rows, of the types of the layer's three tensors; sg, su and sd are the slots' ".scale"
- * factors (1 without), by slot. The CPU's exact-mode sums in both modes. */
+ * factors (1 without), by slot. Exact mode: a thread per output with the CPU's exact-mode sums.
+ * Fast mode: the rows as q36_dot_gq's (a pair's bits do not depend on the others), and prompt
+ * batches on the matrix units as q36_expert_gate_up's and q36_expert_down's tiles. */
 typedef struct { int gate, up, down; float sg[8], su[8], sd[8]; } q36_gq_experts;
 int q36_expert_gate_up_gq(q36_tensor *h, q36_tensor *x, q36_tensor *pairs, int first, int n,
                           q36_tensor *const slots[8], int rows, int hidden, int inter, int topk,

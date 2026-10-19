@@ -99,8 +99,14 @@ kernels are unchanged beside it.
   router as the CPU engine does in both modes: the test finds the CPU engine's
   layers and logits within 1e-4 of their largest value (about 7e-6 measured).
   In a `METAL=1` build that CPU path is `COLI_METAL=0 GQ_EXACT=1`. Fast mode
-  sums the dense products by SIMD groups in a decode step and on the matrix
-  units in a prompt; the experts' kernels are the same in both modes.
+  spreads a row's blocks over the lanes of a SIMD group in a decode step, as
+  llama.cpp's matrix-vector kernels do, and applies the block scales to each
+  block's sums of the quants times x; a prompt runs on the matrix units, each
+  lane decoding its own weights. The routed experts take the same kernels, and
+  in a prompt the int4 experts' tiles. Fast mode is float throughout but
+  groups its arithmetic differently (the block scales applied to each block's
+  sums, fused multiply-adds), so its results differ from exact mode's in the
+  last bits (the test's fast and exact layers within about 3e-5).
 - Not with a GGUF: the CPU's share of a fast prompt (`QWEN36_CPU_MATMUL`: its
   products take INT8 weights), the MTP head, the graph's only drafter (no
   drafts; a line says so when the file has one, or with `QWEN36_MTP=1` or
