@@ -80,6 +80,15 @@ kernels are unchanged beside it.
   a buffer resident whole: nothing is copied. The embedding rows are read from
   the mapping too. A matrix's `.scale` companion multiplies its products, per
   matrix or per expert.
+- From the start of a prompt to the end of the decode step after it, the dense
+  matrices' pages are locked in memory (`mlock`). The file keeps the routed
+  experts beside them, and a prompt's expert reads pushed them out of memory, to
+  be read back from disk by the prompt and by the first decode step; in a file
+  of their own they stayed, as `canonical.qc`'s did in the same runs. During
+  decode the GPU holds them in memory anyway, and between requests the system
+  may take them back (a request that ends without a decode step unlocks them at
+  its end). A line says how many bytes are locked, or why they could not be, and
+  the report at exit how many times they were locked and unlocked.
 - The routed experts go into the expert cache's slots as the file holds them,
   gate, up and down one after the other, in three reads (one with `coli import
   --mode copy`). A slot is as large as the file's largest expert: 2.0 MB on the
@@ -627,8 +636,11 @@ experts of a layer first, so a verify reads that layer's experts in one lease
 (the 35B model's files have no bias), the line and the CPU engine with a dense
 matrix of Q4_0 and with experts of IQ3_S, the layout of
 `coli import --mode copy` (the same bits as the file it was copied from), the
-header check (`GGUF_CHECK=1`), and that the model's own format's options
-change nothing there.
+header check (`GGUF_CHECK=1`), that the model's own format's options
+change nothing there, and, in its graph runs, that the lock's line says the
+bytes of the file's dense matrices, each rounded out to whole pages, and that
+they were unlocked after the first decode step, or at the end of a request
+without one.
 
 `DUMP_LAYERS=<file>` writes the projection, residual and MoE output of every
 layer for the last token, and `DUMP=<file>` the last logits. Two builds can be

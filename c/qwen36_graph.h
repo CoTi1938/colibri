@@ -103,6 +103,8 @@ struct Qwen36Graph {
     int mtp_off;                                /* the head's K/V row of position p is row p - mtp_off (qg_mtp_window) */
     int snap_at, snap_rows;                     /* the forward copies the state after snap_at tokens */
     int *snap_ids, snap_len;                    /* the tokens the copy holds */
+    int gguf_locked;                            /* qg_gguf_lock: 1 while a GGUF's dense matrices are locked in
+                                                 * memory, -1 once mlock failed */
 #if QCM_ON
     int cpu_mm;                                 /* qwen36_cpu_mm.h: products of fast prompt batches on the CPU */
     QcmWeights cpu_z, cpu_o;
@@ -112,6 +114,7 @@ struct Qwen36Graph {
 };
 
 static void qg_settle(Model *, Qwen36Graph *, int);
+static void qg_gguf_lock(Model *, Qwen36Graph *, int, int);
 static int qg_fast_experts(int topk);
 static int qg_fast_guessed(int topk);
 
@@ -197,9 +200,14 @@ static int qg_shared_mm(q36_tensor *y, q36_tensor *x, const QgDense *w, int rows
     return w->gq ? qg_mm(y, x, w, rows) : q36_shared_dot(y, x, w->q, w->sc, rows, w->in, w->out);
 }
 
+static unsigned qg_gguf_locks, qg_gguf_unlocks[2];   /* qg_gguf_lock: after a decode step, at a request's end */
 static void qg_gguf_report(void) {
     fprintf(stderr, "[qwen36-metal] GGUF: %llu products with the file's dense matrices and %llu with its routed "
                     "experts ran on the GPU\n", qg_gguf_products, qg_gguf_experts);
+    if (qg_gguf_locks)
+        fprintf(stderr, "[qwen36-metal] GGUF: the dense matrices locked for %u prompts, unlocked after %u first decode "
+                        "steps and at the end of %u requests; %u still locked at exit\n", qg_gguf_locks,
+                qg_gguf_unlocks[0], qg_gguf_unlocks[1], qg_gguf_locks - qg_gguf_unlocks[0] - qg_gguf_unlocks[1]);
 }
 
 /* Whether the CPU's matrix unit takes products of this batch (qwen36_cpu_mm.h). */
@@ -1479,6 +1487,60 @@ static void qg_prefetch_dense(Qwen36Graph *g, int whole) {
     dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), NULL, qg_dense_pages);
 }
 
+/* A GGUF's dense matrices are locked in memory (mlock) from the start of a
+ * prompt to the end of the decode step after it. The file keeps the routed
+ * experts beside them, and a prompt's expert reads pushed the dense pages out
+ * of memory, for the prompt itself and the first decode step to read back from
+ * disk: on the 35B model on an 8 GB M1, 0.3 to 1.2 GB of the 1.9 GB were out
+ * after a 512-token prompt, and that step took 0.7 to 1.5 s (0.3 to 0.5 s with
+ * the pages locked). In a file of their own (tried with a copy at the same
+ * offsets) they stayed, as canonical.qc's did beside experts.qc in the same
+ * runs. During decode the GPU holds them in memory anyway; between requests
+ * the system may take them back (a request that ends without a decode step
+ * unlocks them at its end, q36_spec_end). In most runs the decode after a
+ * locked prompt found fewer of its experts in the file cache (up to 9% more
+ * read from disk, a few percent slower). A failed mlock is said once and not
+ * tried again. The report at exit counts the locks and the unlocks, by where
+ * they happened, and what stayed locked. */
+static void qg_gguf_range(const QgDense *d, int lock, size_t *bytes, int *error) {
+    if (!d->gq || !d->q || d->type == GQ_F32) return;   /* floats are copies */
+    uintptr_t page = (uintptr_t)getpagesize(), at = (uintptr_t)q36_tensor_data(d->q);
+    uintptr_t lo = at & ~(page - 1), hi = (at + q36_tensor_bytes(d->q) + page - 1) & ~(page - 1);
+    if (!(lock ? mlock((void *)lo, hi - lo) : munlock((void *)lo, hi - lo))) *bytes += hi - lo;
+    else if (!*error) *error = errno;
+}
+static size_t qg_gguf_pages(Model *m, Qwen36Graph *g, int lock, int *error) {
+    size_t bytes = 0;
+    *error = 0;
+    qg_gguf_range(&g->head, lock, &bytes, error);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        const QgDense *d[] = {&L->q, &L->k, &L->v, &L->o, &L->qkv, &L->z, &L->out,
+                              &L->router, &L->sh_g, &L->sh_u, &L->sh_d};
+        for (size_t k = 0; k < sizeof(d) / sizeof(d[0]); k++) qg_gguf_range(d[k], lock, &bytes, error);
+    }
+    return bytes;
+}
+static void qg_gguf_lock(Model *m, Qwen36Graph *g, int lock, int where) {
+    if (!g_gguf || g->gguf_locked < 0 || g->gguf_locked == lock) return;
+    int error, ignored;
+    size_t bytes = qg_gguf_pages(m, g, lock, &error);
+    if (lock && error) {                        /* what was locked goes back */
+        qg_gguf_pages(m, g, 0, &ignored);
+        g->gguf_locked = -1;
+        fprintf(stderr, "[qwen36-metal] GGUF: the dense matrices could not be locked in memory (mlock: %s); a "
+                        "prompt's expert reads may push them out of it\n", strerror(error));
+        return;
+    }
+    g->gguf_locked = lock;
+    if (lock) qg_gguf_locks++;
+    else qg_gguf_unlocks[where]++;
+    static int said;
+    if (lock && !said++)
+        fprintf(stderr, "[qwen36-metal] GGUF: the dense matrices locked in memory (%zu bytes) from each prompt to "
+                        "the decode step after it\n", bytes);
+}
+
 /* The forward waits for the GPU and calls qg_prompt_done whatever happens. */
 static int qg_prompt_layers(Model *m, const int *ids, int S, int pos, FILE *lf, QgPrompt *p, int *last_rows) {
     Qwen36Graph *g = m->graph;
@@ -1574,6 +1636,7 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
         lo = S - need;
     }
     int H = c->hidden, rows = 0, ok = S >= 1 && pos >= 0 && qg_reserve(m, pos + S) && qg_rows(m, S < R ? S : R);
+    if (ok && S > 1 && !verify) qg_gguf_lock(m, g, 1, 0);
     /* Decode leaves the GPU waiting at every layer, and a prompt waits for
      * its experts too: keep the clocks up until a quarter of a second after
      * the last renewal (every step, and every layer and group of a prompt). */
@@ -1676,6 +1739,7 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
         }
     }
     if (S > 1 && !verify) q36_gpu_keepalive(0);       /* also on a failed prefill; a verify is decode */
+    if (S == 1 || verify) qg_gguf_lock(m, g, 0, 0);   /* the step after a prompt: the GPU holds them now */
     return ok;
 }
 

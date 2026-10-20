@@ -7809,6 +7809,9 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
  * state is the one plain decoding leaves after the same tokens. */
 static void q36_spec_end(Model *m, Q36Spec *sp) {
     if (sp->ahead_n) { sp->ended_ahead = 1; q36_spec_settle(m, sp, sp->ahead_i, 0); }
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) qg_gguf_lock(m, m->graph, 0, 1);   /* a request without a decode step: the dense pages go back */
+#endif
 }
 
 static void q36_spec_report(const Q36Spec *sp, const char *scope) {

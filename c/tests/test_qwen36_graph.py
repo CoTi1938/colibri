@@ -34,6 +34,7 @@ import importlib.util
 import io
 import json
 import math
+import mmap
 import os
 import random
 import re
@@ -414,21 +415,53 @@ def write_gguf_fixture(snap, types=None, bias=None):
     write_tokenizer(snap)
 
 
-def gguf_dense_bytes(types=None):
-    """The bytes of the GGUF fixture's dense matrices that the graph sees in the file (the others, floats, it
-    copies): its line at start says them."""
+def gguf_dense_names():
+    """The GGUF fixture's dense matrices that the graph sees in the file: (name, columns, rows)."""
     own = {True: [("attn_q", HIDDEN, Q_HEADS * HEAD_DIM * 2), ("attn_k", HIDDEN, KV_HEADS * HEAD_DIM),
                   ("attn_v", HIDDEN, KV_HEADS * HEAD_DIM), ("attn_output", Q_HEADS * HEAD_DIM, HIDDEN)],
            False: [("attn_qkv", HIDDEN, G_DN_CONV), ("attn_gate", HIDDEN, G_DN_VHEADS * DN_VDIM),
                    ("ssm_out", G_DN_VHEADS * DN_VDIM, HIDDEN)]}
     both = [("ffn_gate_inp", HIDDEN, EXPERTS), ("ffn_gate_shexp", HIDDEN, SHARED), ("ffn_up_shexp", HIDDEN, SHARED),
             ("ffn_down_shexp", SHARED, HIDDEN)]
-    mats = [("output.weight", HIDDEN, VOCAB)] + [(f"blk.{i}.{part}.weight", n, rows) for i in range(LAYERS)
+    return [("output.weight", HIDDEN, VOCAB)] + [(f"blk.{i}.{part}.weight", n, rows) for i in range(LAYERS)
                                                  for part, n, rows in own[i % 4 == 3] + both]
+
+
+def gguf_dense_bytes(types=None):
+    """The bytes of the GGUF fixture's dense matrices that the graph sees in the file (the others, floats, it
+    copies): its line at start says them."""
     total = 0
-    for name, n, rows in mats:
+    for name, n, rows in gguf_dense_names():
         _, per, size, _ = GGML[gguf_type(name, types)]
         total += 0 if gguf_type(name, types) == "F32" else n // per * size * rows
+    return total
+
+
+def gguf_tool():
+    """tools/gguf_import.py as a module (`coli import`)."""
+    spec = importlib.util.spec_from_file_location(
+        "gguf_import", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "gguf_import.py"))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def gguf_locked_bytes(snap):
+    """The bytes the graph locks in memory for a prompt on the model in snap: every dense matrix it sees in the file
+    (gguf_dense_names, the F32 ones excepted: those it copies), each rounded out to whole pages, from the file's own
+    tensor table, as the engine's line counts them."""
+    with open(os.path.join(snap, "gguf.json")) as f:
+        path = os.path.join(snap, json.load(f)["gguf"])
+    _, readers, _, tensors = gguf_tool().open_model(Path(path))
+    for r in readers:
+        r.close()
+    page, total = mmap.PAGESIZE, 0
+    for name, _, _ in gguf_dense_names():
+        t = tensors[name]
+        if t["ggml_type"] == 0:                  # F32: a copy, not locked
+            continue
+        start, end = t["abs_offset"], t["abs_offset"] + t["nbytes"]
+        total += -(-end // page) * page - start // page * page
     return total
 
 
@@ -436,10 +469,7 @@ def write_packed_copy(snap, out):
     """The GGUF fixture in snap as `coli import --mode copy` lays it out, in the new directory out: the dense tensors
     copied as they are and each layer's routed experts one per 4 KiB slot, gate | up | down, so that one read fetches
     an expert (tools/gguf_import.py's write_packed, which `coli import` runs)."""
-    spec = importlib.util.spec_from_file_location(
-        "gguf_import", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "gguf_import.py"))
-    tool = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tool)
+    tool = gguf_tool()
     os.mkdir(out)
     parts, readers, meta, tensors = tool.open_model(Path(snap) / "model.gguf")
     try:
@@ -586,7 +616,8 @@ class GraphRuns(unittest.TestCase):
         for e in envs:
             env.update(e)
         p = subprocess.run([ENGINE, "8", "4", path], env=env, capture_output=True, timeout=600)
-        run = {"code": p.returncode, "stdout": p.stdout, "stderr": p.stderr.decode(errors="replace")}
+        run = {"code": p.returncode, "stdout": p.stdout, "stderr": p.stderr.decode(errors="replace"), "env": env,
+               "n_new": n_new}
         for key in ("layers", "logits"):
             path = os.path.join(out, key + ".f32")
             run[key] = floats_of(path) if os.path.exists(path) else array("f")
@@ -1260,6 +1291,10 @@ G_SMALL_CACHE = {"QWEN_EXPERT_CACHE_BYTES": str(24 * gguf_payload())}    # 24 sl
 G_STREAM_CACHE = {"QWEN_EXPERT_CACHE_BYTES": str(300 * gguf_payload())}  # enough for the prompt windows
 G_PRODUCTS = re.compile(r"\[qwen36-metal\] GGUF: (\d+) products with the file's dense matrices and (\d+) with its "
                         r"routed experts ran on the GPU")
+G_LOCKED = re.compile(r"\[qwen36-metal\] GGUF: the dense matrices locked in memory \((\d+) bytes\) from each prompt "
+                      r"to the decode step after it")
+G_COUNTS = re.compile(r"\[qwen36-metal\] GGUF: the dense matrices locked for (\d+) prompts, unlocked after (\d+) first "
+                      r"decode steps and at the end of (\d+) requests; (\d+) still locked at exit")
 
 
 @unittest.skipUnless(ENGINE, "make -C c test-qwen36-graph METAL=1 runs it (QWEN36_GRAPH_ENGINE)")
@@ -1280,12 +1315,23 @@ class Qwen36GgufGraphTest(GraphRuns):
             raise AssertionError("the Metal graph does not take the GGUF fixture: " + cls.off)
 
     def assert_gguf(self, run):
-        """A graph run on the GGUF: the dense matrices seen in the file, its lines, and its products on the GPU."""
+        """A graph run on the GGUF: the dense matrices seen in the file and locked in memory for each prompt (the
+        bytes of their pages, from the file's tensor table) and unlocked after the first decode step, or at the end
+        of a request without one; its lines, and its products on the GPU."""
         self.assert_ran(run, True)
         self.assertIn("dense=mapped kv=", run["stderr"])
         self.assertIn(f"({gguf_dense_bytes()} bytes mapped)", run["stderr"])
         self.assertIn("[qwen36-metal] GGUF: the dense matrices read in place as the file's ggml blocks, and the "
                       "routed experts as its blocks too (layer 0: gate Q4_K, up Q4_K, down Q5_K)", run["stderr"])
+        m = G_LOCKED.search(run["stderr"])
+        self.assertTrue(m, run["stderr"][-3000:])
+        self.assertEqual(int(m.group(1)), gguf_locked_bytes(run["env"]["SNAP"]), run["stderr"][-3000:])
+        m = G_COUNTS.search(run["stderr"])
+        self.assertTrue(m, run["stderr"][-3000:])
+        locks, steps, ends, left = (int(x) for x in m.groups())
+        self.assertGreaterEqual(locks, 1, run["stderr"][-3000:])
+        self.assertEqual((steps + ends, left), (locks, 0), run["stderr"][-3000:])
+        self.assertGreaterEqual(steps if run["n_new"] >= 2 else ends, 1, run["stderr"][-3000:])
         m = G_PRODUCTS.search(run["stderr"])
         self.assertTrue(m and int(m.group(1)) > 0 and int(m.group(2)) > 0, run["stderr"][-3000:])
 
@@ -1336,22 +1382,28 @@ class Qwen36GgufGraphTest(GraphRuns):
 
     def test_serve_resumes_from_the_copy(self):
         """A second chat turn from the state where the first one's last turn opened: the layers and text of an
-        engine that reads it all, in exact mode."""
+        engine that reads it all, in exact mode. The dense matrices locked for each turn's prompt and unlocked after
+        its first decode step, or at the end of a turn of one token (the prompt's), which has none."""
         self.graph()
         second = PROMPT + "Fox<|im_end|>\n" + chat(("user", "And the dog?"))
+        third = second + "Dog<|im_end|>\n" + chat(("user", "And the cat?"))
         session = Serve(self, EXACT, G_SMALL_CACHE)
         session.ask("a", PROMPT, 3)
         layers, text = session.ask("b", second, 3)
+        session.ask("c", third, 1)
         log = session.close()
         self.assertIn("from the previous turn", log)
         fresh = Serve(self, EXACT, G_SMALL_CACHE)
         flayers, ftext = fresh.ask("f", second, 3)
         flog = fresh.close()
-        for err in (log, flog):   # on the graph: the CPU engine would resume from the copy too
-            self.assertIn("graph ready", err)
+        for err, counts in ((log, (3, 2, 1, 0)), (flog, (1, 1, 0, 0))):
+            self.assertIn("graph ready", err)   # on the graph: the CPU engine would resume from the copy too
             self.assertIn(f"({gguf_dense_bytes()} bytes mapped)", err)
             m = G_PRODUCTS.search(err)
             self.assertTrue(m and int(m.group(1)) > 0 and int(m.group(2)) > 0, err[-3000:])
+            m = G_COUNTS.search(err)   # prompts locked, unlocked after a step, at a request's end, still locked
+            self.assertTrue(m, err[-3000:])
+            self.assertEqual(tuple(int(x) for x in m.groups()), counts, err[-3000:])
         self.assertEqual(layers, flayers)
         self.assertEqual(text, ftext)
 
