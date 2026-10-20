@@ -89,7 +89,12 @@ kernels are unchanged beside it.
   retained slots the layer-by-layer prompt needs (UD-Q4_K_M: 263 slots, 255
   retained; the larger types fewer): a prompt then loads its experts eight at a
   time, with a line, unless `QWEN_EXPERT_CACHE_BYTES` holds top-k + 256 slots
-  (538509312 bytes for UD-Q4_K_M).
+  (538509312 bytes for UD-Q4_K_M). On an 8 GB M1 that one slot more made
+  UD-Q4_K_M's 512-token prompts 15 to 31% faster, with the same logits; in the
+  decode after them the medians were 0.2 to 4.8% lower and the runs
+  overlapped, but on code three of the four default runs were faster than
+  every run with the larger cache
+  ([the experiment's record](experiments/qwen36-gguf-metal-2026-10-19/README.md)).
 - The file's three differences from the checkpoint are taken as it stores
   them, as the CPU engine takes them: full-gamma norms, `A = -exp(A_log)`, and
   DeltaNet value heads in llama.cpp's tiled order (value head h reads key head
@@ -107,6 +112,17 @@ kernels are unchanged beside it.
   groups its arithmetic differently (the block scales applied to each block's
   sums, fused multiply-adds), so its results differ from exact mode's in the
   last bits (the test's fast and exact layers within about 3e-5).
+- On an 8 GB M1 the model's own format is faster. There, in fast mode, the
+  35B model's UD-Q4_K_M decodes 21 to 26% slower than the model's own format
+  (7.41 against 9.44 tok/s on prose after a 512-token prompt) and, at the
+  default budget (its prompt's experts eight at a time, none of the CPU's
+  share), reads 512-token prompts at about half the speed (66 against 132
+  tok/s), with 107 to 109 MiB more peak memory; with
+  `QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4` it decodes 15 to 22% slower,
+  in exact mode 39 to 42%
+  ([the experiment's record](experiments/qwen36-gguf-metal-2026-10-19/README.md)).
+  Most of a decode step's extra time is the wait for the experts read from
+  disk (see [Where the time goes](#where-the-time-goes)).
 - Not with a GGUF: the CPU's share of a fast prompt (`QWEN36_CPU_MATMUL`: its
   products take INT8 weights), the MTP head, the graph's only drafter (no
   drafts; a line says so when the file has one, or with `QWEN36_MTP=1` or
@@ -544,12 +560,28 @@ in exact mode and 2.948 on the CPU engine; the model ranks the true token first
 
 `COLI_TIMERS=1` prints, with the CPU engine's labels, the GPU time of
 DeltaNet, attention, the MoE (router and shared expert included) and lm_head.
-The GPU reports the time of each batch itself: nothing waits for it, so a
-timed run keeps its pace. The MoE time also holds the wait for the experts
-read from disk, which `expert kernel: fetch | compute` shows apart from their
-GPU work; in a fast prompt the GPU works during part of that wait, so the
-phases can add up to more than the elapsed time. `outside the phases` is the
-rest: work on the CPU, and the GPU idle while it waits for the CPU.
+The GPU reports the time of each batch itself: nothing waits for it, though
+each phase ends a GPU batch of its own (the GGUF record's timed runs decoded
+1 to 7% slower than its speed runs, which also differed in other ways). The
+MoE time also holds the wait for the experts read from disk, which
+`expert kernel: fetch | compute` shows apart from the GPU work on the experts
+computed after it. In decode the GPU runs the shared expert during that wait,
+so its time is counted twice, and the experts the cache holds, untimed; in a
+fast prompt it works during part of the wait. So the phases can add up to
+more than the elapsed time, and they leave out some of the GPU's work.
+`outside the phases` is the rest: work on the CPU, and the GPU idle while it
+waits for the CPU.
+
+On a GGUF most of a decode step's extra time is that wait for the disk: on
+the 35B model's UD-Q4_K_M after a 512-token prompt on an 8 GB M1, 70.0
+against 46.5 ms a step on prose, of 135.2 against 103.4 ms for all the phases
+(steps 2 to 32 of one timed run per file, less a first step timed in another
+run). On the three texts the decode read 1.6 to 6.1% more experts than on the
+model's own format, each 14% larger, and its wait grew 40 to 50%; a GGUF
+expert is also three reads instead of one (its gate, up and down are three
+tensors of the file; one read with `coli import --mode copy`), which was not
+measured apart
+([the experiment's record](experiments/qwen36-gguf-metal-2026-10-19/README.md)).
 
 ## Tests
 
