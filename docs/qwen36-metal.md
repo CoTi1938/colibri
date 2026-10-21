@@ -88,7 +88,15 @@ kernels are unchanged beside it.
   decode the GPU holds them in memory anyway, and between requests the system
   may take them back (a request that ends without a decode step unlocks them at
   its end). A line says how many bytes are locked, or why they could not be, and
-  the report at exit how many times they were locked and unlocked.
+  the report at exit how many times they were locked and unlocked. On an 8 GB
+  M1, with the 35B model's UD-Q4_K_M in fast mode, the first decode step after a
+  512-token prompt took 0.30 to 0.33 s instead of 0.88 to 1.17 s and the second
+  new word came 11.4 to 13.5% sooner (25.9% after a 64-token prompt; the first
+  new word comes from the prompt's logits, as much sooner as the prompt is
+  faster); the decode after the prompt was 1.4 to 4.4% slower. Once locked, the
+  pages count in the process's resident size (1773 to 1908 MiB more), not in its
+  peak memory footprint ([the experiment's
+  record](experiments/qwen36-gguf-lock-2026-10-20/README.md)).
 - The routed experts go into the expert cache's slots as the file holds them,
   gate, up and down one after the other, in three reads (one with `coli import
   --mode copy`). A slot is as large as the file's largest expert: 2.0 MB on the
