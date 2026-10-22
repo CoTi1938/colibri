@@ -41,6 +41,13 @@ the end of the context: a reasoning model's turn is its reasoning plus its answe
 Stop sequences are removed from the response and end generation early in both JSON and
 streaming modes.
 
+On the GLM engine, legacy `POST /v1/completions` also accepts a non-empty
+`prompt` array of integer token IDs, for example `[12, 345, 6]`. The IDs go
+directly to the engine's pre-tokenized intake; they must be non-negative and
+within the model's vocabulary. An out-of-vocabulary ID receives a `prompt`
+400. Other engines currently reject token-ID prompts with a named 400, and
+batched prompts (arrays of strings or arrays of arrays) remain unsupported.
+
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
 `add_generation_prompt=False`. This is on by default — a message list ending in a
