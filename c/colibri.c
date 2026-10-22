@@ -11441,14 +11441,15 @@ static void run_serve(Model *m, const char *snap){
             if(prompt_tokens>maxctx-2){
                 /* The legacy protocol has no ERROR frame: this is an empty
                  * answer plus a STAT line carrying CONTEXT_EXCEEDED as a 7th
-                 * token ('coli' matches the first fields and ignores the rest)
-                 * and a stderr line the operator can act on. */
+                 * token and the cause (PROMPT_TOO_LONG here) as an 8th
+                 * ('coli' matches the first fields and ignores the rest),
+                 * plus a stderr line the operator can act on. */
                 free(tmp); free(raw); g_temp=base_temp; g_nuc=base_nuc;
                 fprintf(stderr,"[API] prompt does not fit: >=%d tokens, context is %d "
                                "(CTX=%d). Raise CTX or shorten the prompt.\n",
                         prompt_tokens,maxctx-2,maxctx);
                 printf("\x01\x01" "END" "\x01\x01\n");
-                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED\n",
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED PROMPT_TOO_LONG\n",
                        rss_gb(),prompt_tokens);
                 fflush(stdout); continue;
             }
@@ -11484,21 +11485,31 @@ static void run_serve(Model *m, const char *snap){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM turn tokens\n");exit(1);}
             k=tok_encode(&T,buf,bl,tmp,maxctx-1); prompt_tokens=k;
             if(clipped || k>maxctx-2 || len+k+8+g_draft>=maxctx){
+                /* Same refusal contract as the API arm above, with the cause
+                 * as the 8th STAT token so 'coli chat' can print the right
+                 * hint: HISTORY_FULL wants :reset, PROMPT_TOO_LONG wants a
+                 * shorter prompt or a bigger CTX, RENDER_CLIPPED wants the
+                 * prompt pasted in smaller chunks. */
                 free(tmp); g_temp=base_temp; g_nuc=base_nuc;
-                if(clipped)
+                const char *cause;
+                if(clipped){
+                    cause="RENDER_CLIPPED";
                     fprintf(stderr,"[chat] prompt text exceeded the 64KB render buffer and was "
                                    "clipped; refusing rather than answering from clipped text. "
                                    "Paste shorter chunks.\n");
-                else if(k>maxctx-2)
+                } else if(k>maxctx-2){
+                    cause="PROMPT_TOO_LONG";
                     fprintf(stderr,"[chat] turn does not fit: >=%d tokens, context is %d "
                                    "(CTX=%d). Raise CTX or shorten the prompt.\n",
                             k,maxctx-2,maxctx);
-                else
+                } else {
+                    cause="HISTORY_FULL";
                     fprintf(stderr,"[chat] conversation history no longer fits the context "
                                    "(CTX=%d); clear it (\\x02RESET) to continue.\n",maxctx);
+                }
                 printf("\n\x01\x01" "END" "\x01\x01\n");
-                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED\n",
-                       rss_gb(),prompt_tokens);
+                printf("STAT 0 0.00 0.0 %.2f %d 0 CONTEXT_EXCEEDED %s\n",
+                       rss_gb(),prompt_tokens,cause);
                 fflush(stdout); continue;
             }
             if(k>0) memcpy(hist+len,tmp,k*sizeof(int));

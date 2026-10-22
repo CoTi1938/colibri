@@ -200,5 +200,8 @@ Over-context prompts are refused, never silently truncated (#2097): the engine
 emits an empty answer, a `STAT` line with a seventh `CONTEXT_EXCEEDED` token,
 and a stderr line naming the cause (prompt too long for the context, a
 conversation history that no longer fits, or text clipped by the 64 KB render
-buffer). Raise `CTX` or shorten the prompt; in chat, `\x02RESET` clears a full
-history.
+buffer). The cause rides the `STAT` line as an eighth token (`PROMPT_TOO_LONG`,
+`HISTORY_FULL`, or `RENDER_CLIPPED`) so `coli chat` can print it with the
+right hint instead of an empty answer: `:reset` clears a full history, a
+shorter prompt (or a larger `CTX`) fits an over-long turn. Raise `CTX` or
+shorten the prompt; in chat, `\x02RESET` clears a full history.
