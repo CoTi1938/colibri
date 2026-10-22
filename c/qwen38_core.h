@@ -5391,6 +5391,10 @@ static void q38_head_scores(float *y,const float *x,const Q38Weight *head,const 
     int8_t *xq=(int8_t*)malloc((size_t)I);
     if(!xq){fprintf(stderr,"OOM activation quantization\n");exit(1);}
     float sx=dense_act_i8(x,I,xq,NULL);
+#ifdef IDOT_R16
+    if(head->q8r16) matmul_q_idot_rows_r16(y,xq,sx,head->q8,head->q8sc,ids,n,I);
+    else
+#endif
     matmul_q_idot_rows(y,xq,sx,head->q8,head->q8sc,ids,n,I);
     free(xq);
 }

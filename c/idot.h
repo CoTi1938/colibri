@@ -1224,13 +1224,14 @@ static inline void i8r16_pack(int8_t *dst, const int8_t *src, int O, int I){
                 for(int e=0;e<4;e++) o[64*(size_t)j+e]=(int8_t)((uint8_t)row[4*j+e]^0x80);
         }
 }
+/* row `id` of rows packed by i8r16_pack, as the plain row */
+static inline void i8r16_row(int8_t *row, const int8_t *src, int id, int I){
+    const int8_t *o=src+(size_t)(id/16)*16*I+4*(id%16);
+    for(int j=0;j<I/4;j++)
+        for(int e=0;e<4;e++) row[4*j+e]=(int8_t)((uint8_t)o[64*(size_t)j+e]^0x80);
+}
 static inline void i8r16_unpack(int8_t *dst, const int8_t *src, int O, int I){
-    for(int g=0;g<O/16;g++)
-        for(int r=0;r<16;r++){
-            int8_t *row=dst+(size_t)(16*g+r)*I; const int8_t *o=src+(size_t)g*16*I+4*r;
-            for(int j=0;j<I/4;j++)
-                for(int e=0;e<4;e++) row[4*j+e]=(int8_t)((uint8_t)o[64*(size_t)j+e]^0x80);
-        }
+    for(int o=0;o<O;o++) i8r16_row(dst+(size_t)o*I,src,o,I);
 }
 static inline int32_t i8r16_ld32(const int8_t *p){ int32_t v; memcpy(&v,p,4); return v; }
 /* group grp (16 rows, scale sc[0..15]) against n activation rows: y[s*O + r] */
@@ -1336,6 +1337,22 @@ static void matmul_q_idot_r16(float *y, const int8_t *xq, const float *sx, const
             default: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,n); break;
             }
         }
+    }
+}
+/* matmul_q_idot_rows on rows packed by i8r16_pack: each row is unpacked and read by the row
+ * kernel, so y[j] has the bits matmul_q_idot_r16 gives row ids[j]. */
+static void matmul_q_idot_rows_r16(float *y, const int8_t *xq, float sx, const int8_t *q,
+                                   const float *scale, const int *ids, int n, int I){
+    #pragma omp parallel
+    {
+        int8_t *row=(int8_t*)malloc((size_t)I);
+        if(!row){fprintf(stderr,"OOM interleaved row\n");exit(1);}
+        #pragma omp for schedule(static)
+        for(int j=0;j<n;j++){
+            i8r16_row(row,q,ids[j],I);
+            y[j]=(float)dot_i8i8(row,xq,I)*scale[ids[j]]*sx;
+        }
+        free(row);
     }
 }
 #endif

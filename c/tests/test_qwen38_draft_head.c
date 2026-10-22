@@ -145,6 +145,41 @@ int main(void){
         draft_vocab_free(v); m.draft_vocab=NULL;
     }
 
+#ifdef IDOT_R16
+    printf("the rows interleaved by 16, as the engine keeps them on the CPU\n");
+    {
+        enum { V16=320 };   /* whole groups of 16 rows */
+        Model r; memset(&r,0,sizeof r);
+        r.c.vocab=V16; r.c.hidden=I;
+        q38_weight_reserve(&r.lm_head,Q38_WEIGHT_BF16,V16,I);
+        uint16_t *bf=(uint16_t*)r.lm_head.data;
+        for(int64_t k=0;k<(int64_t)V16*I;k++)bf[k]=f32_to_bf16(rnd());
+        q38_trunk_quantize(&r.lm_head,&r.lm_head.q8,&r.lm_head.q8sc);
+        int8_t *packed=(int8_t*)malloc((size_t)V16*I);
+        i8r16_pack(packed,r.lm_head.q8,V16,I);
+        memcpy(r.lm_head.q8,packed,(size_t)V16*I);
+        free(packed);
+        r.lm_head.q8r16=1;
+        float lo[V16];
+        q38_weight_matmul(lo,x,&r.lm_head,1,I,V16);
+        int top=q38_argmax(lo,V16);
+
+        int ids[]={top,319,1,16,17,200};
+        float score[6];
+        q38_head_scores(score,x,&r.lm_head,ids,6);
+        int same=1;
+        for(int j=0;j<6;j++)same&=!memcmp(&score[j],&lo[ids[j]],sizeof(float));
+        ck(same,"the score of a listed token equals the whole lm_head's score, byte for byte");
+
+        DraftVocab *v=draft_vocab_new(V16,8);
+        int listed[]={(top+5)%V16,top,(top+40)%V16,(top+100)%V16};
+        set_list(v,listed,4);
+        r.draft_vocab=v;
+        ck(q38_mtp_best_token(&r,x)==top,"a list with the best token of the whole vocabulary drafts that token");
+        draft_vocab_free(v);
+    }
+#endif
+
     printf("the decision\n");
     {
         unsetenv("Q38_MTP_VOCAB");
