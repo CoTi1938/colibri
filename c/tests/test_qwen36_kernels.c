@@ -165,6 +165,35 @@ static void test_dot(int rows, int in, int out, int router) {
     q36_tensor_free(q); q36_tensor_free(sc); q36_tensor_free(x); q36_tensor_free(y);
 }
 
+/* A small batch (a speculative verify, 2-8 rows) gives every row the bits of the same row computed alone, in
+ * both modes: the verify's rows stand for the steps they replace. */
+static void test_dot_rows_bits(int rows, int in, int out) {
+    int saved = g_test_exact;
+    for (int exact = 0; exact < 2; exact++) {
+        test_set_exact(exact);
+        q36_tensor *q = rand_i8((size_t)out * in), *sc = rand_tensor((size_t)out, 0.01f);
+        q36_tensor *x = rand_tensor((size_t)rows * in, 1.0f), *y = q36_tensor_new((size_t)rows * out * 4);
+        q36_tensor *x1 = q36_tensor_new((size_t)in * 4), *y1 = q36_tensor_new((size_t)out * 4);
+        float *alone = malloc((size_t)rows * out * 4);
+        int ok = q36_dot_i8(y, x, q, sc, rows, in, out);
+        sync_or_die();
+        for (int r = 0; ok && r < rows; r++) {
+            memcpy(F(x1), F(x) + (size_t)r * in, (size_t)in * 4);
+            ok = q36_dot_i8(y1, x1, q, sc, 1, in, out);
+            sync_or_die();
+            memcpy(alone + (size_t)r * out, F(y1), (size_t)out * 4);
+        }
+        int same = ok && !memcmp(alone, F(y), (size_t)rows * out * 4);
+        printf("dot_i8 %d rows = each alone %d->%d %s  %s\n", rows, in, out, exact ? "exact" : "fast ",
+               same ? "ok" : "FAIL");
+        g_failures += !same;
+        free(alone);
+        q36_tensor_free(q); q36_tensor_free(sc); q36_tensor_free(x); q36_tensor_free(y);
+        q36_tensor_free(x1); q36_tensor_free(y1);
+    }
+    test_set_exact(saved);
+}
+
 static void test_elementwise(int n) {
     q36_tensor *x = rand_tensor((size_t)n, 2.0f), *z = rand_tensor((size_t)n, 4.0f);
     q36_tensor *y0 = q36_tensor_new((size_t)n * 4), *y1 = q36_tensor_new((size_t)n * 4);
@@ -1729,6 +1758,15 @@ int main(void) {
     test_attention_dominant(1, 1);                /* decode's three steps */
     test_attention_dominant(2, 0);                /* prompt rows */
     test_keepalive();
+    /* last, so that the checks above keep their random inputs */
+    test_dot_rows_bits(2, 2048, 8192);
+    test_dot_rows_bits(3, 2048, 4096);
+    test_dot_rows_bits(4, 4096, 2048);
+    test_dot_rows_bits(5, 2048, 512);
+    test_dot_rows_bits(8, 256, 64);
+    test_dot_rows_bits(2, 2048, 12);            /* exact: four outputs per SIMD group, not eight */
+    test_dot_rows_bits(3, 68, 20);
+    test_dot_rows_bits(2, 75, 7);               /* neither vector nor four: the one-output kernel */
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

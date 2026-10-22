@@ -510,6 +510,14 @@ static void expected_reuse_in_decode(void) {
           "a smaller group updates the estimates of its layer");
     int more[GROUP+1];for(int i=0;i<=GROUP;i++)more[i]=2*E+i;
     qep_begin(q,more,GROUP+1);CHECK(!q->group_active,"more than top-k experts of a layer are not a decode group");
+    /* A speculative verify's rows together, under a larger group_max: one visit of their layer. */
+    q->group_max=GROUP+4;
+    qep_begin(q,more,GROUP+1);CHECK(q->group_active,"a verify's rows are a decode group up to group_max");
+    qep_end(q,1);
+    CHECK(q->probability[2*E]==chosen && q->probability[2*E+GROUP]==chosen && q->probability[2*E+GROUP+1]==0.5*q->beta,
+          "a verify's rows update their layer's estimates once");
+    int over[GROUP+5];for(int i=0;i<GROUP+5;i++)over[i]=3*E+i;
+    qep_begin(q,over,GROUP+5);CHECK(!q->group_active,"more than group_max experts of a layer are not a decode group");
     qep_free(q);
 
     Fixture f;fixture_init(&f,24);                   /* 16 retained slots, 8 working */

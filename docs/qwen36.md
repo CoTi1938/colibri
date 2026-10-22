@@ -119,7 +119,7 @@ row, so a rejected draft rolls back by swapping a copy in. A gate drafts only wh
 measured acceptance and verify cost say it pays. The output is that of plain decoding,
 greedy or sampled, on the CPU, in the Vulkan dense chain and in the CUDA chain with every
 routed expert on the device. Lookup stays off under a CUDA tier holding part of the
-experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident, and under the Metal graph ([qwen36-metal.md](qwen36-metal.md)), which has no verify. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident, and under the Metal graph ([qwen36-metal.md](qwen36-metal.md#speculative-decoding)), which drafts with the checkpoint's MTP head instead. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
 
 ## The MTP head (`Q36_MTP`)
@@ -127,9 +127,12 @@ experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is re
 `tools/convert_qwen36.py` carries the release's `mtp.*` tensors into
 `model-mtp.safetensors`. Dense weights and norms stay f16; routed experts use
 exactly the trunk's merged int8/int4, group-scale or mixed-down format.
-`Q36_MTP=1` loads this block from `SNAP`; unset or `0` leaves it unread. A
-container without the block still decodes normally and reports that the head
-is unavailable. No separate model download is needed.
+`Q36_MTP=1` loads this block from `SNAP` on the CPU, Vulkan and CUDA paths;
+unset or `0` leaves it unread there. The Metal graph reads it by default for
+its own head (`QWEN36_MTP=0` turns that off; see
+[qwen36-metal.md](qwen36-metal.md#speculative-decoding)). A container without
+the block still decodes normally and reports that the head is unavailable. No
+separate model download is needed.
 
 For a full conversion, use the usual command. To add the head to an existing
 container, only the source shards named for `mtp.*` in the release's index are
@@ -161,8 +164,9 @@ KV cache; only draft rows need its full decoder computation. Rejected verify
 rows are rewound, and pins preserve the pending residual. The same verify
 path as prompt lookup commits tokens: output and final logits equal ordinary
 decoding, including sampled `serve` turns. As for lookup, speculation is off
-under a CUDA tier holding part of the experts, `CACHE_ROUTE`, qpack and the
-Metal graph.
+under a CUDA tier holding part of the experts, `CACHE_ROUTE` and qpack. The
+Metal graph does not load this head: it drafts with its own, on the GPU, from
+the same tensors ([qwen36-metal.md](qwen36-metal.md#speculative-decoding)).
 
 `Q36_MTP_DRAFTS=1` is the default; `1` through `7` set the maximum depth, and
 `auto` lets the measured gate choose. `Q36_MTP_PMIN` (default `0`) stops adding

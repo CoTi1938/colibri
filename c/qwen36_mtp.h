@@ -697,9 +697,14 @@ static void q36_mtp_attach(Model *m) {
                         "where there are no speculative steps\n");
         return;
     }
-    if (g_cache_route || qq_active() || QWEN_GRAPH(m)) {
+    if (g_cache_route || qq_active()) {
         fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
-                g_cache_route ? "CACHE_ROUTE" : qq_active() ? "a qpack container" : "the Metal graph");
+                g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+        return;
+    }
+    if (QWEN_GRAPH(m)) {   /* the graph drafts with its own head (qwen36_graph_mtp_load in qwen36.c) */
+        fprintf(stderr, "[mtp] Q36_MTP=1: the Metal graph drafts with its own MTP head, on when the container has "
+                        "one (QWEN36_MTP=0 turns it off)\n");
         return;
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }

@@ -14,6 +14,7 @@
 
 typedef struct {
     size_t keys, layers, experts, topk, bytes;
+    size_t group_max;                           /* largest decode group: top-k, or a verify's rows together */
     double alpha, beta, prior;
     double *probability, *repeat_numerator, *repeat_denominator;
     unsigned char *last_selected, *current_selected;
@@ -33,7 +34,7 @@ static QwenExpectedPolicy *qep_new(size_t keys,size_t layers,size_t experts,size
     size_t bytes=keys*(3*sizeof(double)+1);
     if (bytes>SIZE_MAX-experts || bytes+experts>SIZE_MAX-sizeof(QwenExpectedPolicy)) return NULL;
     QwenExpectedPolicy *p=calloc(1,sizeof(*p)); if (!p) return NULL;
-    p->keys=keys; p->layers=layers; p->experts=experts; p->topk=topk;
+    p->keys=keys; p->layers=layers; p->experts=experts; p->topk=topk; p->group_max=topk;
     p->bytes=sizeof(*p)+bytes+experts;
     /* 1 - 2^(-1/16) as a hexadecimal literal, so that every compiler gets these bits. */
     p->alpha=0x1.5b505d5b6f267p-5; p->beta=1.0-p->alpha;
@@ -52,13 +53,15 @@ static QwenExpectedPolicy *qep_new(size_t keys,size_t layers,size_t experts,size
     return p;
 }
 /* A decode group: the top-k of one layer, or fewer of its experts (fast
- * experts, qwen36_fast_experts.h, leave some out). It is only noted here; the
- * estimates change when the whole group has been acquired (qep_end). Any
- * other group (prefill, or not one layer's choices) keeps the frequency policy. */
+ * experts, qwen36_fast_experts.h, leave some out), or with group_max above
+ * top-k the experts of a speculative verify's rows together, counted as one
+ * visit of the layer. It is only noted here; the estimates change when the
+ * whole group has been acquired (qep_end). Any other group (prefill, or not one
+ * layer's choices) keeps the frequency policy. */
 static void qep_begin(QwenExpectedPolicy *p,const int *keys,unsigned n) {
     if (!p) return;
     p->group_active=0;
-    if (!p->decode || n>p->topk || !n || keys[0]<0 || (size_t)keys[0]>=p->keys) return;
+    if (!p->decode || n>p->group_max || !n || keys[0]<0 || (size_t)keys[0]>=p->keys) return;
     size_t layer=(size_t)keys[0]/p->experts;
     memset(p->current_selected,0,p->experts);
     for (unsigned i=0;i<n;i++) {

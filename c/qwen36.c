@@ -1274,6 +1274,14 @@ typedef struct {
 #ifdef QWEN36_METAL_GRAPH
     int metal_graph;                /* the forward runs as the Metal graph */
     struct Qwen36Graph *graph;
+    /* The checkpoint's MTP head (qwen36_graph_mtp_load): one more decoder layer, index
+     * c.n_layers, which reads the model's final residual at a position with the token
+     * after it and drafts the token after that. Its routed experts are the expert
+     * cache's layer c.n_layers. */
+    int mtp;
+    Layer mtp_L;
+    QW mtp_fc;
+    float *mtp_norm_emb, *mtp_norm_hid, *mtp_norm;
 #endif
 } Model;
 
@@ -3868,6 +3876,138 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 static int qwen_global_cache_init(Model *m);
 static void qwen_expert_file_open(Model *m, const char *snap);
 #endif
+#ifdef QWEN36_METAL_GRAPH
+static int64_t scale_count_gu(const Cfg *c);
+static int64_t scale_count_d(const Cfg *c);
+/* The MTP head, when the container carries it (tools/convert_qwen36.py writes it as
+ * model-mtp.safetensors, and --mtp-only adds it to a container converted before):
+ * the checkpoint's mtp.* tensors, f16 dense weights and routed experts in the
+ * container's int4 layout. Its dense matrices are quantized to INT8 here, as the
+ * model's are without canonical.qc; its experts load into the expert cache as layer
+ * c.n_layers (load_expert_merged). On by default with the Metal graph (speculative
+ * decoding, q36_spec_step); QWEN36_MTP=0 turns it off. The other engines' head
+ * (qwen36_mtp.h, Q36_MTP=1) is not loaded beside it. */
+/* One dense matrix of the head, [O][I], to INT8 as qw_quantize makes it (a scale per
+ * row: its largest magnitude over 127), read 256 rows at a time: freed float copies of
+ * whole matrices stayed in the process's footprint (110 MiB of it after loading the 35B
+ * model's head). A tensor that is not f16, bf16 or f32 goes through load_t_n. */
+static void qwen_mtp_dense(Model *m, const char *name, int I, int O, QW *out) {
+    char rn[QW_DENSE_NAME_MAX];
+    const char *nm = dense_resolve(m, name, rn, sizeof rn);
+    st_tensor *t = st_find(&m->S, nm);
+    int64_t want = (int64_t)I * O;
+    if (!t || t->dtype > 2) {
+        float *p = load_t_n(m, name, want);
+        qw_quantize(p, I, O, "mtp", out);
+        free(p);
+        return;
+    }
+    int esz = st_dtype_esz(t->dtype), rows = 256;
+    if (t->numel != want || t->nbytes != want * esz) {
+        fprintf(stderr, "%s: %lld elements (%lld bytes), config implies %lld -- refusing\n", nm,
+                (long long)t->numel, (long long)t->nbytes, (long long)want);
+        exit(1);
+    }
+    int8_t *q = q36_walloc((size_t)want);
+    float *sc = malloc((size_t)O * sizeof(float)), *w = malloc((size_t)rows * I * sizeof(float));
+    void *raw = malloc((size_t)rows * I * esz);
+    if (!q || !sc || !w || !raw) { fprintf(stderr, "OOM reading %s\n", nm); exit(1); }
+    for (int o0 = 0; o0 < O; o0 += rows) {
+        int n = O - o0 < rows ? O - o0 : rows;
+        int64_t k = (int64_t)n * I;
+        st_pread_full(t->fd, raw, k * esz, t->off + (int64_t)o0 * I * esz, "pread data");
+        if (t->dtype == 2) memcpy(w, raw, (size_t)k * sizeof(float));
+        else if (t->dtype == 0) bf16_to_f32_bulk((const uint16_t *)raw, w, k);
+        else f16_to_f32_bulk((const uint16_t *)raw, w, k);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < n; r++) {
+            const float *x = w + (int64_t)r * I; float am = 0.f;
+            for (int i = 0; i < I; i++) { float a = fabsf(x[i]); if (a > am) am = a; }
+            float s = am > 1e-12f ? am/127.f : 1.f; sc[o0 + r] = s; float inv = 1.f/s;
+            int8_t *d = q + (int64_t)(o0 + r) * I;
+            for (int i = 0; i < I; i++) { int v = (int)lrintf(x[i]*inv); if (v>127) v=127; if (v<-127) v=-127; d[i] = (int8_t)v; }
+        }
+    }
+    free(raw);
+    free(w);
+    out->q = q; out->sc = sc; out->I = I; out->O = O;
+    out->q4 = NULL; out->sg = NULL; out->ng = 0;
+}
+static void qwen36_graph_mtp_load(Model *m) {
+    const char *v = getenv("QWEN36_MTP");
+    Cfg *c = &m->c;
+    if (v && *v && strcmp(v, "0") && strcmp(v, "1"))
+        fprintf(stderr, "[qwen36-mtp] QWEN36_MTP=%s ignored: 0 turns the head off, 1 (the default) on\n", v);
+    if (v && !strcmp(v, "0")) return;
+    if (!st_find(&m->S, "mtp.fc.weight")) {
+        if (v && !strcmp(v, "1"))
+            fprintf(stderr, "[qwen36-mtp] QWEN36_MTP=1 ignored: the container has no MTP head (tools/convert_qwen36.py "
+                            "writes it, model-mtp.safetensors)\n");
+        return;
+    }
+    if (!c->n_experts || c->shared_inter <= 0) {
+        fprintf(stderr, "[qwen36-mtp] an MTP head needs a model with routed and shared experts; drafting off\n");
+        return;
+    }
+    int H = c->hidden, q_out = c->q_heads * c->q_head_dim, kv_out = c->kv_heads * c->k_head_dim;
+    int64_t packed = (int64_t)3 * c->hidden * c->inter / 2, scales = 2 * scale_count_gu(c) + scale_count_d(c);
+    for (int e = 0; e < c->n_experts; e++) {
+        char nm[160], qs[160];
+        snprintf(nm, sizeof nm, "mtp.layers.0.mlp.experts.%d.merged_weight", e);
+        snprintf(qs, sizeof qs, "mtp.layers.0.mlp.experts.%d.qs", e);
+        st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qs);
+        if (!tw || tw->nbytes != packed || !ts || ts->numel != scales) {
+            fprintf(stderr, "[qwen36-mtp] %s: missing or not int4 gs=%d like the model's experts -- refusing "
+                            "(QWEN36_MTP=0 runs without the head)\n", nm, c->expert_gs);
+            exit(1);
+        }
+    }
+    Layer *l = &m->mtp_L;
+    m->mtp_norm_emb = load_norm_n(m, "mtp.pre_fc_norm_embedding.weight", H);
+    m->mtp_norm_hid = load_norm_n(m, "mtp.pre_fc_norm_hidden.weight", H);
+    m->mtp_norm = load_norm_n(m, "mtp.norm.weight", H);
+    l->in_ln = load_norm_n(m, "mtp.layers.0.input_layernorm.weight", H);
+    l->post_ln = load_norm_n(m, "mtp.layers.0.post_attention_layernorm.weight", H);
+    l->qn = load_norm_n(m, "mtp.layers.0.self_attn.q_norm.weight", c->head_dim);
+    l->kn = load_norm_n(m, "mtp.layers.0.self_attn.k_norm.weight", c->head_dim);
+    qwen_mtp_dense(m, "mtp.fc.weight", 2 * H, H, &m->mtp_fc);
+    qwen_mtp_dense(m, "mtp.layers.0.self_attn.q_proj.weight", H, q_out, &l->q);
+    qwen_mtp_dense(m, "mtp.layers.0.self_attn.k_proj.weight", H, kv_out, &l->k);
+    qwen_mtp_dense(m, "mtp.layers.0.self_attn.v_proj.weight", H, kv_out, &l->v);
+    qwen_mtp_dense(m, "mtp.layers.0.self_attn.o_proj.weight", c->o_in, H, &l->o);
+    qwen_mtp_dense(m, "mtp.layers.0.mlp.gate.weight", H, c->n_experts, &l->gate);
+    qwen_mtp_dense(m, "mtp.layers.0.mlp.shared_expert.gate_proj.weight", H, c->shared_inter, &l->sh_g);
+    qwen_mtp_dense(m, "mtp.layers.0.mlp.shared_expert.up_proj.weight", H, c->shared_inter, &l->sh_u);
+    qwen_mtp_dense(m, "mtp.layers.0.mlp.shared_expert.down_proj.weight", c->shared_inter, H, &l->sh_d);
+    l->sh_gate = load_t_n(m, "mtp.layers.0.mlp.shared_expert_gate.weight", H);
+    /* the head's layer is an attention layer: is_attn grows by its entry */
+    uint8_t *attn = realloc(c->is_attn, (size_t)c->n_layers + 1);
+    if (!attn) { fprintf(stderr, "OOM\n"); exit(1); }
+    c->is_attn = attn;
+    c->is_attn[c->n_layers] = 1;
+    m->mtp = 1;
+    fprintf(stderr, "[qwen36-mtp] the MTP head drafts (speculative decoding; QWEN36_MTP=0 turns it off)\n");
+}
+
+/* One routed expert of the MTP head into a slot: int4 pairs repacked planar, f32 scales. */
+static void qwen36_graph_mtp_expert(Model *m, int eid, Slot *s) {
+    Cfg *c = &m->c;
+    char nm[160], qs[160];
+    snprintf(nm, sizeof nm, "mtp.layers.0.mlp.experts.%d.merged_weight", eid);
+    snprintf(qs, sizeof qs, "mtp.layers.0.mlp.experts.%d.qs", eid);
+    int64_t ng = (int64_t)c->inter * c->hidden, gp = ng / 2, bytes = 3 * ng / 2;
+    uint8_t *raw = malloc((size_t)bytes);
+    if (!raw || !s->pw) { fprintf(stderr, "OOM reading %s\n", nm); exit(1); }
+    st_read_raw(&m->S, nm, raw, 1);
+    xf_repack_pairs_signed(s->pw, raw, c->inter, c->hidden);
+    xf_repack_pairs_signed(s->pw + gp, raw + gp, c->inter, c->hidden);
+    xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, c->hidden, c->inter);
+    free(raw);
+    st_read_f32(&m->S, qs, s->gs, 0);
+    s->is_int4 = 1;
+}
+#endif
+
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     model_init_range(m, snap, cap, bits, 0, 0, 1, 1);
 #ifdef QWEN36_METAL_GRAPH
@@ -3889,6 +4029,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             m->global_cache_budget = (size_t)(ram / 16);
         }
         qwen_expert_file_open(m, snap);
+        qwen36_graph_mtp_load(m);
         if (!qwen_global_cache_init(m) || !qg_create(m)) exit(1);
         m->dense_load_s += now_s() - built;
     }
@@ -4093,6 +4234,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         return;
     }
 #ifdef QWEN36_METAL_GRAPH
+    if (layer == m->c.n_layers && m->mtp) { qwen36_graph_mtp_expert(m, eid, s); return; }
     if (m->expert_file.opened) {
         char error[320];
         if (!qwen_planar_record(m, layer, eid, s, error, sizeof error)) {
@@ -4269,6 +4411,13 @@ static void *qwen_global_allocate(void *context, size_t index) {
  * whether or not the readahead has finished, but misses announced together
  * are read by the SSD in parallel instead of one pread at a time. */
 static void qwen_expert_advise(Model *m, int layer, int eid) {
+    if (layer == m->c.n_layers && m->mtp) {
+        char nm[160], qs[160];
+        snprintf(nm, sizeof nm, "mtp.layers.0.mlp.experts.%d.merged_weight", eid);
+        snprintf(qs, sizeof qs, "mtp.layers.0.mlp.experts.%d.qs", eid);
+        st_prefetch(&m->S, nm); st_prefetch(&m->S, qs);
+        return;
+    }
     if (m->expert_file.opened && layer >= 0 && eid >= 0 &&
         (uint32_t)layer < m->expert_file.h.layers && (uint32_t)eid < m->expert_file.h.experts) {
         const QefHeader *h = &m->expert_file.h;
@@ -4329,12 +4478,19 @@ static int qwen_global_cache_init(Model *m) {
     size_t packed = (size_t)3 * c->hidden * c->inter / 2;
     size_t scales = (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
     if (!packed || packed > SIZE_MAX - scales) return 0;
-    size_t payload = packed + scales, keys = (size_t)c->n_layers * c->n_experts;
+    size_t layers = (size_t)c->n_layers + (m->mtp ? 1 : 0);   /* the MTP head's experts: one more layer */
+    size_t payload = packed + scales, keys = layers * c->n_experts;
     size_t slots = m->global_cache_budget / payload;
-    if (slots > (size_t)INT_MAX || slots < (size_t)c->topk) {
-        fprintf(stderr, "[qwen-cache] budget cannot hold one complete top-k group\n"); return 0;
+    /* With the MTP head a verify of two rows leases both rows' experts at once: groups up to twice top-k */
+    size_t group = (size_t)c->topk * (m->mtp ? 2 : 1);
+    if (group > QGC_MAX_GROUP) group = QGC_MAX_GROUP;
+    if (slots > (size_t)INT_MAX || slots < group) {
+        fprintf(stderr, "[qwen-cache] budget cannot hold %s\n", m->mtp ?
+                "two top-k groups, which a verify with the MTP head leases at once (QWEN36_MTP=0 needs one)" :
+                "one complete top-k group");
+        return 0;
     }
-    if (slots > keys + (size_t)c->topk) slots = keys + (size_t)c->topk;
+    if (slots > keys + group) slots = keys + group;
     /* One physical representation for every slot: check every expert first. */
     for (int l = 0; l < c->n_layers; l++) for (int e = 0; e < c->n_experts; e++) {
         char name[256]; snprintf(name, sizeof name, "model.layers.%d.mlp.experts.%d.merged_weight", m->active_of[l], e);
@@ -4344,12 +4500,13 @@ static int qwen_global_cache_init(Model *m) {
     m->global_slots = calloc(slots, sizeof(Slot)); m->global_cache = calloc(1, sizeof(QwenGlobalCache));
     if (!m->global_slots || !m->global_cache) goto fail;
     uint64_t age_interval = (uint64_t)c->n_layers * c->topk * 8;
-    if (!qgc_init(m->global_cache, keys, slots, (size_t)c->topk, payload, payload, age_interval,
+    if (!qgc_init(m->global_cache, keys, slots, group, payload, payload, age_interval,
                   m, qwen_global_allocate, qwen_global_load, qwen_global_free)) goto fail;
-    if (expected_on && !qgc_expected_enable(m->global_cache, (size_t)c->n_layers, (size_t)c->n_experts, (size_t)c->topk)) {
+    if (expected_on && !qgc_expected_enable(m->global_cache, layers, (size_t)c->n_experts, (size_t)c->topk)) {
         fprintf(stderr, "[qwen-cache] cannot allocate the decode reuse estimates\n");
         qgc_destroy(m->global_cache); goto fail;
     }
+    if (m->global_cache->expected) m->global_cache->expected->group_max = group;   /* a verify's rows: one visit */
     m->global_cache->advise = qwen_global_advise;
     m->global_cache->load_many = qwen_global_load_many;
     m->global_cache->stats.metadata += slots * sizeof(Slot);
@@ -6340,14 +6497,22 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #ifdef QWEN36_METAL_GRAPH
     /* The Metal graph: the forward pass on the GPU, the last row's logits back. */
     if (m->graph) {
-        if (nlogits != 1 || g_hidden_sink) { fprintf(stderr, "[qwen36-metal] the Metal graph returns only the last row\n"); exit(1); }
+        /* a verify (q36_spec_step): every row's logits, the state after each of its first rows copied */
+        int verify = nlogits == S && S > 1 && S <= Q36_SPEC_ROWS && m->snap_rows == S - 1;
+        if ((nlogits != 1 && !verify) || g_hidden_sink) {
+            fprintf(stderr, "[qwen36-metal] the Metal graph returns the last row, or every row of a verify\n");
+            exit(1);
+        }
         for (int s = 0; s < S; s++)
             if (ids[s] < 0 || ids[s] >= c->vocab) {
                 fprintf(stderr, "token id %d out of range 0..%d -- refusing\n", ids[s], c->vocab - 1);
                 exit(1);
             }
-        float *logit = falloc(c->vocab);
-        if (!qg_forward(m, ids, S, pos_base, logit, lf)) { fprintf(stderr, "[qwen36-metal] forward failed\n"); exit(1); }
+        float *logit = falloc((int64_t)nlogits * c->vocab);
+        m->graph->verify = verify ? S : 0;
+        int ok = qg_forward(m, ids, S, pos_base, logit, lf);
+        m->graph->verify = 0;
+        if (!ok) { fprintf(stderr, "[qwen36-metal] forward failed\n"); exit(1); }
         if (lf) fclose(lf);
         kv_prefix_record(&m->kvp, ids, pos_base, S);
         m->token_count += S; m->freq_token_count += S;
@@ -6976,7 +7141,8 @@ static void ensure_kv(Model *m){
  * picks, greedy or sampled, are those of plain decoding. Drafting stays off
  * where that does not hold: the CUDA tier (its float order follows residency),
  * CACHE_ROUTE (it routes by residency) and a qpack container. The Metal graph
- * has no verify, so it does not draft either.
+ * drafts with its own MTP head (q36_spec_begin), and with prompt lookup only in
+ * tests (COLI_LOOKUP_FORCE).
  *
  * Whether a proposal is drafted is the gate's call (spec_draft.h): the measured
  * acceptance by draft position and the measured cost of a verify by its rows;
@@ -6995,6 +7161,14 @@ typedef struct {
     float *ahead_logit;
     uint64_t drafts, accepted, verifies, forwards, tokens;
     int ended_ahead;             /* the generation ended with a verify's rows unconsumed (undone) */
+    /* The Metal graph's MTP head (qwen36_graph_mtp_load) drafts, one token a verify. Its confidence (the draft's
+     * probability under its softmax): a draft goes to a verify only from min_p on (QWEN36_MTP_MIN_P, default
+     * 0.6); skipped: the drafts below it. past: the last 16 tokens, a bit each (the newest lowest), set for a
+     * token past the ids the head drafts from (qg_mtp_vocab); idle: the steps it did not run (q36_spec_step). */
+    int graph_mtp;
+    float min_p, draft_p;
+    uint64_t skipped, idle;
+    unsigned past;
 } Q36Spec;
 static const int *g_q36_oracle; static int g_q36_oracle_n;   /* ref.json's full ids (COLI_LOOKUP_FORCE) */
 
@@ -7010,6 +7184,31 @@ static int q36_spec_force_mode(const char *v, int *row) {
     exit(1);
 }
 
+static int q36_spec_alloc(Model *m, int rows);
+
+#ifdef QWEN36_METAL_GRAPH
+/* tok joins the last 16 tokens the graph's MTP head looks back on (Q36Spec.past). */
+static void q36_spec_past(Model *m, Q36Spec *sp, int tok) {
+    sp->past = (sp->past << 1 | (unsigned)(tok >= qg_mtp_vocab(m->c.vocab))) & 0xffffu;
+}
+
+/* QWEN36_MTP_MIN_P: the head's confidence from which a draft goes to a verify, a number from 0 (every draft) to 1;
+ * 0.6 when unset, and with a line when it is not such a number. */
+static float q36_mtp_min_p(void) {
+    static float p = -1;
+    if (p < 0) {
+        const char *v = getenv("QWEN36_MTP_MIN_P");
+        char *end = NULL;
+        float x = v && *v ? strtof(v, &end) : 0.6f;
+        p = 0.6f;
+        if (v && *v && (*end || !(x >= 0 && x <= 1)))
+            fprintf(stderr, "[qwen36-mtp] QWEN36_MTP_MIN_P=%s ignored: a number from 0 to 1 (0.6, the default)\n", v);
+        else p = x;
+    }
+    return p;
+}
+#endif
+
 static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     memset(sp, 0, sizeof *sp);
     const char *e = getenv("COLI_LOOKUP");
@@ -7024,14 +7223,6 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
-    if (sp->lookup && QWEN_GRAPH(m)) {
-        static int said_graph;
-        if (!said_graph && asked) {   /* the default stays quiet: nothing was asked for */
-            said_graph = 1;
-            fprintf(stderr, "[qwen36] COLI_LOOKUP=1: the Metal graph has no speculative verify; plain decoding\n");
-        }
-        sp->lookup = 0;
-    }
     int tier_off = (qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m);
     if (sp->lookup && (tier_off || g_cache_route || qq_active())) {
         static int said;
@@ -7051,6 +7242,41 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     e = getenv("Q36_MTP_DRAFTS");
     sp->mtp_depth = !e || !*e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
     if (sp->mtp_depth < 0 || sp->mtp_depth > Q36_SPEC_ROWS - 1) { fprintf(stderr, "Q36_MTP_DRAFTS must be 0 (auto) or 1..%d\n", Q36_SPEC_ROWS - 1); exit(1); }
+#ifdef QWEN36_METAL_GRAPH
+    /* The Metal graph drafts with its own MTP head (the other engines' head is not loaded beside it, so sp->mtp
+     * is 0); prompt lookup only under COLI_LOOKUP_FORCE (tests of the verify). */
+    if (QWEN_GRAPH(m)) {
+        sp->graph_mtp = m->mtp;
+        /* A draft goes to a verify from the head's confidence 0.6 on (q36_mtp_min_p). The gate stays off for
+         * these drafts: it weighs a verify against the plain steps of the same run, and a verify also helps the
+         * steps after it (both rows' experts are read in one lease, and the cache then holds two tokens'
+         * experts), so it refused verifies that paid. */
+        sp->min_p = q36_mtp_min_p();
+        if (sp->graph_mtp) sp->gate.off = 1;
+        /* the copies a verify needs, now: the first verify would pay their allocation */
+        if (sp->graph_mtp && !q36_spec_alloc(m, 1)) {
+            static int said_alloc;
+            if (!said_alloc) {
+                said_alloc = 1;
+                fprintf(stderr, "[qwen36-mtp] no memory for a verify's copies: no drafts until there is (prompts "
+                                "still run the head; QWEN36_MTP=0 turns it off)\n");
+            }
+            sp->graph_mtp = 0;
+        }
+        for (int i = np > 16 ? np - 16 : 0; sp->graph_mtp && prompt && i < np; i++) q36_spec_past(m, sp, prompt[i]);
+        if (!sp->force && sp->lookup && asked) {
+            static int said_graph;
+            if (!said_graph) {
+                said_graph = 1;
+                fprintf(stderr, sp->graph_mtp ? "[qwen36] COLI_LOOKUP=1: the Metal graph drafts with the checkpoint's "
+                                                "MTP head only (model-mtp.safetensors); no prompt lookup\n"
+                                              : "[qwen36] COLI_LOOKUP=1: no prompt lookup on the Metal graph, and its "
+                                                "MTP head is off or absent (model-mtp.safetensors)\n");
+            }
+        }
+        if (!sp->force) sp->lookup = 0;
+    }
+#endif
     if (sp->lookup && prompt && np > 0) {
         sp->hist_cap = np + 256;
         sp->hist = (int *)malloc((size_t)sp->hist_cap * sizeof(int));
@@ -7064,6 +7290,9 @@ static void q36_spec_free(Q36Spec *sp) { free(sp->hist); sp->hist = NULL; sp->hi
 /* Copy slots for a verify of up to rows+1 rows, allocated the first time they are
  * needed. 0 = out of memory (the caller takes a plain step). */
 static int q36_spec_alloc(Model *m, int rows) {
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) return rows >= 1 && rows <= Q36_SPEC_SNAPS && qg_spec_alloc(m, rows);
+#endif
     Cfg *c = &m->c;
     if (rows > Q36_SPEC_SNAPS) rows = Q36_SPEC_SNAPS;
     size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
@@ -7082,6 +7311,14 @@ static int q36_spec_alloc(Model *m, int rows) {
 
 /* Back to the state after the verify's first `keep` rows, `len` positions fed. */
 static void q36_spec_rollback(Model *m, int len, int keep) {
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) {
+        qg_spec_rollback(m, keep);
+        m->kv_len = len;
+        if (m->kvp.len > len) m->kvp.len = len;
+        return;
+    }
+#endif
     Cfg *c = &m->c; int slot = keep - 1;
 #ifdef COLI_VULKAN
     q36c_rollback(m, slot, len);   /* the dense chain's own copies: its device buffers swap too */
@@ -7100,6 +7337,9 @@ static void q36_spec_rollback(Model *m, int len, int keep) {
 
 static void q36_spec_settle(Model *m, Q36Spec *sp, int keep, int rejected) {
     if (keep < sp->ahead_n) q36_spec_rollback(m, sp->ahead_pos + keep, keep);
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph && m->mtp) qg_mtp_keep(m, keep);   /* the head reads the rows that stood */
+#endif
     spec_gate_result(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1);
     free(sp->ahead_logit); sp->ahead_logit = NULL; sp->ahead_n = sp->ahead_i = 0;
 }
@@ -7146,6 +7386,9 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     Cfg *c = &m->c; int V = c->vocab;
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
+#ifdef QWEN36_METAL_GRAPH
+    if (sp->graph_mtp) q36_spec_past(m, sp, tok);
+#endif
     if (sp->ahead_n) {
         int i = sp->ahead_i;
         if (tok == sp->ids[i] && pos == sp->ahead_pos + i &&
@@ -7160,9 +7403,32 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     }
     int room = more - 1;
     if (room > Q36_SPEC_ROWS - 1) room = Q36_SPEC_ROWS - 1;
-    if (pos + room >= m->kv_cap) room = m->kv_cap - 1 - pos;
+    int kv_cap = m->kv_cap;
+#ifdef QWEN36_METAL_GRAPH
+    if (m->graph) kv_cap = m->graph->cap;   /* the graph's own KV cache (ensure_kv reserved it) */
+#endif
+    if (pos + room >= kv_cap) room = kv_cap - 1 - pos;
     int d[Q36_SPEC_ROWS], k = 0, src = SPEC_SRC_LOOKUP;
     double t_verify = 0;   /* an MTP draft's head row is the one a plain step feeds too: the verify's */
+#ifdef QWEN36_METAL_GRAPH
+    /* The Metal graph's MTP head reads the rows the last forward left with tok and
+     * drafts what follows tok; it reads them even when no draft goes on, so its
+     * attention holds every position, but not when nothing can follow (room 0: the
+     * generation ends with this step), nor while half or more of the last 16 tokens
+     * lie past the ids it drafts from (every Chinese character does): there it could
+     * draft only the other tokens, and it costs about 5% of a step on the 35B model.
+     * Its attention starts again when it runs again, and a prompt that ends so does
+     * not run it (qg_mtp_idle_prompt). One draft a verify. */
+    if (sp->graph_mtp && room > 0) {
+        int past = 0;
+        for (unsigned b = sp->past; b; b &= b - 1) past++;
+        int drafted = past < 8 && qg_mtp_draft(m, tok, &d[0], &sp->draft_p);
+        if (past >= 8) sp->idle++;
+        else if (drafted && sp->draft_p < sp->min_p) sp->skipped++;
+        else if (drafted) { k = 1; src = SPEC_SRC_MTP; }
+        if (k > 0 && !q36_spec_alloc(m, k)) k = 0;
+    } else
+#endif
     if (sp->lookup && room > 0) {
         int n = 0, lr = room < sp->lookup_max ? room : sp->lookup_max; double vl = 0;
         if (sp->force)
@@ -7236,12 +7502,19 @@ static void q36_spec_end(Model *m, Q36Spec *sp) {
 static void q36_spec_report(const Q36Spec *sp, const char *scope) {
     if (sp->mtp_drafts) {
         char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_MTP, g, sizeof g);
-        fprintf(stderr, "[qwen36 mtp] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | acceptance %.1f%% (%llu/%llu drafts) | gate %s\n", scope,
+        /* the graph's drafts skip the gate: what it measured follows "off:" */
+        fprintf(stderr, "[qwen36 mtp] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | acceptance %.1f%% (%llu/%llu drafts) | gate %s%s\n", scope,
                 sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
                 (unsigned long long)sp->forwards, (unsigned long long)sp->tokens,
                 100.0 * sp->mtp_accepted / sp->mtp_drafts, (unsigned long long)sp->mtp_accepted,
-                (unsigned long long)sp->mtp_drafts, g);
+                (unsigned long long)sp->mtp_drafts, sp->graph_mtp ? "off: " : "", g);
         q36_mtp_report();
+    }
+    if (sp->graph_mtp) {   /* every verify on the graph is its head's: no lookup line */
+        fprintf(stderr, "[qwen36 mtp] %s: %llu drafts below the confidence %.2f left out, %llu steps without the "
+                        "head%s\n", scope, (unsigned long long)sp->skipped, sp->min_p, (unsigned long long)sp->idle,
+                sp->ended_ahead ? " | ended mid-verify" : "");
+        return;
     }
     if (!sp->lookup && !sp->verifies) return;
     if (!sp->gate.off) {

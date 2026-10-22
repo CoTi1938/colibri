@@ -37,6 +37,7 @@ typedef struct {
     q36_tensor *a, *b, *conv, *alog, *dt, *norm;
     q36_tensor *state, *ring;                   /* recurrent state (2 planes), conv history */
     q36_tensor *snap_state, *snap_ring;         /* their copy at the snapshot (qg_snapshot_arm) */
+    q36_tensor *spec_state[Q36_SPEC_ROWS - 1], *spec_ring[Q36_SPEC_ROWS - 1];  /* their copy after each of a verify's first rows (qg_spec_alloc) */
     QgDense router, sh_g, sh_u, sh_d;
     q36_tensor *bias, *sh_gate;                 /* bias is zeros when the model has none */
 } QgLayer;
@@ -76,6 +77,23 @@ struct Qwen36Graph {
     q36_tensor *dump_x;                         /* the tensor that row is in */
     int dump_row;
     double ms[7];                               /* COLI_TIMERS of the current forward, see qg_cut */
+    /* Speculative decoding (q36_spec_step in qwen36.c). A verify forward (verify =
+     * its rows) runs the picked token and its draft as one batch, every row through
+     * the last layer, and returns every row's logits; the DeltaNet kernels copy the
+     * state after each of its first rows into spec_state/spec_ring, and a rejected
+     * draft swaps in the copy after the last accepted row (qg_spec_rollback). The MTP
+     * head (m->mtp) reads the final residual of each verified row with the token
+     * after it: a forward keeps its rows' residuals as pending rows, and qg_mtp_draft
+     * runs them through the head once the token after the last is known. */
+    int verify, no_tail, tail_keep;             /* tail_keep: a prompt's last rows that run the last layer whole (qg_layer_tail) */
+    int vadv_layer, vadv_n, vadv_ids[8 * Q36_SPEC_ROWS];    /* a verify's guesses for the next layer (qg_advise_ahead) */
+    q36_tensor *last_rows, *head_rows;          /* final norms and logits of a verify's rows */
+    float *h_rows; size_t h_cap;                /* host: final residuals of the forward's rows */
+    QgDense mtp_fc;
+    q36_tensor *mtp_in;                         /* [rows][2 hidden]: the normed embedding, then the normed residual */
+    float *mtp_pend;                            /* pending rows' residuals, Q36_SPEC_ROWS rows */
+    int mtp_pend_n, mtp_pend_pos, mtp_pend_tok[Q36_SPEC_ROWS], mtp_len;
+    int mtp_off;                                /* the head's K/V row of position p is row p - mtp_off (qg_mtp_window) */
     int snap_at, snap_rows;                     /* the forward copies the state after snap_at tokens */
     int *snap_ids, snap_len;                    /* the tokens the copy holds */
 #if QCM_ON
@@ -251,15 +269,16 @@ static int qg_prompt_rows(void) {
 }
 
 /* The batch tensors hold the rows of one forward: a prompt's batch (up to
- * qg_prompt_rows, about 330 KB a row) or the single row of a decode step. A
- * forward resizes them when its batch is different, so the 340 to 680 MB of a
- * long prompt are not kept through the answer: the system gets them back, and
- * caches experts in them. The GPU must be idle. */
+ * qg_prompt_rows, about 330 KB a row) or a decode step's (one row, or eight
+ * with the MTP head: see qg_rows). A forward resizes them when its batch is
+ * different, so the 340 to 680 MB of a long prompt are not kept through the
+ * answer: the system gets them back, and caches experts in them. The GPU must
+ * be idle. */
 static void qg_free_rows(Qwen36Graph *g) {
     q36_tensor **t[] = {&g->x, &g->normal, &g->p0, &g->p1, &g->p2, &g->query, &g->gate, &g->key,
                         &g->core, &g->normout, &g->tmp, &g->projected, &g->sum, &g->post, &g->decay,
                         &g->beta, &g->conv, &g->qk, &g->rot, &g->logits, &g->prob, &g->ids, &g->weights,
-                        &g->sg, &g->su, &g->sh, &g->shared, &g->scalar, &g->pairs, &g->eh, &g->ey};
+                        &g->sg, &g->su, &g->sh, &g->shared, &g->scalar, &g->pairs, &g->eh, &g->ey, &g->mtp_in};
     for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) { q36_tensor_free(*t[k]); *t[k] = NULL; }
     g->rows = 0;
 #if QCM_ON
@@ -292,6 +311,11 @@ static int qg_scores(Model *m) {
 static int qg_rows(Model *m, int R) {
     Qwen36Graph *g = m->graph;
     Cfg *c = &m->c;
+    /* decode alternates one-row steps, verifies and MTP rows: a small batch keeps its tensors, and with the
+     * MTP head a small batch takes tensors for a verify's rows at once (a verify that reallocated them would
+     * cost more) */
+    if (R == g->rows || (R < g->rows && g->rows <= Q36_SPEC_ROWS)) return 1;
+    if (m->mtp && R < Q36_SPEC_ROWS) R = Q36_SPEC_ROWS;
     if (R == g->rows) return 1;
     if (!q36_gpu_sync()) return 0;
     qg_free_rows(g);
@@ -315,6 +339,7 @@ static int qg_rows(Model *m, int R) {
     QG_NEW(shared, R * H); QG_NEW(scalar, R);
     QG_NEW(pairs, R * K);                       /* uint32, as wide as a float */
     QG_NEW(eh, R * K * c->inter); QG_NEW(ey, R * K * H);
+    if (m->mtp) QG_NEW(mtp_in, R * 2 * H);
 #undef QG_NEW
     g->rows = R;
     return qg_scores(m);
@@ -330,12 +355,13 @@ static void qg_free(Model *m) {
     q36_gpu_sync();
     if (!qll_destroy(&g->stream_loader)) abort();
     qsl_destroy(&g->loader);
-    for (int i = 0; g->L && i < m->c.n_layers; i++) {
+    for (int i = 0; g->L && i < m->c.n_layers + m->mtp; i++) {
         QgLayer *L = &g->L[i];
         q36_tensor *t[] = {L->in_ln, L->post_ln, L->qn, L->kn, L->kc, L->vc, L->a, L->b, L->conv,
                            L->alog, L->dt, L->norm, L->state, L->ring, L->bias, L->sh_gate,
                            L->snap_state, L->snap_ring};
         for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) q36_tensor_free(t[k]);
+        for (int k = 0; k < Q36_SPEC_ROWS - 1; k++) { q36_tensor_free(L->spec_state[k]); q36_tensor_free(L->spec_ring[k]); }
         QgDense *d[] = {&L->q, &L->k, &L->v, &L->o, &L->qkv, &L->z, &L->out,
                         &L->router, &L->sh_g, &L->sh_u, &L->sh_d};
         for (size_t k = 0; k < sizeof(d) / sizeof(d[0]); k++) qg_dense_free(d[k]);
@@ -343,8 +369,10 @@ static void qg_free(Model *m) {
     free(g->L);
     qg_dense_free(&g->head);
     qg_free_rows(g);
-    q36_tensor *t[] = {g->last, g->head_out, g->ahead, g->ahead_logits, g->scores};
+    q36_tensor *t[] = {g->last, g->head_out, g->ahead, g->ahead_logits, g->scores, g->last_rows, g->head_rows};
     for (size_t k = 0; k < sizeof(t) / sizeof(t[0]); k++) q36_tensor_free(t[k]);
+    qg_dense_free(&g->mtp_fc);
+    free(g->h_rows); free(g->mtp_pend);
     q36_map_free(g->map);
     free(g->snap_ids);
 #if QCM_ON
@@ -391,11 +419,11 @@ static int qg_create(Model *m) {
         g->map = q36_map_new(g->map_base, g->map_bytes);
         if (!g->map) goto failed;
     }
-    g->L = calloc((size_t)c->n_layers, sizeof(QgLayer));
+    g->L = calloc((size_t)c->n_layers + m->mtp, sizeof(QgLayer));
     if (!g->L) goto failed;
     size_t cells = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim;
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
+    for (int i = 0; i < c->n_layers + m->mtp; i++) {     /* the MTP head's layer last (an attention layer) */
+        Layer *l = i < c->n_layers ? &m->L[i] : &m->mtp_L;
         QgLayer *L = &g->L[i];
         L->in_ln = qg_upload(l->in_ln, (size_t)H);
         L->post_ln = qg_upload(l->post_ln, (size_t)H);
@@ -438,12 +466,21 @@ static int qg_create(Model *m) {
         }
     }
     if (!m->final_norm || !qg_dense(g, &m->lm_head, &g->head)) goto failed;
+    if (m->mtp) {
+        if (!qg_dense(g, &m->mtp_fc, &g->mtp_fc) || !(g->mtp_pend = malloc((size_t)Q36_SPEC_ROWS * H * sizeof(float))))
+            goto failed;
+        qw_free(&m->mtp_fc);
+        /* the head runs on the GPU only: its CPU copies go */
+        Layer *l = &m->mtp_L;
+        QW *w[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d};
+        for (size_t k = 0; k < sizeof(w) / sizeof(w[0]); k++) qw_free(w[k]);
+    }
     qw_free(&m->lm_head);                       /* the GPU sees it; a CPU copy is not needed */
 
     if (!(g->last = q36_tensor_new((size_t)H * sizeof(float))) ||
         !(g->head_out = q36_tensor_new((size_t)c->vocab * sizeof(float))) ||
-        !(g->ahead = q36_tensor_new((size_t)H * sizeof(float))) ||
-        !(g->ahead_logits = q36_tensor_new((size_t)c->n_experts * sizeof(float)))) goto failed;
+        !(g->ahead = q36_tensor_new((size_t)Q36_SPEC_ROWS * H * sizeof(float))) ||
+        !(g->ahead_logits = q36_tensor_new((size_t)Q36_SPEC_ROWS * c->n_experts * sizeof(float)))) goto failed;
     g->slot_scales = (size_t)3 * H * c->inter / 2;
     if (!qsl_init(&g->loader, m->global_cache)) goto failed;
     fprintf(stderr, "[qwen36-metal] graph ready on %s: rows<=%d dense=%s kv=%s (%zu bytes mapped); the experts in the "
@@ -471,7 +508,7 @@ static int qg_reserve(Model *m, int need) {
     if (cap < need) cap = (need + 1023) / 1024 * 1024;
     if (!q36_gpu_sync()) return 0;
     size_t head = (size_t)c->head_dim * g->kv_bytes;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_layers + m->mtp; i++) {
         if (!c->is_attn[i]) continue;
         QgLayer *L = &g->L[i];
         q36_tensor *kc = q36_tensor_new((size_t)c->kv_heads * cap * head);
@@ -500,6 +537,7 @@ static void qg_reset(Model *m) {
     qg_settle(m, g, q36_gpu_sync());
     if (qll_held(&g->stream_loader) && !qll_finish(&g->stream_loader, 1)) abort();
     g->stream_pending = 0;
+    g->mtp_len = g->mtp_pend_n = g->mtp_off = 0;
     for (int i = 0; i < m->c.n_layers; i++) {
         QgLayer *L = &g->L[i];
         if (L->state) memset(q36_tensor_data(L->state), 0, q36_tensor_bytes(L->state));
@@ -612,6 +650,13 @@ static void qg_advice_emit(void *context, int layer, const int *ids, int from, i
     qg_advise(context, layer, ids, from, to);
 }
 
+/* A speculative verify's rows read many experts together already: each row
+ * announces its four likeliest guesses, against a step's six. */
+#define QG_AHEAD_GUESSES_VERIFY 4
+#define QG_MTP_EXPERTS 2               /* routed experts the MTP head reads, see qg_moe */
+#define QG_MTP_WINDOW 32               /* a prompt's last positions the MTP head reads, see qg_mtp_window */
+#define QG_MTP_VOCAB 32768             /* token ids the MTP head drafts from, see qg_mtp_draft */
+
 /* Fast mode, decode: QWEN36_FAST_EXPERTS=J reads a token's J likeliest experts
  * and uses the rest of its top-k only when the expert cache holds them
  * (qwen36_fast_experts.h), with one line at start. Unset or 0, the default, and
@@ -647,15 +692,28 @@ static int qg_fast_experts(int topk) {
  * result; on the 35B model the seventh and eighth guesses were chosen 56% and
  * 41% of the time on code (65% and 49% on prose), too seldom for their reads
  * to pay on an 8 GB M1 (docs/experiments/qwen36-ahead-six-2026-10-06). */
-static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il) {
-    int K = qas_ahead_guesses(m->c.topk), top[8], n;
+static void qg_advise_ahead(Model *m, Qwen36Graph *g, int il, int row) {
+    const float *l = (const float *)q36_tensor_data(g->ahead_logits) + (size_t)row * m->c.n_experts;
+    int K = g->verify ? QG_AHEAD_GUESSES_VERIFY : qas_ahead_guesses(m->c.topk), top[8], n;
+    if (K > m->c.topk) K = m->c.topk;
     /* with fast experts the others are used only when the cache holds them: nothing to announce */
     if (qg_fast_experts(m->c.topk) && K > qg_fast_experts(m->c.topk)) K = qg_fast_experts(m->c.topk);
-    n = qas_top(q36_tensor_data(g->ahead_logits), m->c.n_experts, K, top);
-    if (g->defer_decode_advice) {
+    n = qas_top(l, m->c.n_experts, K, top);
+    if (g->defer_decode_advice && !g->verify && n <= 8) {
         /* The next trunk overwrites ahead_logits. Save only the selected IDs
          * and emit them after that trunk and the current experts are submitted. */
         qas_save(&g->ahead_advice, il + 1, top, n);
+        return;
+    }
+    if (g->verify || g->defer_decode_advice) {
+        /* A verify's rows: the union of their guesses waits for the next trunk too (qg_layer_legacy). Said at
+         * once, their reads would hold up the verify's own, the GPU idle meanwhile. */
+        if (g->vadv_layer != il + 1) { g->vadv_layer = il + 1; g->vadv_n = 0; }
+        for (int j = 0; j < n; j++) {
+            int k = 0;
+            while (k < g->vadv_n && g->vadv_ids[k] != top[j]) k++;
+            if (k == g->vadv_n && k < (int)(sizeof g->vadv_ids / sizeof *g->vadv_ids)) g->vadv_ids[g->vadv_n++] = top[j];
+        }
         return;
     }
     qg_advise(m, il + 1, top, 0, n);
@@ -739,23 +797,89 @@ static void qg_route_degrade(Model *m, Qwen36Graph *g, int il, int first, int ro
  * first while the GPU computes the shared expert) and each group computes all
  * the choices routed to it. expert_sum then adds them up per token in the
  * router's order, so the grouping does not change a bit of the result. */
+/* A verify's experts, all in one lease (qg_moe): those the cache holds are computed while the misses read, as a
+ * step's are. The hits' choices go first in pairs, then the misses', each part in sub-groups of top-k slots
+ * whose choices' slot fields count within the sub-group. Each choice is computed alone and expert_sum adds them
+ * in the router's order: the same bits in any order. */
+static int qg_moe_verify(Model *m, Qwen36Graph *g, int il, int rows, int ne, const int *experts, const int *first,
+                         uint32_t *pairs) {
+    Cfg *c = &m->c;
+    int H = c->hidden, K = c->topk, n = rows * K, ord[QGC_MAX_GROUP], at[QGC_MAX_GROUP + 1], o = 0, ok = 1;
+    uint32_t moved[8 * Q36_SPEC_ROWS];
+    Slot *hit[QGC_MAX_GROUP] = {0}, *slots[QGC_MAX_GROUP] = {0};
+    q36_tensor *gpu[8] = {0};
+    if (n > (int)(sizeof moved / sizeof *moved) || ne > QGC_MAX_GROUP) return 0;
+    int held = (int)qsl_wait_hits(&g->loader, (void **)hit);
+    for (int j = 0; j < ne; j++) if (hit[j]) ord[o++] = j;
+    for (int j = 0; j < ne; j++) if (!hit[j]) ord[o++] = j;
+    o = 0;
+    for (int i = 0; i < ne; i++) {
+        int e = experts[ord[i]], sub = (i < held ? i : i - held) % K;
+        at[i] = o;
+        for (int q = first[e]; q < first[e + 1]; q++) moved[o++] = (pairs[q] & 0x0fffffffu) | (uint32_t)sub << 28;
+    }
+    at[ne] = o;
+    memcpy(pairs, moved, (size_t)o * sizeof(uint32_t));
+    for (int part = 0; ok && part < 2; part++) {
+        int from = part ? held : 0, to = part ? ne : held;
+        if (part) {
+            if (held) ok = q36_gpu_flush();
+            double t = tm_on() ? tm_now() : 0;
+            ok = qsl_wait(&g->loader, NULL, NULL, (void **)slots) && ok;
+            if (tm_on()) g->ms[6] += tm_now() - t;
+            if (ok && il + 1 < c->n_layers)
+                for (int r = 0; r < rows; r++) qg_advise_ahead(m, g, il, r);
+        }
+        for (int s0 = from; ok && s0 < to; s0 += K) {
+            int nk = to - s0 < K ? to - s0 : K;
+            for (int j = 0; j < K; j++) {
+                Slot *s = j >= nk ? NULL : part ? slots[ord[s0 + j]] : hit[ord[s0 + j]];
+                gpu[j] = s ? s->gpu : NULL;
+                if (j < nk && !gpu[j]) ok = 0;
+            }
+            ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, at[s0], at[s0 + nk] - at[s0], gpu, rows, H,
+                                          c->inter, K, g->slot_scales) &&
+                 q36_expert_down(g->ey, g->eh, g->pairs, at[s0], at[s0 + nk] - at[s0], gpu, rows, H, c->inter, K,
+                                 g->slot_scales);
+        }
+    }
+    return ok;
+}
+
 static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
     Cfg *c = &m->c;
     QgLayer *L = &g->L[il];
     int H = c->hidden, K = c->topk, E = c->n_experts, n = rows * K;
     qg_route_degrade(m, g, il, 0, rows);   /* first: qfe_keep indexes by the ids */
-    if (g->defer_decode_advice && rows == 1 && qg_fast_experts(K) && E <= 256) {
+    if (E <= 256 && K <= 8) {
+        int32_t *iw = q36_tensor_data(g->ids);
+        float *w = q36_tensor_data(g->weights);
         unsigned char present[256];
-        qgc_present(m->global_cache, il * E, E, present);
-        qfe_keep(q36_tensor_data(g->ids), q36_tensor_data(g->weights), K, qg_fast_experts(K), present);
+        if (il == c->n_layers) {
+            /* The MTP head reads its 2 heaviest routed experts only (QG_MTP_EXPERTS): with all 8 its reads take
+             * the cache's slots from the model's layers. A draft only, in both modes; its other six choices point
+             * at the heaviest expert with weight 0, whose FFN runs once more for each (qfe_keep). */
+            memset(present, 0, (size_t)E);
+            for (int r = 0; r < rows; r++) qfe_keep(iw + (size_t)r * K, w + (size_t)r * K, K, QG_MTP_EXPERTS, present);
+        } else if (qg_fast_experts(K) && ((g->defer_decode_advice && rows == 1) || (g->verify && rows == g->verify))) {
+            /* Fast experts (qwen36_fast_experts.h). A verify's later rows also count what its earlier rows chose,
+             * which the verify reads anyway, and with J above 3 its draft rows keep two sure experts fewer (3 with
+             * J = 5), except in the last quarter of the layers. */
+            int J = qg_fast_experts(K), late = il >= c->n_layers - c->n_layers / 4;
+            qgc_present(m->global_cache, il * E, E, present);
+            for (int r = 0; r < rows; r++) {
+                qfe_keep(iw + (size_t)r * K, w + (size_t)r * K, K, r && !late && J > 3 ? J - 2 : J, present);
+                for (int k = 0; k < K; k++) present[iw[(size_t)r * K + k]] = 1;
+            }
+        }
     }
     const int32_t *ids = q36_tensor_data(g->ids);
     uint32_t *pairs = q36_tensor_data(g->pairs);
-    int first[257] = {0}, fill[256], experts[256], ne = 0, keys[8];
+    int first[257] = {0}, fill[256], experts[256], ne = 0, keys[QGC_MAX_GROUP];
     for (int p = 0; p < n; p++) {
         if (ids[p] < 0 || ids[p] >= E) return 0;
         first[ids[p] + 1]++;
-        ehit_mark(m, il, ids[p]);
+        if (il < c->n_layers) ehit_mark(m, il, ids[p]);
     }
     for (int e = 0; e < E; e++) {
         if (first[e + 1]) experts[ne++] = e;
@@ -765,17 +889,24 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
     for (int p = 0; p < n; p++) pairs[fill[ids[p]]++] = (uint32_t)p;
     for (int i = 0; i < ne; i++)                /* the slot of each expert in its group */
         for (int q = first[experts[i]]; q < first[experts[i] + 1]; q++) pairs[q] |= (uint32_t)(i % K) << 28;
-    int ng = ne < K ? ne : K;
+    /* A small batch (a speculative verify) leases every expert of the layer at once when the cache takes
+     * groups that large (qwen_global_cache_init): the reads go together and the GPU computes them in
+     * sub-groups of top-k slots (each choice's slot field counts within its sub-group) with no wait between. */
+    int whole = rows > 1 && rows <= Q36_SPEC_ROWS && ne > K && ne <= (int)m->global_cache->group_cap;
+    int ng = whole ? ne : ne < K ? ne : K;
     for (int j = 0; j < ng; j++) keys[j] = il * E + experts[j];
     if (!qsl_start(&g->loader, keys, (unsigned)ng)) return 0;
     qg_advise(m, il, experts, ng, ng + K < ne ? ng + K : ne);
     /* The shared expert runs on the GPU while the worker reads from disk. */
     int ok = qg_shared_gpu(m, g, L, rows) && qg_cut(g, 3) && q36_gpu_flush();
-    for (int g0 = 0;;) {
+    if (rows == g->verify && ng == ne) {
+        if (rows > 1) q36_gpu_keepalive(0.25);
+        ok = ok && qg_moe_verify(m, g, il, rows, ne, experts, first, pairs);
+    } else for (int g0 = 0;;) {
         /* Fast prompt kernels also leave gaps while the next experts load. */
         if (rows > 1) q36_gpu_keepalive(0.25);
-        int a = first[experts[g0]], b = first[experts[g0 + ng - 1] + 1], done = 0;
-        Slot *slots[8] = {0};
+        int a = first[experts[g0]], done = 0;
+        Slot *slots[QGC_MAX_GROUP] = {0};
         q36_tensor *gpu[8] = {0};
         /* Decode: the experts the cache already holds are computed while the
          * misses read, in a GPU batch of their own; the misses' pairs follow
@@ -804,11 +935,16 @@ static int qg_moe(Model *m, Qwen36Graph *g, int il, int rows, FILE *lf) {
         double t = tm_on() ? tm_now() : 0;
         ok = qsl_wait(&g->loader, NULL, NULL, (void **)slots) && ok;
         if (tm_on()) g->ms[6] += tm_now() - t;
-        if (ok && rows == 1 && il + 1 < c->n_layers) qg_advise_ahead(m, g, il);
-        for (int j = 0; ok && j < ng; j++) ok = (gpu[j] = slots[j] ? slots[j]->gpu : NULL) != NULL;
-        ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, a + done, b - a - done, gpu, rows, H, c->inter, K,
-                                      g->slot_scales) &&
-             q36_expert_down(g->ey, g->eh, g->pairs, a + done, b - a - done, gpu, rows, H, c->inter, K, g->slot_scales);
+        if (ok && (rows == 1 || rows == g->verify) && il + 1 < c->n_layers)
+            for (int r = 0; r < rows; r++) qg_advise_ahead(m, g, il, r);
+        for (int s0 = 0; ok && s0 < ng; s0 += K) {      /* sub-groups of top-k slots (one when ng <= K) */
+            int nk = ng - s0 < K ? ng - s0 : K;
+            int a1 = s0 ? first[experts[g0 + s0]] : a + done, b1 = first[experts[g0 + s0 + nk - 1] + 1];
+            for (int j = 0; ok && j < K; j++) ok = j >= nk || (gpu[j] = slots[s0 + j] ? slots[s0 + j]->gpu : NULL) != NULL;
+            ok = ok && q36_expert_gate_up(g->eh, g->post, g->pairs, a1, b1 - a1, gpu, rows, H, c->inter, K,
+                                          g->slot_scales) &&
+                 q36_expert_down(g->ey, g->eh, g->pairs, a1, b1 - a1, gpu, rows, H, c->inter, K, g->slot_scales);
+        }
         if (!ok || (g0 += ng) == ne) break;
         ok = qg_cut(g, 2);
         ok = q36_gpu_sync() && ok;            /* the GPU is done with the slots before release, even after a failure */
@@ -922,6 +1058,39 @@ static int qg_cpu_attention(Qwen36Graph *g, QgLayer *L, QgTrunk *t, const q36_sh
     return ok;
 }
 
+/* Whether a verify runs its DeltaNet recurrence row by row (qg_dn_rows): with more than one draft, and in exact
+ * mode with one too (the exact batch kernel keeps a column of both state planes per thread, slower for two rows
+ * than two one-row kernels). */
+static int qg_verify_rows(const Qwen36Graph *g) {
+    return g->verify > 2 || (g->verify == 2 && q36_gpu_is_exact());
+}
+
+/* A verify of more than one draft: the DeltaNet convolution, norms and recurrence row after row, each from the
+ * state the row before left, the state and ring after each of the first rows copied (snap) into its spec copy, so
+ * that a rejected draft can swap in the state after the last accepted row (qg_spec_rollback). Every row runs a
+ * decode step's one-row kernels, so it has a step's bits. */
+static int qg_dn_rows(Model *m, QgLayer *L, QgTrunk *t, const q36_shape *s) {
+    Cfg *c = &m->c;
+    size_t cd = (size_t)c->dn_conv_dim * sizeof(float), vh = (size_t)c->dn_vheads * sizeof(float);
+    size_t core = (size_t)c->dn_vheads * c->dn_vdim * sizeof(float);
+    int ok = 1;
+    for (int r = 0; ok && r < s->rows; r++) {
+        q36_shape s1 = *s;
+        s1.rows = 1; s1.pos = s->pos + r; s1.snap = r + 1 < s->rows;
+        q36_tensor *p0 = q36_tensor_view(t->p0, r * cd, cd), *cv = q36_tensor_view(t->conv, r * cd, cd);
+        q36_tensor *qk = q36_tensor_view(t->qk, r * cd, cd), *dc = q36_tensor_view(t->decay, r * vh, vh);
+        q36_tensor *bt = q36_tensor_view(t->beta, r * vh, vh), *co = q36_tensor_view(t->core, r * core, core);
+        q36_tensor *ss = s1.snap ? L->spec_state[r] : NULL, *sr = s1.snap ? L->spec_ring[r] : NULL;
+        ok = p0 && cv && qk && dc && bt && co && (!s1.snap || (ss && sr)) &&
+             q36_dn_conv(cv, L->ring, p0, L->conv, sr, &s1) && q36_dn_l2(qk, cv, &s1) &&
+             q36_dn_delta(co, L->state, qk, cv, dc, bt, ss, &s1);
+        /* encoded commands keep the buffers; this frees the views' descriptors only */
+        q36_tensor_free(p0); q36_tensor_free(cv); q36_tensor_free(qk);
+        q36_tensor_free(dc); q36_tensor_free(bt); q36_tensor_free(co);
+    }
+    return ok;
+}
+
 static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int pos, int snap, int decode_ahead) {
     Cfg *c = &m->c;
     QgLayer *L = &g->L[il];
@@ -967,8 +1136,9 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
         ok = ok && (!cpu || mark) && qg_mm(t->p0, t->normal, &L->qkv, rows) && (!cpu || q36_gpu_flush()) &&
              (cpu || qg_mm(t->p1, t->normal, &L->z, rows)) &&
              q36_dn_aux(t->decay, t->beta, t->normal, L->a, L->b, L->alog, L->dt, &s) &&
-             q36_dn_conv(t->conv, L->ring, t->p0, L->conv, L->snap_ring, &s) && q36_dn_l2(t->qk, t->conv, &s) &&
-             q36_dn_delta(t->core, L->state, t->qk, t->conv, t->decay, t->beta, L->snap_state, &s) &&
+             (qg_verify_rows(g) && rows == g->verify ? qg_dn_rows(m, L, t, &s) :
+              q36_dn_conv(t->conv, L->ring, t->p0, L->conv, L->snap_ring, &s) && q36_dn_l2(t->qk, t->conv, &s) &&
+              q36_dn_delta(t->core, L->state, t->qk, t->conv, t->decay, t->beta, L->snap_state, &s)) &&
              q36_rmsnorm(t->normout, t->core, L->norm, rows * c->dn_vheads, c->dn_vdim, c->eps, 1) &&
              (!cpu || qg_cpu_mm(g, t->p1, t->normal, &L->z, rows, mark)) &&
              q36_gate(t->tmp, t->normout, t->p1, rows * width, 1);
@@ -985,6 +1155,11 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
         ok = q36_rmsnorm(g->ahead, t->sum, g->L[il + 1].post_ln, 1, H, c->eps, 0) &&
              q36_router_dot2(t->logits, t->post, L->router.q, L->router.sc, g->ahead_logits, g->ahead,
                              g->L[il + 1].router.q, g->L[il + 1].router.sc, H, c->n_experts);
+    else if (ok && rows == g->verify && il + 1 < c->n_layers)   /* a verify: the same guess for each row */
+        ok = q36_router_dot(t->logits, t->post, L->router.q, L->router.sc, rows, H, c->n_experts) &&
+             q36_rmsnorm(g->ahead, t->sum, g->L[il + 1].post_ln, rows, H, c->eps, 0) &&
+             q36_router_dot(g->ahead_logits, g->ahead, g->L[il + 1].router.q, g->L[il + 1].router.sc, rows, H,
+                            c->n_experts);
     else ok = ok && q36_router_dot(t->logits, t->post, L->router.q, L->router.sc, rows, H, c->n_experts);
     ok = ok && q36_router_softmax(t->prob, t->logits, L->bias, rows, c->n_experts) &&
          q36_router_select(t->ids, t->weights, t->prob, rows, c->n_experts, c->topk, groups, c->topk_group) &&
@@ -992,7 +1167,8 @@ static int qg_trunk(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int 
     return ok;
 }
 /* A prompt's last layer, when it is an attention layer: only the last row's output goes on, to
- * the final norm and the head. The other rows only write their keys and values to the cache:
+ * the final norm and the head (with the MTP head, the rows it reads: g->tail_keep, or every row
+ * with g->no_tail). The other rows only write their keys and values to the cache:
  * the input norm, the k and v projections, the k norm and RoPE, as qg_trunk computes them. */
 static int qg_trunk_kv(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, int pos) {
     Cfg *c = &m->c;
@@ -1009,11 +1185,13 @@ static int qg_trunk_kv(Model *m, Qwen36Graph *g, QgTrunk *t, int il, int rows, i
 static int qg_layer_legacy(Model *m, Qwen36Graph *g, int il, int rows, int pos, FILE *lf);
 
 /* The last layer for a batch of a prompt: keys and values of its rows, and with last (the
- * prompt's final batch) the whole layer for its last row alone, at its position. Every row is
+ * prompt's final batch) the whole layer for its last g->tail_keep rows alone (its last row; with
+ * the MTP head, the rows the head reads, qg_mtp_window), at their positions. Every row is
  * computed as in a whole batch, so exact mode keeps every bit; the last layer's queries,
  * attention, output projection and experts of the other rows are skipped. */
 static int qg_layer_tail(Model *m, Qwen36Graph *g, int il, int rows, int pos, int last, FILE *lf) {
-    int kv_rows = last ? rows - 1 : rows, ok = 1;
+    int keep = !last ? 0 : g->tail_keep < 1 ? 1 : g->tail_keep < rows ? g->tail_keep : rows;
+    int kv_rows = rows - keep, ok = 1;
     if (kv_rows > 0) {
         QgTrunk t;
         if (!qg_trunk_bind(&t, g, &m->c, 1, 0, kv_rows, 0)) return 0;
@@ -1023,11 +1201,11 @@ static int qg_layer_tail(Model *m, Qwen36Graph *g, int il, int rows, int pos, in
     if (!ok || !last) return ok;
     size_t H = (size_t)m->c.hidden, rd = m->c.rotary_dim > 0 ? (size_t)m->c.rotary_dim : 2;
     q36_tensor *x = g->x, *rot = g->rot;
-    q36_tensor *xv = q36_tensor_view(x, (size_t)(rows - 1) * H * sizeof(float), H * sizeof(float));
-    q36_tensor *rv = q36_tensor_view(rot, (size_t)(rows - 1) * rd * sizeof(float), rd * sizeof(float));
+    q36_tensor *xv = q36_tensor_view(x, (size_t)kv_rows * H * sizeof(float), (size_t)keep * H * sizeof(float));
+    q36_tensor *rv = q36_tensor_view(rot, (size_t)kv_rows * rd * sizeof(float), (size_t)keep * rd * sizeof(float));
     if (xv && rv) {
         g->x = xv; g->rot = rv;
-        ok = qg_layer_legacy(m, g, il, 1, pos + rows - 1, lf);
+        ok = qg_layer_legacy(m, g, il, keep, pos + kv_rows, lf);
         g->x = x; g->rot = rot;
         if (g->dump_x == xv) { g->dump_x = x; g->dump_row = rows - 1; }   /* the same row, read at the next sync */
     } else ok = 0;
@@ -1035,8 +1213,8 @@ static int qg_layer_tail(Model *m, Qwen36Graph *g, int il, int rows, int pos, in
     q36_tensor_free(xv); q36_tensor_free(rv);
     return ok;
 }
-static int qg_is_tail(const Cfg *c, int il, int rows) {
-    return il == c->n_layers - 1 && c->is_attn[il] && rows > 1;
+static int qg_is_tail(const Qwen36Graph *g, const Cfg *c, int il, int rows) {
+    return il == c->n_layers - 1 && c->is_attn[il] && rows > 1 && !g->no_tail;
 }
 
 static int qg_layer_legacy(Model *m, Qwen36Graph *g, int il, int rows, int pos, FILE *lf) {
@@ -1045,6 +1223,11 @@ static int qg_layer_legacy(Model *m, Qwen36Graph *g, int il, int rows, int pos, 
     int ok = qg_trunk(m, g, &t, il, rows, pos, g->snap_rows, rows == 1);
     if (ok && g->ahead_advice.n)
         ok = qas_submit_pending(&g->ahead_advice, il, m, qg_advice_submit, qg_advice_emit);
+    if (ok && g->vadv_n) {                      /* a verify's guesses for this layer, while its trunk runs */
+        int n = g->vadv_layer == il ? g->vadv_n : 0;
+        g->vadv_n = 0;
+        if (n && (ok = q36_gpu_flush())) qg_advise(m, il, g->vadv_ids, 0, n);
+    }
     if (!ok || !q36_gpu_sync()) return 0;
     qg_settle(m, g, 1);
     qg_dump_row(lf, g->projected, rows - 1, m->c.hidden);
@@ -1151,37 +1334,92 @@ static int qg_prompt_layers(Model *m, const int *ids, int S, int pos, FILE *lf, 
             g->stream_warm = b > 0;
             q36_gpu_keepalive(0.25);
             FILE *dump = b + 1 == p->nb ? lf : NULL;
-            ok = qg_is_tail(c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, b + 1 == p->nb, dump)
+            ok = qg_is_tail(g, c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, b + 1 == p->nb, dump)
                                          : qg_layer(m, g, il, rows, pos + s0, dump);
             *last_rows = rows;
         }
     return ok;
 }
 
-/* S tokens at positions pos..; logits of the last one. lf: DUMP_LAYERS file,
- * three rows per layer for the last token (projection, residual, MoE output). */
+/* The final residuals of the forward's rows first.. (n of them, from x), those from
+ * row lo on, at h_rows[row - lo]: a step's or a verify's rows (lo 0), a prompt's
+ * last QG_MTP_WINDOW + 1 (qg_mtp_window). */
+static int qg_keep(Qwen36Graph *g, const float *x, int first, int n, int lo, int H) {
+    int cut = lo - first < 0 ? 0 : lo - first < n ? lo - first : n;
+    x += (size_t)cut * H;
+    first += cut;
+    n -= cut;
+    size_t need = (size_t)(first - lo + n) * H;
+    if (n && need > g->h_cap) {
+        float *h = realloc(g->h_rows, need * sizeof(float));
+        if (!h) return 0;
+        g->h_rows = h;
+        g->h_cap = need;
+    }
+    if (n) memcpy(g->h_rows + (size_t)(first - lo) * H, x, (size_t)n * H * sizeof(float));
+    return 1;
+}
+static int qg_mtp_rows(Model *m, const float *h, const int *next, int n, int pos, float *logits, int vocab);
+static int qg_mtp_window(Qwen36Graph *g, int pairs, int pos);
+static int qg_mtp_idle_prompt(const Model *m, const int *ids, int S);
+
+/* S tokens at positions pos..; logits of the last one, or of every row in a
+ * verify (g->verify). lf: DUMP_LAYERS file, three rows per layer for the last
+ * token (projection, residual, MoE output). With the MTP head the final residual
+ * of every row it reads is kept (qg_keep), a prompt's pairs go through the head,
+ * and the rows left wait for the token after them (qg_mtp_draft). */
 static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, FILE *lf) {
     Qwen36Graph *g = m->graph;
     Cfg *c = &m->c;
+    int verify = g->verify;
     qas_clear(&g->ahead_advice);
+    g->vadv_n = 0;
     g->defer_decode_advice = S == 1 && pos > 0;
-    int R = S > 1 ? qg_prompt_rows() : 1;
+    int R = S > 1 && !verify ? qg_prompt_rows() : S;
+    /* A prompt's last layer runs whole for its last row only; with the MTP head, for the rows whose final
+     * residual the head reads (all of them, or its window; the last row alone where the head will idle,
+     * qg_mtp_idle_prompt), when they are in the prompt's last batch. */
+    g->no_tail = verify;
+    g->tail_keep = 1;
+    int lo = 0;                                 /* the first row whose final residual the head reads */
+    int idle = m->mtp && !verify && S > 1 && qg_mtp_idle_prompt(m, ids, S);
+    if (m->mtp && !verify && S > 1) {
+        int w = QG_MTP_WINDOW, last_rows = S - ((S - 1) / R) * R, need = idle ? 1 : S - 1 > w ? w + 1 : S;
+        if (need <= last_rows) g->tail_keep = need;
+        else g->no_tail = 1;
+        lo = S - need;
+    }
     int H = c->hidden, rows = 0, ok = S >= 1 && pos >= 0 && qg_reserve(m, pos + S) && qg_rows(m, S < R ? S : R);
     /* Decode leaves the GPU waiting at every layer, and a prompt waits for
      * its experts too: keep the clocks up until a quarter of a second after
      * the last renewal (every step, and every layer and group of a prompt). */
     q36_gpu_keepalive(0.25);
+    /* A one-draft verify's kernels copy the DeltaNet state after its first row into the first spec copies (one
+     * batch, through the snapshot copies); a longer verify, or an exact one, runs the recurrence row by row
+     * (qg_dn_rows). */
+    int batch_snap = verify == 2 && !qg_verify_rows(g);
+    if (batch_snap)
+        for (int i = 0; i < c->n_layers; i++) {
+            QgLayer *L = &g->L[i];
+            if (!L->state) continue;
+            q36_tensor *s = L->snap_state, *r = L->snap_ring;
+            L->snap_state = L->spec_state[0]; L->snap_ring = L->spec_ring[0];
+            L->spec_state[0] = s; L->spec_ring[0] = r;
+        }
     QgPrompt lp = {0};
     if (ok && S > g->rows && g->stream_enabled && !q36_gpu_is_exact())
         ok = qg_prompt_layers(m, ids, S, pos, lf, &lp, &rows);
     else for (int s0 = 0; ok && s0 < S; s0 += rows) {
+        int prev = rows;
         rows = S - s0 < g->rows ? S - s0 : g->rows;
         int before = g->snap_at - (pos + s0);   /* rows of this batch up to the snapshot */
-        g->snap_rows = before >= 1 && before <= rows ? before : 0;
+        g->snap_rows = batch_snap ? 1 : verify ? 0 : before >= 1 && before <= rows ? before : 0;
         /* x and the RoPE table are rewritten by the CPU: nothing may be in flight */
         ok = q36_gpu_sync();
         qg_settle(m, g, ok);
-        if (ok && s0 == 0) ok = qgc_expected_phase(m->global_cache, S, pos);
+        if (ok && m->mtp && s0 > 0) ok = qg_keep(g, q36_tensor_data(g->x), s0 - prev, prev, lo, H);
+        /* a verify is decode for the expert cache's reuse estimates */
+        if (ok && s0 == 0) ok = qgc_expected_phase(m->global_cache, verify ? 1 : S, pos);
         float *x = q36_tensor_data(g->x);
         for (int r = 0; ok && r < rows; r++) ok = qwen_embedding_row(m, ids[s0 + r], x + (size_t)r * H);
         if (ok && c->rotary_dim) qg_rope_table(c, g, rows, pos + s0);
@@ -1189,8 +1427,8 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
             if (S > 1) q36_gpu_keepalive(0.25);
             if (S > 64 && il == c->n_layers - 4 && s0 + rows == S) qg_prefetch_dense(g, S >= 1536);
             FILE *dump = s0 + rows == S ? lf : NULL;
-            ok = qg_is_tail(c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, s0 + rows == S, dump)
-                                         : qg_layer(m, g, il, rows, pos + s0, dump);
+            ok = qg_is_tail(g, c, il, rows) ? qg_layer_tail(m, g, il, rows, pos + s0, s0 + rows == S, dump)
+                                            : qg_layer(m, g, il, rows, pos + s0, dump);
         }
     }
     /* The final norm is the CPU engine's double sum of squares. The head
@@ -1200,11 +1438,26 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
     qg_settle(m, g, ok);
     qas_clear(&g->ahead_advice);
     g->defer_decode_advice = 0;
-    if (ok) rmsnorm_row(q36_tensor_data(g->last), (const float *)q36_tensor_data(g->x) + (size_t)(rows - 1) * H,
-                        m->final_norm, H, c->eps);
+    g->snap_rows = 0;
+    if (batch_snap)
+        for (int i = 0; i < c->n_layers; i++) {
+            QgLayer *L = &g->L[i];
+            if (!L->state) continue;
+            q36_tensor *s = L->snap_state, *r = L->snap_ring;
+            L->snap_state = L->spec_state[0]; L->snap_ring = L->spec_ring[0];
+            L->spec_state[0] = s; L->spec_ring[0] = r;
+        }
+    if (ok && m->mtp)       /* the rows' final residuals: the whole prompt layer by layer, else the last batch */
+        ok = lp.x ? qg_keep(g, q36_tensor_data(lp.x), 0, S, lo, H)
+                  : qg_keep(g, q36_tensor_data(g->x), S - rows, rows, lo, H);
+    int nl = verify ? S : 1;                    /* rows whose logits come back */
+    q36_tensor *last = verify ? g->last_rows : g->last, *out = verify ? g->head_rows : g->head_out;
+    for (int r = 0; ok && r < nl; r++)
+        rmsnorm_row((float *)q36_tensor_data(last) + (size_t)r * H,
+                    (const float *)q36_tensor_data(g->x) + (size_t)(rows - nl + r) * H, m->final_norm, H, c->eps);
     qg_prompt_done(g, &lp);
-    ok = ok && qg_mm(g->head_out, g->last, &g->head, 1) && qg_cut(g, 5) && q36_gpu_sync();
-    if (ok) memcpy(logits, q36_tensor_data(g->head_out), (size_t)c->vocab * sizeof(float));
+    ok = ok && qg_mm(out, last, &g->head, nl) && qg_cut(g, 5) && q36_gpu_sync();
+    if (ok) memcpy(logits, q36_tensor_data(out), (size_t)nl * c->vocab * sizeof(float));
     if (tm_on()) {      /* as on the CPU, the MoE time holds the router, the shared expert and the disk */
         const double *t = g->ms;
         tm_add(S, 0, t[0]); tm_add(S, 1, t[1]); tm_add(S, 2, t[2] + t[3] + t[4] + t[6]);
@@ -1218,7 +1471,196 @@ static int qg_forward(Model *m, const int *ids, int S, int pos, float *logits, F
         if (!qll_destroy(&g->stream_loader)) abort();
         g->stream_initialized = 0;
     }
-    if (S > 1) q36_gpu_keepalive(0);       /* also on a failed prefill */
+    if (ok && m->mtp) {
+        if (S > 1 && !verify) {
+            /* a prompt: its pairs through the head (the last QG_MTP_WINDOW only, see qg_mtp_window: h_rows holds
+             * the rows from there, lo), none where the head will idle (its attention restarts where it runs
+             * again); its last row waits for the next token */
+            int skip = idle ? S - 1 : qg_mtp_window(g, S - 1, pos);
+            ok = skip == lo && (idle || qg_mtp_rows(m, g->h_rows, ids + 1 + skip, S - 1 - skip, pos + skip, NULL, 0));
+            if (idle) g->mtp_len = -1;
+            memcpy(g->mtp_pend, g->h_rows + (size_t)(S - 1 - skip) * H, (size_t)H * sizeof(float));
+            g->mtp_pend_n = 1;
+            g->mtp_pend_pos = pos + S - 1;
+            if (g->h_cap > (size_t)Q36_SPEC_ROWS * H) { free(g->h_rows); g->h_rows = NULL; g->h_cap = 0; }
+        } else {
+            /* a step or a verify: its rows wait; a verify's drafts are settled by q36_spec_step (qg_mtp_keep) */
+            memcpy(g->mtp_pend, g->h_rows, (size_t)S * H * sizeof(float));
+            for (int j = 0; j + 1 < S; j++) g->mtp_pend_tok[j] = ids[j + 1];
+            g->mtp_pend_n = S;
+            g->mtp_pend_pos = pos;
+        }
+    }
+    if (S > 1 && !verify) q36_gpu_keepalive(0);       /* also on a failed prefill; a verify is decode */
+    return ok;
+}
+
+/* ---- speculative decoding (q36_spec_step) --------------------------------- */
+
+/* The copies a verify of k drafts needs, allocated the first time: the DeltaNet
+ * state after each of its first k rows (each as large as the state: 63 MiB on the
+ * 35B model in fast mode, 123 MiB in exact mode) and the final norms and logits of
+ * its rows. 0 = no memory. */
+static int qg_spec_alloc(Model *m, int k) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    if (k < 1 || k > Q36_SPEC_ROWS - 1) return 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        for (int j = 0; j < k; j++) {
+            if (!L->spec_state[j] && !(L->spec_state[j] = q36_tensor_new(q36_tensor_bytes(L->state)))) return 0;
+            if (!L->spec_ring[j] && !(L->spec_ring[j] = q36_tensor_new(q36_tensor_bytes(L->ring)))) return 0;
+        }
+    }
+    if (!g->last_rows && !(g->last_rows = q36_tensor_new((size_t)Q36_SPEC_ROWS * c->hidden * sizeof(float)))) return 0;
+    if (!g->head_rows && !(g->head_rows = q36_tensor_new((size_t)Q36_SPEC_ROWS * c->vocab * sizeof(float)))) return 0;
+    return 1;
+}
+
+/* A verify's draft was rejected: the state after its first keep rows comes back. */
+static void qg_spec_rollback(Model *m, int keep) {
+    Qwen36Graph *g = m->graph;
+    qg_settle(m, g, q36_gpu_sync());
+    if (keep < 1 || keep > Q36_SPEC_ROWS - 1) abort();
+    for (int i = 0; i < m->c.n_layers; i++) {
+        QgLayer *L = &g->L[i];
+        if (!L->state) continue;
+        q36_tensor *s = L->state, *r = L->ring;
+        L->state = L->spec_state[keep - 1]; L->ring = L->spec_ring[keep - 1];
+        L->spec_state[keep - 1] = s; L->spec_ring[keep - 1] = r;
+    }
+}
+
+/* The MTP head over n pairs at positions pos..: row r pairs the model's final
+ * residual h[r] at pos + r with the token next[r] at pos + r + 1. Their K/V
+ * rows go into the head's attention (its own cache, layer c.n_layers), the
+ * routed experts through the expert cache; with logits, the last row's logits
+ * come back: what the head says follows next[n - 1]. The input is the
+ * checkpoint's: the embedding normed by pre_fc_norm_embedding, then the residual
+ * after the model's final norm (as the head was trained) normed by
+ * pre_fc_norm_hidden, both into fc.
+ *
+ * A prompt's pairs go through the head for its last QG_MTP_WINDOW positions only,
+ * and the head's attention restarts there (its K/V rows are stored from row 0 for
+ * that position: mtp_off; RoPE keeps the true positions): the head sees the recent
+ * context, and the prompt pays 32 rows of the head instead of all of them. Returns
+ * the pairs skipped. */
+static int qg_mtp_window(Qwen36Graph *g, int pairs, int pos) {
+    int w = QG_MTP_WINDOW;
+    if (pairs <= w) return 0;
+    int skip = pairs - w;
+    g->mtp_off = pos + skip;
+    g->mtp_len = pos + skip;
+    return skip;
+}
+
+static int qg_mtp_rows(Model *m, const float *h, const int *next, int n, int pos, float *logits, int vocab) {
+    Qwen36Graph *g = m->graph;
+    Cfg *c = &m->c;
+    int H = c->hidden, il = c->n_layers, rows = 0;
+    int R = n <= g->rows ? g->rows : n < qg_prompt_rows() ? n : qg_prompt_rows();   /* no new tensors when they hold n rows */
+    float *e = malloc((size_t)H * sizeof(float)), *hn = malloc((size_t)H * sizeof(float));
+    int ok = e && hn && n > 0 && qg_reserve(m, pos + n) && qg_rows(m, R);
+    g->snap_rows = 0;
+    /* A pair that does not follow the head's rows (a turn resumed from the copy of an earlier position, a prompt
+     * after the row a generation left pending): the head's attention restarts there, as at a prompt's window. */
+    if (g->mtp_len != pos) g->mtp_off = g->mtp_len = pos;
+    for (int b0 = 0; ok && b0 < n; b0 += rows) {
+        rows = n - b0 < g->rows ? n - b0 : g->rows;
+        ok = q36_gpu_sync();
+        qg_settle(m, g, ok);
+        float *in = q36_tensor_data(g->mtp_in);
+        for (int r = 0; ok && r < rows; r++) {
+            float *row = in + (size_t)r * 2 * H;
+            ok = qwen_embedding_row(m, next[b0 + r], e);
+            rmsnorm_row(row, e, m->mtp_norm_emb, H, c->eps);
+            rmsnorm_row(hn, h + (size_t)(b0 + r) * H, m->final_norm, H, c->eps);
+            rmsnorm_row(row + H, hn, m->mtp_norm_hid, H, c->eps);
+        }
+        if (ok && c->rotary_dim) qg_rope_table(c, g, rows, pos + b0);   /* RoPE at the true positions */
+        ok = ok && qg_mm(g->x, g->mtp_in, &g->mtp_fc, rows) &&
+             qg_layer_legacy(m, g, il, rows, pos + b0 - g->mtp_off, NULL);
+    }
+    ok = q36_gpu_sync() && ok;
+    qg_settle(m, g, ok);
+    if (ok) g->mtp_len = pos + n;
+    if (ok && logits) {
+        rmsnorm_row(q36_tensor_data(g->last), (const float *)q36_tensor_data(g->x) + (size_t)(rows - 1) * H,
+                    m->mtp_norm, H, c->eps);
+        QgDense head = g->head;
+        head.out = vocab;                       /* the first `vocab` rows of the head */
+        ok = qg_mm(g->head_out, g->last, &head, 1) && q36_gpu_sync();
+        if (ok) memcpy(logits, q36_tensor_data(g->head_out), (size_t)vocab * sizeof(float));
+    }
+    free(e);
+    free(hn);
+    return ok;
+}
+
+/* After a verify: of its rows, the first keep stood. */
+static void qg_mtp_keep(Model *m, int keep) {
+    Qwen36Graph *g = m->graph;
+    if (keep < g->mtp_pend_n) g->mtp_pend_n = keep;
+}
+
+/* The token ids the head drafts from: the first QG_MTP_VOCAB, or Q36_MTP_VOCAB (tests), at most the vocabulary. */
+static int qg_mtp_vocab(int V) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("Q36_MTP_VOCAB");
+        v = e && *e ? atoi(e) : QG_MTP_VOCAB;
+        if (v < 1) v = QG_MTP_VOCAB;
+    }
+    return v < V ? v : V;
+}
+
+/* Whether the head idles at the step after a prompt whatever its token (q36_spec_step: half or more of the last 16
+ * tokens past the ids it drafts from): 8 or more of the prompt's last 15 tokens are (of all of them when it has
+ * fewer: the tokens before can only add). Its window over the prompt (qg_mtp_window) would then go unused, its
+ * attention starting again where it runs again: the prompt skips it. */
+static int qg_mtp_idle_prompt(const Model *m, const int *ids, int S) {
+    int past = 0, vocab = qg_mtp_vocab(m->c.vocab);
+    for (int i = S > 15 ? S - 15 : 0; i < S; i++) past += ids[i] >= vocab;
+    return past >= 8;
+}
+
+/* The pending rows meet the token after the last, tok: through the head, whose
+ * most likely next token among the first QG_MTP_VOCAB ids (qg_mtp_vocab) is the
+ * draft, with its probability under a softmax of the head's logits for those ids
+ * (the draft's confidence): a draft reads 67 MB of the model's 0.5 GB lm_head.
+ * Those ids hold most tokens of English, other Latin-script text and code, but no
+ * Chinese character, and few Arabic or Korean ones: where most tokens lie past
+ * them, q36_spec_step leaves the head idle. 0 = nothing pending or a failure.
+ * Q36_MTP_DUMP (tests) appends the record of the other engines' head
+ * (qwen36_mtp.h): the row tok pairs with, tok, the logits (past those ids -inf). */
+static int qg_mtp_draft(Model *m, int tok, int *draft, float *prob) {
+    Qwen36Graph *g = m->graph;
+    int n = g->mtp_pend_n, next[Q36_SPEC_ROWS], V = m->c.vocab, vocab = qg_mtp_vocab(V);
+    if (!n) return 0;
+    for (int j = 0; j + 1 < n; j++) next[j] = g->mtp_pend_tok[j];
+    next[n - 1] = tok;
+    float *logits = malloc((size_t)V * sizeof(float));
+    int ok = logits && qg_mtp_rows(m, g->mtp_pend, next, n, g->mtp_pend_pos, logits, vocab);
+    g->mtp_pend_n = 0;
+    const char *dump = getenv("Q36_MTP_DUMP");
+    if (ok && dump && *dump) {
+        int row = g->mtp_pend_pos + n - 1;
+        for (int i = vocab; i < V; i++) logits[i] = -INFINITY;
+        FILE *f = fopen(dump, "ab");
+        if (!f || fwrite(&row, 4, 1, f) != 1 || fwrite(&tok, 4, 1, f) != 1 ||
+            fwrite(logits, 4, (size_t)V, f) != (size_t)V) { fprintf(stderr, "Q36_MTP_DUMP write failed\n"); exit(1); }
+        fclose(f);
+    }
+    if (ok) {
+        int best = 0;
+        for (int i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
+        double z = 0;
+        for (int i = 0; i < vocab; i++) z += exp((double)logits[i] - logits[best]);
+        *draft = best;
+        *prob = (float)(1.0 / z);
+    }
+    free(logits);
     return ok;
 }
 

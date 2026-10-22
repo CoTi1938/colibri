@@ -42,6 +42,10 @@ enum {
     K_RMSNORM_ROW, K_ROUTER_SOFTMAX_ROW, K_ROUTER_SELECT_ROW, K_SHARED_GATE_ROW,
     K_DN_DELTA_ROW, K_ATTN_GQA_QK, K_ATTN_GQA_SOFTMAX, K_ATTN_GQA_PV, K_ATTN_GQA_REDUCE,
     K_DOT_I8_VEC4,
+    K_DOT_I8_R4_ROWS,
+    K_DOT_I8_VEC4_ROWS,
+    K_DOT_I8_VEC4_ROWS2, K_DOT_I8_VEC4_ROWS3, K_DOT_I8_VEC4_ROWS4,
+    K_DOT_I8_R8_ROWS2, K_DOT_I8_R8_ROWS3, K_DOT_I8_R8_ROWS4,
     K_ATTN_KV_HALF, K_ATTN_QK_HALF, K_ATTN_PV_HALF, K_ATTN_GQA_QK_HALF, K_ATTN_GQA_PV_HALF,
     K_ATTN_QK8, K_ATTN_QK8_HALF, K_ATTN_PV8, K_ATTN_PV8_HALF, K_RMSNORM_WIDE,
     K_ROUTER_SOFTMAX_FAST, K_DN_CHUNK_GRAM, K_DN_CHUNK_INV, K_DN_CHUNK_UW, K_DN_CHUNK_STEP, K_DN_FOLD, K_DN_AUX4,
@@ -60,6 +64,10 @@ static const char *const q36_kernel_names[K_COUNT] = {
     "q36_dn_delta_row",
     "q36_attn_gqa_qk", "q36_attn_gqa_softmax", "q36_attn_gqa_pv", "q36_attn_gqa_reduce",
     "q36_dot_i8_vec4",
+    "q36_dot_i8_r4_rows",
+    "q36_dot_i8_vec4_rows",
+    "q36_dot_i8_vec4_rows2", "q36_dot_i8_vec4_rows3", "q36_dot_i8_vec4_rows4",
+    "q36_dot_i8_r8_rows2", "q36_dot_i8_r8_rows3", "q36_dot_i8_r8_rows4",
     "q36_attn_kv_half", "q36_attn_qk_half", "q36_attn_pv_half", "q36_attn_gqa_qk_half", "q36_attn_gqa_pv_half",
     "q36_attn_qk8", "q36_attn_qk8_half", "q36_attn_pv8", "q36_attn_pv8_half",
     "q36_rmsnorm_wide", "q36_router_softmax_fast", "q36_dn_chunk_gram", "q36_dn_chunk_inv", "q36_dn_chunk_uw",
@@ -575,6 +583,18 @@ int q36_dot_i8(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc, int 
             return 1;
         }
         int vector = !g_exact && in % 4 == 0, four = !vector && out % 4 == 0;
+        if (rows >= 2 && rows <= 8 && (vector || four)) {
+            /* a small batch (a speculative verify): each weight read once for every row, each row's bits as
+             * in the one-row kernel; up to 4 rows with 4 (fast) or 8 (exact) outputs per SIMD group */
+            int per = rows > 4 ? (four ? 4 : 1) : vector ? (out % 4 ? 1 : 4) : (out % 8 ? 4 : 8);
+            int k = per == 4 && vector ? K_DOT_I8_VEC4_ROWS2 + rows - 2 : per == 8 ? K_DOT_I8_R8_ROWS2 + rows - 2
+                    : vector ? K_DOT_I8_VEC4_ROWS : K_DOT_I8_R4_ROWS;
+            id<MTLComputeCommandEncoder> e = q36_encoder(k);
+            q36_bind(e, q, 0); q36_bind(e, sc, 1); q36_bind(e, x, 2); q36_bind(e, y, 3);
+            [e setBytes:&a length:sizeof(a) atIndex:4];
+            q36_groups(e, (uint64_t)out / per, 1);
+            return 1;
+        }
         id<MTLComputeCommandEncoder> e = q36_encoder(vector ? K_DOT_I8_VEC4 : four ? K_DOT_I8_R4 : K_DOT_I8);
         q36_bind(e, q, 0); q36_bind(e, sc, 1); q36_bind(e, x, 2); q36_bind(e, y, 3);
         [e setBytes:&a length:sizeof(a) atIndex:4];
@@ -1013,23 +1033,30 @@ int q36_attn(q36_tensor *out, q36_tensor *q, q36_tensor *kc, q36_tensor *vc, q36
             return 1;
         }
         if (half) return 0;                     /* no exact kernel reads a half cache */
-        if (rows == 1 && scores && qh / kv <= 8 && q36_fits(scores, 3 * qh * (uint64_t)s->cap * F4)) {
-            /* decode: the same result from three parallel steps (q36_attn_scores) */
-            id<MTLComputeCommandEncoder> e = q36_encoder(K_ATTN_SCORES);
-            q36_bind(e, q, 0); q36_bind(e, kc, 1); q36_bind(e, scores, 2);
-            [e setBytes:&p length:sizeof(p) atIndex:3];
-            [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(s->pos + 32) / 32, kv, 1)
-              threadsPerThreadgroup:MTLSizeMake(32 * (NSUInteger)(qh / kv), 1, 1)];
-            e = q36_encoder(K_ATTN_WEIGHTS);
-            q36_bind(e, scores, 0);
-            [e setBytes:&p length:sizeof(p) atIndex:1];
-            [e dispatchThreadgroups:MTLSizeMake(qh, 1, 1)                   /* Q36_ATTN_THREADS */
-              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            e = q36_encoder(K_ATTN_VALUES);
-            q36_bind(e, scores, 0); q36_bind(e, vc, 1); q36_bind(e, out, 2);
-            [e setBytes:&p length:sizeof(p) atIndex:3];
-            [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(hd + 31) / 32, (NSUInteger)(qh + 1) / 2, 1)
-              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        /* decode: the same result from three parallel steps (q36_attn_scores); a small batch (a speculative
+         * verify) runs them row after row, each row at its own position, so each row has a decode step's bits */
+        if (rows <= 8 && scores && qh / kv <= 8 && q36_fits(scores, 3 * qh * (uint64_t)s->cap * F4)) {
+            for (uint64_t r = 0; r < rows; r++) {
+                q36_state_args pr = p;
+                pr.rows = 1;
+                pr.pos = p.pos + (uint32_t)r;
+                uint64_t skip = r * qh * hd * F4;
+                id<MTLComputeCommandEncoder> e = q36_encoder(K_ATTN_SCORES);
+                q36_bind_at(e, q, skip, 0); q36_bind(e, kc, 1); q36_bind(e, scores, 2);
+                [e setBytes:&pr length:sizeof(pr) atIndex:3];
+                [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(pr.pos + 32) / 32, kv, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32 * (NSUInteger)(qh / kv), 1, 1)];
+                e = q36_encoder(K_ATTN_WEIGHTS);
+                q36_bind(e, scores, 0);
+                [e setBytes:&pr length:sizeof(pr) atIndex:1];
+                [e dispatchThreadgroups:MTLSizeMake(qh, 1, 1)                   /* Q36_ATTN_THREADS */
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                e = q36_encoder(K_ATTN_VALUES);
+                q36_bind(e, scores, 0); q36_bind(e, vc, 1); q36_bind_at(e, out, skip, 2);
+                [e setBytes:&pr length:sizeof(pr) atIndex:3];
+                [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(hd + 31) / 32, (NSUInteger)(qh + 1) / 2, 1)
+                  threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
             return 1;
         }
         id<MTLComputeCommandEncoder> e = q36_encoder(K_ATTN);

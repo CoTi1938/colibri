@@ -205,6 +205,138 @@ kernel void q36_dot_i8_r4(device const char *q [[buffer(0)]],
     }
 }
 
+// q36_dot_i8_r4 for a small batch (2..8 rows, a speculative verify): the SIMD group of four outputs loads each
+// weight once and runs every row's chains, each row's in the order q36_dot_i8_r4 runs it (same lanes, same FMA
+// chain, same simd_sum and scale), so every row gets a one-row step's bits while the weights are read once
+// instead of once per row.
+kernel void q36_dot_i8_r4_rows(device const char *q [[buffer(0)]],
+                               device const float *sc [[buffer(1)]],
+                               device const float *x [[buffer(2)]],
+                               device float *y [[buffer(3)]],
+                               constant q36_dense_args &p [[buffer(4)]],
+                               uint z [[threadgroup_position_in_grid]],
+                               ushort lane [[thread_index_in_simdgroup]]) {
+    uint o = z * 4;
+    if (o >= p.out) return;
+    device const char *q0 = q + ulong(o) * p.in;
+    float a[8][4];
+    for (uint r = 0; r < 8; r++) a[r][0] = a[r][1] = a[r][2] = a[r][3] = 0;
+    for (uint i = lane; i < p.in; i += 32) {
+        float w0 = float(q0[i]), w1 = float(q0[p.in + i]), w2 = float(q0[2 * p.in + i]), w3 = float(q0[3 * ulong(p.in) + i]);
+        for (uint r = 0; r < 8; r++) {
+            if (r >= p.rows) break;
+            float xv = x[ulong(r) * p.in + i];
+            a[r][0] = fma(w0, xv, a[r][0]);
+            a[r][1] = fma(w1, xv, a[r][1]);
+            a[r][2] = fma(w2, xv, a[r][2]);
+            a[r][3] = fma(w3, xv, a[r][3]);
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        if (r >= p.rows) break;
+        float s0 = simd_sum(a[r][0]), s1 = simd_sum(a[r][1]), s2 = simd_sum(a[r][2]), s3 = simd_sum(a[r][3]);
+        if (lane == 0) {
+            device float *yr = y + ulong(r) * p.out + o;
+            yr[0] = s0 * sc[o]; yr[1] = s1 * sc[o + 1]; yr[2] = s2 * sc[o + 2]; yr[3] = s3 * sc[o + 3];
+        }
+    }
+}
+
+// q36_dot_i8_vec4 for a small batch (2..8 rows): each output's weights loaded once for every row, each row's
+// float4 chain and reduction as q36_dot_i8_vec4 runs them (the same bits as one-row fast steps).
+kernel void q36_dot_i8_vec4_rows(device const char *q [[buffer(0)]],
+                                 device const float *sc [[buffer(1)]],
+                                 device const float *x [[buffer(2)]],
+                                 device float *y [[buffer(3)]],
+                                 constant q36_dense_args &p [[buffer(4)]],
+                                 uint z [[threadgroup_position_in_grid]],
+                                 ushort lane [[thread_index_in_simdgroup]]) {
+    if (z >= p.out) return;
+    device const char *qr = q + ulong(z) * p.in;
+    float4 acc[8];
+    for (uint r = 0; r < 8; r++) acc[r] = 0;
+    for (uint i = uint(lane) * 4; i < p.in; i += 128) {
+        float4 w = float4(char4(*(device const packed_char4 *)(qr + i)));
+        for (uint r = 0; r < 8; r++) {
+            if (r >= p.rows) break;
+            acc[r] = fma(w, q36_load4(x + ulong(r) * p.in + i), acc[r]);
+        }
+    }
+    for (uint r = 0; r < 8; r++) {
+        if (r >= p.rows) break;
+        float sum = simd_sum((acc[r].x + acc[r].y) + (acc[r].z + acc[r].w));
+        if (lane == 0) y[ulong(r) * p.out + z] = sum * sc[z];
+    }
+}
+
+// The same for R rows known when compiling (2-4, a verify of 1-3 drafts), several outputs per SIMD group: the
+// one-output kernels read every row's input once per output, and at two rows that input, not the weights, set
+// their time. Here four (fast) or eight (exact) outputs share each input load; each output keeps its lanes,
+// chain, reduction and scale, so every row still has a one-row step's bits.
+template <uint R>
+void q36_dot_i8_vec4_rows_n(device const char *q, device const float *sc, device const float *x, device float *y,
+                            constant q36_dense_args &p, uint z, ushort lane) {
+    uint o = z * 4;
+    if (o >= p.out) return;
+    device const char *q0 = q + ulong(o) * p.in;
+    float4 acc[R][4];
+    for (uint r = 0; r < R; r++) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0;
+    for (uint i = uint(lane) * 4; i < p.in; i += 128) {
+        float4 w0 = float4(char4(*(device const packed_char4 *)(q0 + i)));
+        float4 w1 = float4(char4(*(device const packed_char4 *)(q0 + ulong(p.in) + i)));
+        float4 w2 = float4(char4(*(device const packed_char4 *)(q0 + 2 * ulong(p.in) + i)));
+        float4 w3 = float4(char4(*(device const packed_char4 *)(q0 + 3 * ulong(p.in) + i)));
+        for (uint r = 0; r < R; r++) {
+            float4 xv = q36_load4(x + ulong(r) * p.in + i);
+            acc[r][0] = fma(w0, xv, acc[r][0]);
+            acc[r][1] = fma(w1, xv, acc[r][1]);
+            acc[r][2] = fma(w2, xv, acc[r][2]);
+            acc[r][3] = fma(w3, xv, acc[r][3]);
+        }
+    }
+    for (uint r = 0; r < R; r++)
+        for (uint k = 0; k < 4; k++) {
+            float sum = simd_sum((acc[r][k].x + acc[r][k].y) + (acc[r][k].z + acc[r][k].w));
+            if (lane == 0) y[ulong(r) * p.out + o + k] = sum * sc[o + k];
+        }
+}
+
+template <uint R>
+void q36_dot_i8_r8_rows_n(device const char *q, device const float *sc, device const float *x, device float *y,
+                          constant q36_dense_args &p, uint z, ushort lane) {
+    uint o = z * 8;
+    if (o >= p.out) return;
+    device const char *q0 = q + ulong(o) * p.in;
+    float a[R][8];
+    for (uint r = 0; r < R; r++)
+        for (uint k = 0; k < 8; k++) a[r][k] = 0;
+    for (uint i = lane; i < p.in; i += 32) {
+        float w[8];
+        for (uint k = 0; k < 8; k++) w[k] = float(q0[k * ulong(p.in) + i]);
+        for (uint r = 0; r < R; r++) {
+            float xv = x[ulong(r) * p.in + i];
+            for (uint k = 0; k < 8; k++) a[r][k] = fma(w[k], xv, a[r][k]);
+        }
+    }
+    for (uint r = 0; r < R; r++)
+        for (uint k = 0; k < 8; k++) {
+            float sum = simd_sum(a[r][k]);
+            if (lane == 0) y[ulong(r) * p.out + o + k] = sum * sc[o + k];
+        }
+}
+
+#define Q36_DOT_ROWS(name, body, R)                                                                              \
+    kernel void name##R(device const char *q [[buffer(0)]], device const float *sc [[buffer(1)]],               \
+                        device const float *x [[buffer(2)]], device float *y [[buffer(3)]],                     \
+                        constant q36_dense_args &p [[buffer(4)]], uint z [[threadgroup_position_in_grid]],      \
+                        ushort lane [[thread_index_in_simdgroup]]) { body<R>(q, sc, x, y, p, z, lane); }
+Q36_DOT_ROWS(q36_dot_i8_vec4_rows, q36_dot_i8_vec4_rows_n, 2)
+Q36_DOT_ROWS(q36_dot_i8_vec4_rows, q36_dot_i8_vec4_rows_n, 3)
+Q36_DOT_ROWS(q36_dot_i8_vec4_rows, q36_dot_i8_vec4_rows_n, 4)
+Q36_DOT_ROWS(q36_dot_i8_r8_rows, q36_dot_i8_r8_rows_n, 2)
+Q36_DOT_ROWS(q36_dot_i8_r8_rows, q36_dot_i8_r8_rows_n, 3)
+Q36_DOT_ROWS(q36_dot_i8_r8_rows, q36_dot_i8_r8_rows_n, 4)
+
 // Fast GEMV: four consecutive inputs per lane, with independent FMA chains.
 // Packed loads avoid imposing any alignment beyond that of the scalar input.
 // The reduction order differs from q36_dot_i8; the exact path keeps that kernel.

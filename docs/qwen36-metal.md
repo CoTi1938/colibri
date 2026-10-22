@@ -46,13 +46,14 @@ the GPU.
 The graph takes no images: the vision tower is not loaded (a line at start says
 so), so a chat turn with an image is refused, and through the gateway the
 refusal reads as for a container without the tower, though it is there;
-`COLI_METAL=0` serves images. The graph takes no prompt-lookup or MTP drafts
-(`COLI_LOOKUP`; with `Q36_MTP=1` the head stays off, with one line) and no
-read-out of the prompt's logits: a logprobs request is refused, so
-`/v1/systemone` answers an error (the server log says why) and its scoring needs
-`COLI_METAL=0`. It keeps no pins (`pin=1` is ignored, with one line). The CPU
-engine's per-layer expert cache (the size argument above, `PILOT`, `HOT`,
-`COLIBRI_RESIDENT`) is not used: the graph has one cache,
+`COLI_METAL=0` serves images. The graph takes no prompt-lookup drafts
+(`COLI_LOOKUP`; its drafts come from the checkpoint's MTP head, see [Speculative
+decoding](#speculative-decoding), and `Q36_MTP=1`, the other engines' head, is
+not loaded, with one line) and no read-out of the prompt's logits: a logprobs
+request is refused, so `/v1/systemone` answers an error (the server log says
+why) and its scoring needs `COLI_METAL=0`. It keeps no pins (`pin=1` is ignored,
+with one line). The CPU engine's per-layer expert cache (the size argument
+above, `PILOT`, `HOT`, `COLIBRI_RESIDENT`) is not used: the graph has one cache,
 `QWEN_EXPERT_CACHE_BYTES`. In a serve the dashboard's expert map shows that
 cache; its profile has the wall time, the counts and the disk time (summed over
 the readers, which read in parallel), and its phase columns stay 0 unless
@@ -98,7 +99,9 @@ The batch tensors hold the rows of the current forward: up to 2048 for a
 prompt while the system reports no memory pressure, 1024
 otherwise (about 340 KB a row: 350 MB more for the larger batch, which runs an
 8192-token prompt 4% faster because each expert gets twice the rows;
-`QWEN36_PROMPT_ROWS=1024` or `2048` sets it), one in decode. Past 1024 rows
+`QWEN36_PROMPT_ROWS=1024` or `2048` sets it), one in decode (eight with the
+MTP head, for a verify; up to eight after a short prompt, whose tensors decode
+keeps). Past 1024 rows
 the KV cache grows in steps of 1024 (42 MB each on the 35B model, 21 MB in
 fast mode) instead of doubling. Fast mode keeps attention keys and values in
 half precision (168 MB less at 8192 tokens of context) and only the high plane
@@ -191,6 +194,77 @@ starts in 4 s instead of 100. The copy takes 129 MB (66 MB in fast mode), from
 the first request on. `COLI_KV_PREFIX=0` turns it off with the rest of the
 prompt reuse.
 
+## Speculative decoding
+
+Qwen3.6's checkpoint carries a multi-token-prediction (MTP) head: one more
+decoder layer that reads the model's last hidden state at a position with the
+token after it, and predicts the token after that. `tools/convert_qwen36.py`
+carries it into the container as `model-mtp.safetensors` (f16 dense weights and
+norms, the routed experts in the model's own int4 layout), and `--mtp-only
+--base-container` adds it to a container converted before, in a new directory of
+links ([qwen36.md](qwen36.md#the-mtp-head-q36_mtp)). The graph reads the same
+tensors as the other engines' head (`Q36_MTP=1`), runs its own on the GPU, and
+does not load theirs.
+
+With the head in the container, the graph decodes speculatively; `QWEN36_MTP=0`
+turns it off (a value other than 0 and 1 is ignored, with a line). The engine
+reads every `*.safetensors` of the container, with the head off too: a damaged
+`model-mtp.safetensors` stops it as a damaged shard of the model would.
+
+After each token the head drafts the next one, and when its confidence (the
+draft's probability under a softmax of the head's logits for the token ids it
+drafts from, below) is at least 0.6 (`QWEN36_MTP_MIN_P`, a number from 0 to 1;
+0 verifies every draft), one forward verifies the picked token and the draft
+together: when the next pick equals the draft, the second row's logits answer
+it with no forward of their own. The picks always come from the model's logits
+([speculative.md](speculative.md)). In exact mode the tokens and logits are
+those of plain decoding, byte for byte: a verify computes each row with a
+decode step's kernels (the DeltaNet recurrence row by row), and a rejected
+draft swaps back the DeltaNet state copied after the first row. Fast mode runs
+the two rows through the batch kernels. The gate of the other draft sources
+([speculative.md](speculative.md#the-gate)) stays off for these drafts: a
+draft goes to a verify on its confidence alone. The gate weighs a verify
+against the plain steps of the same run, while a verify also makes the steps
+after it faster (the expert cache then holds two tokens' experts).
+
+The head runs on the GPU as one more layer. Its attention keys and values have
+their own cache, and its routed experts go through the expert cache as the
+layer after the model's last (the 41st on the 35B model). It reads only its two
+heaviest routed experts, so that its reads take few of the cache's slots from
+the model's layers: its other choices (six on the 35B model) point at the
+heaviest expert with weight 0, whose FFN runs once more for each (no read, but
+its compute). It drafts among the first 32768 token ids: a draft reads 67 MB of
+the model's 0.5 GB `lm_head`. Those ids hold most tokens of English, other
+Latin-script text and code, but no Chinese character (their ids start at 95726)
+and few Arabic or Korean ones, and its confidence counts only them. Where half
+or more of the last 16 tokens lie past them, the head does not run: it could
+draft only the other tokens there, and it costs about 5% of a step on the 35B
+model; its attention starts again when it runs again. Of a prompt it reads only
+the last 32 positions, which it would otherwise go through whole, and keeps
+only their final residuals; its attention starts at the first of them, and
+starts again where a position does not follow its last one (a turn resumed from
+the copy above). Where 8 or more of a prompt's last 15 tokens lie past the ids
+it drafts from, the prompt skips the head: it will not run at the next step,
+whatever the token, and its pass would go unused. A verify reads the experts of
+both rows in one lease, and the expected-reuse cache policy counts them as one
+visit of the layer. So between steps the cache keeps top-k fewer experts than
+without the head (287 of the 303 slots of the default size on an 8 GB Mac,
+instead of 295), and a prompt runs its layers in windows (below) only with 272
+slots or more instead of 264. A budget under two top-k groups (16 slots on the
+35B model) stops the start with a line; `QWEN36_MTP=0` runs with it. The hit
+rate a serve turn reports also counts the head's experts and those of each
+verify.
+
+With `QWEN36_FAST_EXPERTS` above 3, a verify's draft row keeps two sure
+experts fewer (3 with J = 5) except in the last quarter of the layers; with any
+J it counts the experts the first row chose as held by the cache, since the
+verify reads them anyway.
+
+The head's memory: its dense weights, the copy of the DeltaNet state a verify
+keeps (63 MiB on the 35B model in fast mode, 123 MiB in exact mode) and the
+verify's buffers; decode keeps the tensors of an eight-row batch
+(`Q36_SPEC_ROWS`), whose attention scores grow with the context.
+
 ## How it is built
 
 | File | Role |
@@ -259,6 +333,14 @@ whole layer computes them), and the last token runs the whole layer alone, at
 its position: the queries, attention, output projection, router and experts
 of the last layer are skipped for every token but one. Exact mode keeps every
 bit; in fast mode the last token takes the generation kernels.
+
+With the MTP head, the rows whose final residuals the head reads run the last
+layer whole too: its window, the last 33 rows (all rows of a shorter prompt),
+or every row of the prompt when the window starts in an earlier batch (a last
+batch of fewer than 33 rows); a prompt that skips the head runs its last row
+alone, as without it. In fast mode they take batch kernels, so the
+first token's logits can differ in the last bits from a run with
+`QWEN36_MTP=0`; exact mode keeps every bit.
 
 ## Exact and fast kernels
 
@@ -375,16 +457,26 @@ make -C c test-qwen36-graph METAL=1    # the graph against the CPU engine, on a 
 make -C c test                         # includes the qwen36 component tests
 ```
 
-`tests/test_qwen36_graph.py` writes a random model of the graph's geometry
-(8 layers, hidden 256, 64 experts of which 4 per token, eight query heads on
-one KV head of 256, DeltaNet heads of 128) and checks: the exact graph against
-the CPU engine in the same arithmetic (`COLI_DENSE_IDOT=0 QWEN_EXPERT_ACT=f32`)
-with an expert cache too small for the model, a 1600-token prompt in two
-batches, the fast graph against the exact one, the CPU's share of a fast
-prompt against `QWEN36_CPU_MATMUL=0`, a chat turn that resumes from the serve
-copy against a fresh engine, a NaN before the router, the MTP head kept off
-under `Q36_MTP=1`, and the steps aside to the CPU engine, a Clef decision head
-among them. On the Apple Paravirtual device it checks only the steps aside.
+`tests/test_qwen36_graph.py` writes a random model of the graph's geometry (8
+layers, hidden 256, 64 experts of which 4 per token, eight query heads on one KV
+head of 256, DeltaNet heads of 128) and checks: the exact graph against the CPU
+engine in the same arithmetic (`COLI_DENSE_IDOT=0 QWEN_EXPERT_ACT=f32`) with an
+expert cache too small for the model, a 1600-token prompt in two batches, the
+fast graph against the exact one, the CPU's share of a fast prompt against
+`QWEN36_CPU_MATMUL=0`, a chat turn that resumes from the serve copy against a
+fresh engine, a NaN before the router, `Q36_MTP=1` (the other engines' head, not
+loaded), and the steps aside to the CPU engine, a Clef decision head among them.
+With an MTP head it writes too, one that drafts the token just picked again, it
+checks the drafts: in exact mode the tokens and logits of plain decoding with
+every draft verified, some right and some not, the same in a serve turn resumed
+from the copy before the head's window and in the turn after one that ended
+inside a verify, the head's logits (`Q36_MTP_DUMP`) the same bits with its
+window in one batch or in two, the steps it does not run where most tokens lie
+past the ids it drafts from (`Q36_MTP_VOCAB`) and the prompts that skip it,
+and fast experts in a verify.
+Without the head, prompt lookup's forced drafts (`COLI_LOOKUP_FORCE`) check
+verifies of up to six rows against plain decoding. On the Apple Paravirtual
+device it checks only the steps aside.
 
 `DUMP_LAYERS=<file>` writes the projection, residual and MoE output of every
 layer for the last token, and `DUMP=<file>` the last logits. Two builds can be
