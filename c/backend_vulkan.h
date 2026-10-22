@@ -514,7 +514,7 @@ typedef struct {
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */
-typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; } ColiVkTensorInfo;
+typedef struct { void *wbuf, *sbuf; int fmt, I, O, rowWords, gs; int wide; } ColiVkTensorInfo;   /* wide: off the f16 cooperative-matrix GEMMs */
 int  coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *out);
 /* The chain's fence wait failed: the device is lost, the backend stops. */
 void coli_vk_mark_lost(void);
