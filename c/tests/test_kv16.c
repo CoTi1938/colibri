@@ -52,7 +52,8 @@ int main(int argc, char **argv) {
         if (bits(kv16_dot_lanes(x, w, I)) != bits(dot_f32_lanes(x, wf, I))) { ++bad; fprintf(stderr, "dot, %d elements\n", I); }
         float a = x[0] * 0.75f;
         kv16_axpy(y, a, w, I);
-        for (int k = 0; k < I; k++) z[k] += a * wf[k];
+        /* the float row's loop as -O2 and up compile it, fused (at -O1 gcc leaves it unfused) */
+        for (int k = 0; k < I; k++) z[k] = MATMUL_F32_MADD(z[k], a, wf[k]);
         if (memcmp(y, z, (size_t)I * sizeof(float))) { ++bad; fprintf(stderr, "axpy, %d elements\n", I); }
         n += 2;
     }
