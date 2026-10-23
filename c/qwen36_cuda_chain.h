@@ -248,6 +248,15 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
                         "the per-matrix path\n");
         return NULL;
     }
+    if (q36_kv16() && !cc_kv16_ready()) {   /* its K and V would not be the host's float16 numbers */
+        if (!m->K) {
+            g_q36_kv16 = 0;
+            fprintf(stderr, "[chain] qwen36: the CUDA backend does not round K and V to float16 (an older DLL): the KV cache stays float32\n");
+        } else {
+            fprintf(stderr, "[chain] qwen36: the CUDA backend does not round K and V to float16 (an older DLL); the per-matrix path\n");
+            return NULL;
+        }
+    }
     if (!q36cc_geometry_ok(c)) {
         fprintf(stderr, "[chain] qwen36: a geometry its kernels do not take (head dim %d, DeltaNet %dx%d); the per-matrix path\n",
                 c->head_dim, c->dn_kdim, c->dn_vdim);
@@ -415,6 +424,17 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
         ok = cc_reserve(&ch->kg, (r + c->window) * kvo * F, CC_DEV) && cc_reserve(&ch->vg, (r + c->window) * kvo * F, CC_DEV);
     return ok;
 }
+/* n of the host's K or V elements from idx (q36_kv_es() bytes each, q36_kv16) into a float32
+ * mirror at float offset at: float16 widens to the floats it holds, which are the device's */
+static int q36cc_kv_up(CcBuf *dst, size_t at, const void *base, int64_t idx, size_t n) {
+    if (!q36_kv16()) return cc_write(dst, at, (const float *)base + idx, n * sizeof(float));
+    float *f = malloc(n * sizeof(float));
+    if (!f) return 0;
+    kv16_unpack(f, (const uint16_t *)base + idx, (int64_t)n);
+    int ok = cc_write(dst, at, f, n * sizeof(float));   /* a pageable source is staged before it returns */
+    free(f);
+    return ok;
+}
 /* A sliding layer's ring (q36_kv_rows) on the device too, where the backend's attention
  * reads one (cc_attn_wr; an older backend: a mirror of the cache's length, filled from the
  * host's ring): position t in row t % ring on both sides. 0 for a full layer. */
@@ -540,8 +560,8 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
                 int r = t % R, run = pos_base - t < R - r ? pos_base - t : R - r;
                 for (int h = 0; h < KV && ok; h++) {
                     size_t src = ((size_t)h * R + r) * kvd, dst = dring ? src : ((size_t)h * ch->cap + t) * kvd;
-                    ok = cc_write(ch->kc[i], dst, m->K[i] + src, (size_t)run * kvd * sizeof(float)) &&
-                         cc_write(ch->vc[i], dst, m->V[i] + src, (size_t)run * kvd * sizeof(float));
+                    ok = q36cc_kv_up(ch->kc[i], dst, m->K[i], (int64_t)src, (size_t)run * kvd) &&
+                         q36cc_kv_up(ch->vc[i], dst, m->V[i], (int64_t)src, (size_t)run * kvd);
                 }
                 t += run;
             }
@@ -550,8 +570,8 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
         }
         for (int h = 0; h < KV && ok; h++) {
             size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->cap + t0) * kvd;
-            ok = cc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * kvd * sizeof(float)) &&
-                 cc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * kvd * sizeof(float));
+            ok = q36cc_kv_up(ch->kc[i], dst, m->K[i], (int64_t)src, (size_t)n * kvd) &&
+                 q36cc_kv_up(ch->vc[i], dst, m->V[i], (int64_t)src, (size_t)n * kvd);
         }
         ch->kv_valid[i] = pos_base;
     }
@@ -590,6 +610,10 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
     if (ok && l->kn) { CcNorm p = {n * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->k, ch->prm, ch->k, &p); }
     if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->csd, &p); }
+    if (ok && q36_kv16()) {   /* K and V as the host's cache keeps them (float16): the CPU's numbers, before anything reads them */
+        CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        ok = cc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && cc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
+    }
     if (!ok) return 0;
     /* the new rows into the device cache, and to the host's */
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -741,8 +765,8 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
             size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-            memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-            memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+            q36_kv_put(m->K[i], (int64_t)dst, kv + src, c->k_head_dim);
+            q36_kv_put(m->V[i], (int64_t)dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim);
         }
         if (R && m->ring_pos) m->ring_pos[(pb + s) % R] = pb + s;
     }
