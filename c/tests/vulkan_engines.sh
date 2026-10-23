@@ -2421,7 +2421,10 @@ mla_toks() {  # <engine> <log>
 }
 mla_gate() {
   local eng=$1 tag=$2 tol=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  # COLI_SPEC_GATE=0 first (a gate's own setting follows it and wins): the lookup drafts'
+  # gate decides from measured times, so two runs could verify different steps and write
+  # different numbers of logit rows, and logits_close would compare nothing
+  local envs=(COLI_SPEC_GATE=0); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f chain.usage cpu.f32 vk.f32
   env "${envs[@]}" COLI_USAGE=chain.usage USAGE_SAVE=0 DUMP=cpu.f32 ./"$eng" "$@" > cpu.log 2>&1 || true
   if [ -n "${FAULT_BACK:-}" ]; then

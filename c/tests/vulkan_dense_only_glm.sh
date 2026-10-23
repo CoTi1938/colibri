@@ -17,7 +17,8 @@
 # of the CPU's largest (logits_close).
 dho_mla_gate() {
   local eng=$1 tag=$2 tol=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  # COLI_SPEC_GATE=0 first, as in mla_gate (vulkan_engines.sh): the same verify steps in every run
+  local envs=(COLI_SPEC_GATE=0); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local mode=${CHAINMODE:-1}
   local vk=(USAGE_SAVE=0 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VULKAN=1 COLI_VK_CHAIN=$mode)
   [ "$mode" = 0 ] && vk+=(COLI_VK_DENSE=1)
