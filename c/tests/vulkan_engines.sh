@@ -1841,6 +1841,10 @@ flint_chain_serve() {
   printf '{"format": "colibri-gguf-v1", "gguf": "%s/flint_tiny/model.gguf", "mode": "link", "arch": "flint", "parts": 1}\n' "$PWD" > flint_tiny/gguf.json
   CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
   COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  # the sliding layers' KV in a ring of window + 9 rows, on the host and on the device: the
+  # same turns (a pin restored, a prefix reused, a cache that grows), the CPU's frames
+  CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1

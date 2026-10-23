@@ -98,9 +98,11 @@ typedef struct {
     VkcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
     int snap_slots, snap_valid;                /* allocated; written by the last verify */
     int *kv_valid, *attn_ord, n_attn;
+    int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else dev_rows) */
     int dn_where, host_zero;
     VkcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkv, *z, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     VkcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
+    VkcBuf *kg, *vg;                           /* a long step's window over a ring: its rows before the step and the step's (q36c_attention) */
     VkcBuf *agb, *lat, *latd;                  /* Muse Spark: the attention gate's rows, the experts' input rows */
     float *host_routed;
     unsigned long long forwards, frames, host_ms_n;
@@ -287,10 +289,10 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
-    ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int));
+    ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int)); ch->kv_rows = calloc(L, sizeof(int));
     if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->o_ra || !ch->o_rf ||
         !ch->o_pre || !ch->o_pf || !ch->t_ab || !ch->t_sg ||
-        !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord) return NULL;
+        !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord || !ch->kv_rows) return NULL;
     /* the parameter arena of the n layers: offsets, then one upload */
     size_t np = 0;
     int vh = c->dn_vheads, conv_dim = c->dn_conv_dim, convk = c->dn_convk;
@@ -605,15 +607,41 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
      * model's scratch, and so coli plan's count of it, stays as it was */
     if (ok && c->muse)
         ok = q36c_res(&ch->agb, r * AG, VKC_DEV) && q36c_res(&ch->lat, r * LT, VKC_DEV) && q36c_res(&ch->latd, r * LT, VKC_DOWN);
+    if (ok && m->kv_ring)   /* the sliding layers' rings: a long step's window, linear (the window's rows before it and its own) */
+        ok = q36c_res(&ch->kg, (r + c->window) * kvo, VKC_DEV) && q36c_res(&ch->vg, (r + c->window) * kvo, VKC_DEV);
     return ok;
+}
+/* A sliding layer's mirror is a ring of the host's rows (q36_kv_rows), position t in row
+ * t % ring on both sides; 0 for a full layer. */
+static int q36c_ring(Model *m, int i) { return q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0; }
+/* What the chain's KV mirror takes at the context's capacity, after the tier has filled
+ * the device, for a model whose mirror cannot split (a sliding window, sinks: Flint, Muse
+ * Spark, whose chain stops when the mirror does not fit): the full layers' rows at ctx, a
+ * sliding layer's ring (q36_ring_for), at most half of what the device has free. The tier
+ * leaves it free (VktConfig.chain_bytes). Before, Flint int4 at 32K of context mirrored
+ * 6.6 GB beside a tier that had left 1 GiB, and its chain ran only with
+ * COLI_VK_TIER_RESERVE_GB=12. */
+static size_t q36c_late_bytes(Model *m, int ctx) {
+    Cfg *c = &m->c;
+    if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
+    int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;
+    for (int i = 0; i < hi && i < c->n_layers; i++)
+        if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
+    return kv > half ? half : kv;
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int q36c_mirror(Q36Chain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
         size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), ch->n_attn, row, m->kv_cap, 1, 0,
-                                            (size_t)ch->n_attn * ch->dev_rows * row) : 1;
+        /* the rings counted at their rows, as that many layers of the cache's length */
+        int nf = 0, nr = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
+        int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + m->kv_cap - 1) / m->kv_cap) : 0);
+        size_t held = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
+        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, m->kv_cap, 1, 0, held) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
             fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
@@ -625,8 +653,9 @@ static int q36c_mirror(Q36Chain *ch, Model *m) {
             if (!c->is_attn[i]) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
             ch->kv_valid[i] = 0;
-            ch->kc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * ch->dev_rows * c->k_head_dim * sizeof(float), VKC_DEV);
+            ch->kv_rows[i] = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
+            ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
+            ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
             if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
         }
         ch->cap = m->kv_cap;
@@ -753,7 +782,22 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
             continue;
         }
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
-        int t0 = ch->kv_valid[i], n = pos_base - t0;
+        int t0 = ch->kv_valid[i], n = pos_base - t0, R = q36c_ring(m, i);
+        if (R) {   /* a ring: the window's rows before pos_base, the host's ring rows into the same device rows */
+            if (t0 < pos_base - c->window + 1) t0 = pos_base - c->window + 1;
+            if (t0 < 0) t0 = 0;
+            for (int t = t0; t < pos_base && ok; ) {
+                int r = t % R, run = pos_base - t < R - r ? pos_base - t : R - r;
+                for (int h = 0; h < KV && ok; h++) {
+                    size_t at = ((size_t)h * R + r) * kvd;
+                    ok = vkc_write(ch->kc[i], at, m->K[i] + at, (size_t)run * kvd * sizeof(float)) &&
+                         vkc_write(ch->vc[i], at, m->V[i] + at, (size_t)run * kvd * sizeof(float));
+                }
+                t += run;
+            }
+            ch->kv_valid[i] = pos_base;
+            continue;
+        }
         for (int h = 0; h < KV && ok; h++) {
             size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->dev_rows + t0) * kvd;
             ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * kvd * sizeof(float)) &&
@@ -809,17 +853,51 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
                vkc_kv_gqa(&a) && q36c_attn_out(ch, m, l, n);
     }
     /* the new rows into the device cache, and to the host's */
+    const int R = q36c_ring(m, i), rows = ch->kv_rows[i];   /* a ring: position t in row t % R */
+    if (R && n > R - win + 1) {
+        /* A step longer than the ring's spare rows would overwrite rows its first rows still see:
+         * its window is gathered instead, as MiMo's chain does, the ring's rows of the positions
+         * before it and then its own, head-major in kg/vg, where the attention reads them as a
+         * cache from position b0 (the same values in the same order: the same bits); then its
+         * last R rows go into the ring. */
+        int b0 = pb - win + 1 > 0 ? pb - win + 1 : 0, nh = pb - b0, tot = nh + n;
+        VkcRegion *g = malloc(sizeof *g * (size_t)KV * (n > 2 ? n : 2));
+        if (!g) return 0;
+        int ng = 0;
+        for (int h = 0; h < KV; h++)
+            for (int t = b0; t < pb; ) {
+                int r = t % R, run = pb - t < R - r ? pb - t : R - r;
+                g[ng++] = (VkcRegion){((size_t)h * tot + (t - b0)) * kvd, ((size_t)h * R + r) * kvd, (size_t)run * kvd};
+                t += run;
+            }
+        ok = (!ng || (vkc_copy_regions(ch->kg, ch->kc[i], g, ng) && vkc_copy_regions(ch->vg, ch->vc[i], g, ng)));
+        ng = 0;
+        for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
+            g[ng++] = (VkcRegion){((size_t)h * tot + nh + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        ok = ok && vkc_copy_regions(ch->kg, ch->k, g, ng) && vkc_copy_regions(ch->vg, ch->v, g, ng);
+        VkcAttn a = {n, H, KV, hd, nh, tot, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
+                     1.f / sqrtf((float)hd), 0, 0};
+        VkcAttnW w = {a, win, 0, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+        ok = ok && vkc_attn_w(ch->q, ch->kg, ch->vg, ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w);
+        ng = 0;   /* after the attention read the ring's rows: the step's last R into it */
+        for (int s = n > R ? n - R : 0; s < n; s++) for (int h = 0; h < KV; h++)
+            g[ng++] = (VkcRegion){((size_t)h * R + (pb + s) % R) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        ok = ok && vkc_copy_regions(ch->kc[i], ch->k, g, ng) && vkc_copy_regions(ch->vc[i], ch->v, g, ng) &&
+             vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
+        free(g);
+        return ok && q36c_attn_out(ch, m, l, n);
+    }
     VkcRegion *rg = malloc(sizeof *rg * (size_t)n * KV);
     if (!rg) return 0;
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
-        rg[s * KV + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        rg[s * KV + h] = (VkcRegion){((size_t)h * rows + (R ? (pb + s) % R : pb + s)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
     ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
          vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
     free(rg);
-    VkcAttn a = {n, H, KV, hd, pb, ch->dev_rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
+    VkcAttn a = {n, H, KV, hd, pb, rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                  1.f / sqrtf((float)hd), 0, 0};
     if (win || l->sinks) {   /* Flint: a sliding window and a sink per head (vkc_attn_w, as MiMo's) */
-        VkcAttnW w = {a, win, 0, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+        VkcAttnW w = {a, win, R, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
         return ok && vkc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w) &&
                q36c_attn_out(ch, m, l, n);
     }
@@ -883,10 +961,14 @@ static void q36c_kv_down(Q36Chain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
     if (!c->is_attn[i]) return;
     const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+    const int R = q36c_ring(m, i);
+    for (int s = 0; s < n; s++) {
+        for (int h = 0; h < c->kv_heads; h++) {
+            size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+            memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
+            memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+        }
+        if (R && m->ring_pos) m->ring_pos[(pb + s) % R] = pb + s;
     }
 }
 

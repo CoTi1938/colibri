@@ -1166,6 +1166,7 @@ typedef struct {
     int kv_len;
     kv_prefix kvp;
     int *mpos, mpos_len, rope_delta;
+    int *ring_pos;
 } Q36Seq;
 typedef struct { Q36Seq *seq; int pos; } Q36Row;
 
@@ -1199,6 +1200,7 @@ typedef struct {
     double t_disk;
     uint8_t **ehit;
     float **K, **V; int kv_len, max_t, kv_cap;
+    int kv_ring, *ring_pos;   /* a sliding-window layer's KV ring (q36_kv_rows): its rows, the position each holds */
     /* What the current attention and DeltaNet state was built from, so a
      * turn that resends the transcript prefills only the new tail. The ids
      * are recorded where they are fed, never derived from a counter: see
@@ -1244,6 +1246,49 @@ typedef struct {
      * write that conversation's state; NULL in every other forward. */
     const Q36Row *mux_rows;
 } Model;
+
+/* ---- a sliding-window layer's KV ring (Flint, Muse Spark) ---------------------------
+ * A sliding-window layer reads its last `window` positions only, so its K and V keep a
+ * ring of kv_ring rows (window + Q36_RING_SPARE): position t in row t % kv_ring, where a
+ * full layer keeps max_t rows, t in row t. Flint's 35 sliding layers of 49 keep 769 rows
+ * each instead of the context's 32768 or more. The spare rows: what a step may write and
+ * then undo (a verify's rejected drafts, a pinned prefix's option) without overwriting a
+ * row the window still sees, and a chain step's rows, which the device writes before its
+ * attention reads them (a chain step writes at most spare + 1 rows). ring_pos[r]: the
+ * position row r holds (-1: none), the same for every sliding layer, since each step
+ * writes the same positions in all of them; a rewind (a pin, a reused prefix) checks it
+ * before it trusts the rows. kv_ring 0: every layer linear (Q36_KV_RING=0, a context the
+ * ring would not shorten, a model without sliding layers). */
+#define Q36_RING_SPARE 256
+static int q36_ring_spare(void) {
+    /* Q36_KV_RING_SPARE: the tests' small ring, never under what a verify can undo: k drafts
+     * of which j stand leave rows to k past the next step's first, and the window that step
+     * reads must survive them (spare >= k - j - 1, SPEC_MAX_DRAFTS - 1 at worst) */
+    static int s = -1;
+    if (s < 0) { const char *e = getenv("Q36_KV_RING_SPARE"); s = e && *e ? atoi(e) : Q36_RING_SPARE; }
+    if (s < SPEC_MAX_DRAFTS + 1) s = SPEC_MAX_DRAFTS + 1;
+    return s;
+}
+static int q36_ring_for(const Cfg *c, int max_t) {
+    const char *e = getenv("Q36_KV_RING");
+    if (!c->win_layer || c->window < 1 || (e && *e == '0')) return 0;
+    int R = c->window + q36_ring_spare();
+    return R < max_t ? R : 0;
+}
+static inline int q36_kv_rows(const Model *m, int layer) {
+    return m->kv_ring && m->c.win_layer && m->c.win_layer[layer] ? m->kv_ring : m->max_t;
+}
+/* where position t of KV head h starts in layer `layer`'s K or V, in floats */
+static inline int64_t q36_kv_at(const Model *m, int layer, int h, int t) {
+    int R = q36_kv_rows(m, layer);
+    return ((int64_t)h * R + t % R) * m->c.k_head_dim;
+}
+/* the ring still holds positions [t0, t1) */
+static int q36_ring_holds(const int *ring_pos, int R, int t0, int t1) {
+    if (!ring_pos || !R) return 1;
+    for (int t = t0 < 0 ? 0 : t0; t < t1; t++) if (ring_pos[t % R] != t) return 0;
+    return 1;
+}
 
 static pthread_mutex_t g_pilot_mx = PTHREAD_MUTEX_INITIALIZER;
 static struct { int l, e; } pilot_q[4096];
@@ -4440,14 +4485,28 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
     }
-    for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
-        int t = mr ? mr[s].pos : pos_base + s;
-        float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-        memcpy(Kl + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-        memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-    }
     float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
+    /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
+     * the cache would have them, and go into the ring after the scores; written first, the
+     * later rows of a long step would overwrite rows its earlier rows still see. */
+    const int ring = q36_kv_rows(m, layer) != m->max_t ? m->kv_ring : 0;
+    if (!ring)
+        for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
+            int t = mr ? mr[s].pos : pos_base + s;
+            float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            memcpy(Kl + q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+            memcpy(Vl + q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        }
+    else
+        for (int s = 0; s < (mr ? S : 1); s++) {   /* the rows before the step's: still in the ring */
+            int p = mr ? mr[s].pos : pos_base;
+            if (!q36_ring_holds(mr ? mr[s].seq->ring_pos : m->ring_pos, ring, p - win + 1, p)) {
+                fprintf(stderr, "[qwen36] layer %d: the KV ring no longer holds the window before position %d "
+                                "(a rewind past its %d spare rows)\n", layer, p, ring - win);
+                exit(1);
+            }
+        }
     float *ctx = falloc((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
@@ -4463,8 +4522,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
             /* a sliding-window layer (Flint) sees the window's rows, its own included */
             int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+            /* from tb on, the step's own rows (a ring's, from the scratch): a multiplexed
+             * row's is itself, the others' from pos_base */
+            int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
+            const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
             for (int t = t0; t <= qpos; t++) {
-                const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
+                const float *kv = t < tb ? Kl + q36_kv_at(m, layer, kvh, t) : Kb + (int64_t)(t - sp0)*KV*kvd;
                 float acc = dot_f32_lanes(qv, kv, kvd);
                 sc[t] = acc * scale;
             }
@@ -4479,11 +4542,22 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *cx = ctx + ((int64_t)s*H + hh)*hd;
             for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
             for (int t = t0; t <= qpos; t++) {
-                const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
+                const float *vrow = t < tb ? Vl + q36_kv_at(m, layer, kvh, t) : Vb + (int64_t)(t - sp0)*KV*kvd;
                 float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
             }
         }
     }
+    if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
+        for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
+            int t = mr ? mr[s].pos : pos_base + s;
+            float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            for (int kvh = 0; kvh < KV; kvh++) {
+                memcpy(Kl + q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+                memcpy(Vl + q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+            }
+            int *rp = mr ? mr[s].seq->ring_pos : m->ring_pos;
+            if (rp) rp[t % ring] = t;
+        }
     /* Muse Spark: every head's output normalised, and the gate its own projection of the
      * attention's input (attn_gate), H x hd wide like the heads */
     if (c->muse) {
@@ -6191,6 +6265,7 @@ static void q36_seq_swap(Model *m, Q36Seq *q) {
     Q36_SEQ_SWAP(int, m->kv_len, q->kv_len); Q36_SEQ_SWAP(kv_prefix, m->kvp, q->kvp);
     Q36_SEQ_SWAP(int *, m->mpos, q->mpos); Q36_SEQ_SWAP(int, m->mpos_len, q->mpos_len);
     Q36_SEQ_SWAP(int, m->rope_delta, q->rope_delta);
+    Q36_SEQ_SWAP(int *, m->ring_pos, q->ring_pos);
 #undef Q36_SEQ_SWAP
 }
 
@@ -6202,7 +6277,7 @@ static void q36_seq_free(Model *m, Q36Seq *q) {
         if (q->DN_rec) free(q->DN_rec[i]); if (q->DN_conv) free(q->DN_conv[i]);
     }
     free(q->K); free(q->V); free(q->DN_rec); free(q->DN_conv);
-    kv_prefix_free(&q->kvp); free(q->mpos);
+    kv_prefix_free(&q->kvp); free(q->mpos); free(q->ring_pos);
     memset(q, 0, sizeof *q);
 }
 static int q36_seq_alloc(Model *m, Q36Seq *q) {
@@ -6211,9 +6286,13 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
     q->K = calloc((size_t)n, sizeof(float *)); q->V = calloc((size_t)n, sizeof(float *));
     q->DN_rec = calloc((size_t)n, sizeof(float *)); q->DN_conv = calloc((size_t)n, sizeof(float *));
     int ok = q->K && q->V && q->DN_rec && q->DN_conv && kv_prefix_alloc(&q->kvp, m->kv_cap);
+    if (ok && m->kv_ring) {   /* the Model's layout: its sliding layers' rings */
+        ok = (q->ring_pos = malloc((size_t)m->kv_ring * sizeof(int))) != NULL;
+        for (int r = 0; ok && r < m->kv_ring; r++) q->ring_pos[r] = -1;
+    }
     for (int i = 0; ok && i < n; i++) {
         if (c->is_attn[i]) {
-            size_t kv = (size_t)c->kv_heads * m->kv_cap * c->k_head_dim;
+            size_t kv = (size_t)c->kv_heads * q36_kv_rows(m, i) * c->k_head_dim;
             q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
             ok = q->K[i] && q->V[i];
         } else if (m->DN_rec[i]) {
@@ -6474,7 +6553,8 @@ static int pin_restore(Model *m, const int *ids, int n){
     while (s >= 0) {
         ColiPin *k = &g_pins.slot[s];
         Q36PinState *st = (Q36PinState *)k->state;
-        if (st && kv_prefix_holds(&m->kvp, k->ids, k->len)) {
+        if (st && kv_prefix_holds(&m->kvp, k->ids, k->len) &&
+            q36_ring_holds(m->ring_pos, m->kv_ring, k->len - c->window + 1, k->len)) {   /* and the window's rows in the rings */
             for (int i = 0; i < c->n_layers; i++){
                 if (c->is_attn[i]) continue;
                 if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
@@ -6514,6 +6594,7 @@ static void reset_recurrent(Model *m){
      * forget what it was built from, or the two disagree in favour of the one
      * nobody can check. */
     kv_prefix_clear(&m->kvp);
+    if (m->ring_pos) for (int r = 0; r < m->kv_ring; r++) m->ring_pos[r] = -1;
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -6566,21 +6647,49 @@ static void ensure_kv(Model *m){
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
     if (keep > m->max_t)   keep = m->max_t;
+    /* A sliding layer's ring (q36_kv_rows): the same rows at any longer context, so it
+     * keeps its buffer; one that was linear (a context no longer than the ring) holds
+     * positions [0, keep) in rows [0, keep), which are their rows in the ring too. */
+    int old_ring = m->K ? m->kv_ring : 0, ring = q36_ring_for(c, m->max_t);
+    if (ring && ring != old_ring) {
+        int *rp = malloc((size_t)ring * sizeof(int));
+        if (!rp) { ring = 0; }
+        else {
+            for (int r = 0; r < ring; r++) rp[r] = r < keep ? r : -1;
+            free(m->ring_pos); m->ring_pos = rp;
+        }
+    }
+    if (!ring) { free(m->ring_pos); m->ring_pos = NULL; }
     m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
-            m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
-            m->V[i] = falloc((int64_t)c->kv_heads * m->max_t * kvd);
+            int win = ring && c->win_layer && c->win_layer[i];
+            if (win && old_ring == ring && oldK && oldK[i]) {   /* the ring as it is */
+                m->K[i] = oldK[i]; m->V[i] = oldV[i]; oldK[i] = oldV[i] = NULL;
+                continue;
+            }
+            int rows = win ? ring : m->max_t, ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+            m->K[i] = falloc((int64_t)c->kv_heads * rows * kvd);
+            m->V[i] = falloc((int64_t)c->kv_heads * rows * kvd);
             if (keep > 0 && oldK && oldK[i] && oldV[i])
                 for (int h = 0; h < c->kv_heads; h++){
-                    memcpy(m->K[i] + (int64_t)h*m->max_t*kvd,
-                           oldK[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
-                    memcpy(m->V[i] + (int64_t)h*m->max_t*kvd,
-                           oldV[i] + (int64_t)h*old_stride*kvd, (size_t)keep*kvd*sizeof(float));
+                    memcpy(m->K[i] + (int64_t)h*rows*kvd,
+                           oldK[i] + (int64_t)h*ostride*kvd, (size_t)keep*kvd*sizeof(float));
+                    memcpy(m->V[i] + (int64_t)h*rows*kvd,
+                           oldV[i] + (int64_t)h*ostride*kvd, (size_t)keep*kvd*sizeof(float));
                 }
         } else { m->K[i] = NULL; m->V[i] = NULL; }
     }
+    if (ring && ring != old_ring) {
+        int nw = 0;
+        for (int i = 0; i < c->n_layers; i++) nw += c->is_attn[i] && c->win_layer[i];
+        double row = 2.0 * c->kv_heads * c->k_head_dim * sizeof(float) / 1073741824.0;
+        fprintf(stderr, "[qwen36] KV: %d sliding-window layers keep a ring of %d rows (window %d, %d spare), not %d: "
+                        "%.2f GiB of their cache instead of %.2f\n", nw, ring, c->window, ring - c->window, m->max_t,
+                nw * row * ring, nw * row * m->max_t);
+    }
+    m->kv_ring = ring;
     if (oldK){
         for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
         free(oldK); free(oldV);
@@ -7322,6 +7431,8 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * because "it did not get faster" is otherwise indistinguishable from
      * "reuse is not wired up". */
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    /* the sliding layers' rings must still hold the window before the first fresh token */
+    if (reuse && !q36_ring_holds(m->ring_pos, m->kv_ring, reuse - m->c.window + 1, reuse)) reuse = 0;
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
@@ -8289,6 +8400,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
+                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx()) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};

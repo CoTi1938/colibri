@@ -501,7 +501,22 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
     int kvd = c->k_head_dim, KV = c->kv_heads;
     for (int i = 0; i < c->n_layers && ok; i++) {
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
-        int t0 = ch->kv_valid[i], n = pos_base - t0;
+        int t0 = ch->kv_valid[i], n = pos_base - t0, R = q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0;
+        if (R) {   /* the host's ring (q36_kv_rows): the window's rows before pos_base, each run of its rows to its positions */
+            if (t0 < pos_base - c->window + 1) t0 = pos_base - c->window + 1;
+            if (t0 < 0) t0 = 0;
+            for (int t = t0; t < pos_base && ok; ) {
+                int r = t % R, run = pos_base - t < R - r ? pos_base - t : R - r;
+                for (int h = 0; h < KV && ok; h++) {
+                    size_t src = ((size_t)h * R + r) * kvd, dst = ((size_t)h * ch->cap + t) * kvd;
+                    ok = cc_write(ch->kc[i], dst, m->K[i] + src, (size_t)run * kvd * sizeof(float)) &&
+                         cc_write(ch->vc[i], dst, m->V[i] + src, (size_t)run * kvd * sizeof(float));
+                }
+                t += run;
+            }
+            ch->kv_valid[i] = pos_base;
+            continue;
+        }
         for (int h = 0; h < KV && ok; h++) {
             size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->cap + t0) * kvd;
             ok = cc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * kvd * sizeof(float)) &&
@@ -660,10 +675,14 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
     if (!c->is_attn[i]) return;
     const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+    const int R = q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0;   /* a sliding layer's ring on the host */
+    for (int s = 0; s < n; s++) {
+        for (int h = 0; h < c->kv_heads; h++) {
+            size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+            memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
+            memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+        }
+        if (R && m->ring_pos) m->ring_pos[(pb + s) % R] = pb + s;
     }
 }
 /* A prompt chunk routes nearly every expert of a layer, and the host's step costs per row
@@ -897,7 +916,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (!ch || !ch->ok || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
     int CH = q36cc_rows_max(ch, m), rows = S < CH ? S : CH;
-    int kvo = c->kv_heads * c->k_head_dim, half = c->rotary_dim / 2;
+    int half = c->rotary_dim / 2;
     if (m->snap_rows > 0 && !q36cc_spec_slots(ch, m, m->snap_rows)) {
         fprintf(stderr, "[chain] qwen36: device memory for a verify's %d copies refused; this verify on the CPU\n", m->snap_rows);
         return 0;
@@ -992,14 +1011,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 ok = ok && cc_submit(1);   /* A1 */
                 ch->wait_ms += tm_now() - t0;
                 if (!ok) break;
-                if (c->is_attn[i]) {                           /* the rows into the host's cache */
-                    const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-                    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-                        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-                        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-                        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
-                    }
-                }
+                if (c->is_attn[i]) q36cc_kv_down(ch, m, i, n, pb);   /* the rows into the host's cache */
                 /* A2: the shared expert, while the host computes the routed experts */
                 ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n) && cc_submit(0);
                 double t1 = tm_now();
@@ -1037,12 +1049,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
          * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
         for (int i = 0; i < L; i++) {
             if (!c->is_attn[i] || (E > 0 && !q36_dense_l(c, i))) continue;
-            const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-            for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-                size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-                memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-                memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
-            }
+            q36cc_kv_down(ch, m, i, n, pb);
         }
         if (want_x) memcpy(xh + (size_t)c0 * D, cc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = 0; i < L; i++) if (c->is_attn[i]) ch->kv_valid[i] = pb + n;
