@@ -4239,6 +4239,10 @@ kv_split_colibri() {
   kv_mla_gate colibri "kv colibri n-gram drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
   kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   kv_mla_gate colibri "kv colibri tier off" 1 8 4 $G COLI_VK_TIER=0 -- 64 16 16
+  # KV16: the host's latent rows in float16 (the split uploads them widened, the host part
+  # reads them as they are, the chain rounds its new rows alike; the cold-device family below
+  # runs it with the shadow)
+  kv_mla_gate colibri "kv colibri KV16" 0 8 4 $G KV16=1 -- 64 16 16   # tokens: see dense-only's KV16 gates
   # prompts only: the prompt and the drafts' verify rows on the device, decode on the CPU
   CHAINMODE=2 kv_mla_gate colibri "kv colibri prompts only, drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
   # COLI_VK_KV_SPLIT=0: the whole mirrors, as before the split
