@@ -302,7 +302,8 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
 
 /* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
  * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
- * MemAvailable, Windows ullAvailPhys, macOS free+inactive+purgeable. #855. */
+ * MemAvailable, Windows ullAvailPhys bounded by the commit still grantable
+ * (compat_meminfo), macOS free+inactive+purgeable. #855. */
 static double k3_mem_avail(void){
 #ifdef _WIN32
     double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
