@@ -25,6 +25,10 @@ whatever state the chain keeps on the device. CHAIN_SERVE_CONTINUE=1 adds a last
 that continues the one before it exactly (its prompt, what it wrote, two bytes more) and
 asks for enough tokens to grow the cache: the state is reused while the KV mirrors are
 made again from the host's rows, which then have to hold what the device wrote.
+The KV cache stays float32 here (Q36_KV=f32, KV16=0): the engines' default float16 rounds a
+value the CPU and the device computed a few bits apart into two halves an ulp apart, about
+1e-3 in a logprob. CHAIN_SERVE_KV16=1 keeps the float16 cache (the device rounds its rows as
+the host does) and compares the logprobs within 5e-3; token ids and texts stay exact.
 """
 import os
 import re
@@ -36,7 +40,8 @@ READY = b"\x01\x01READY\x01\x01"
 
 
 def session(engine, snap, extra, chain):
-    env = dict(os.environ, SNAP=snap, SERVE="1", COLI_PREFIX_LOG="1", Q38_PREFIX_LOG="1", **extra)
+    kv = {} if KV16 else {"Q36_KV": "f32", "KV16": "0"}   # float16 only when asked (the docstring says why)
+    env = dict(os.environ, SNAP=snap, SERVE="1", COLI_PREFIX_LOG="1", Q38_PREFIX_LOG="1", **kv, **extra)
     if chain:
         env.update(COLI_VULKAN="1", COLI_VK_CHAIN=os.environ.get("COLI_VK_CHAIN", "1"), COLI_VK_TIER_SYNC="1",
                    COLI_USAGE=os.path.abspath("chain-serve.usage"))
@@ -95,7 +100,8 @@ def session(engine, snap, extra, chain):
     return out, b"".join(err).decode(errors="replace")
 
 
-TOL = float(os.environ.get("CHAIN_SERVE_TOL", "1e-4"))
+KV16 = os.environ.get("CHAIN_SERVE_KV16") == "1"
+TOL = float(os.environ.get("CHAIN_SERVE_TOL", "5e-3" if KV16 else "1e-4"))
 WORST = [0.0]
 
 

@@ -732,6 +732,21 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
     } else if (p.op == 10) {
         int d = (int)(i % p.D);
         y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
+    } else if (p.op == 11) {   /* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 */
+        float x = a[p.a_off + i];
+        if (x > 65504.f) x = 65504.f; else if (x < -65504.f) x = -65504.f;
+        unsigned u = __float_as_uint(x), s = u & 0x80000000u, m = u & 0x7fffffffu;
+        if (m > 0x7f800000u) u = u | 0x400000u;
+        else if (m >= 0x38800000u) u = s | ((m + 0xfffu + ((m >> 13) & 1u)) & 0xffffe000u);
+        else {
+            unsigned e = m >> 23, mm = (m & 0x7fffffu) | 0x800000u;
+            if (e < 102u) u = s;
+            else {
+                unsigned sh = 126u - e, n = (mm + (1u << (sh - 1u)) - 1u + ((mm >> sh) & 1u)) >> sh;
+                u = s | __float_as_uint(__fmul_rn((float)n, 5.9604644775390625e-8f));
+            }
+        }
+        y[p.y_off + i] = __uint_as_float(u);
     }
 }
 
@@ -1300,7 +1315,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_ADD: case CC_EW_SWIGLU: if (!a || !b) return 0; break;
     case CC_EW_COMBINE: if (!(p->flags & 8) && !a) return 0; if ((p->flags & 1) && !b) return 0;
                         if ((p->flags & 2) && !cb) return 0; if ((p->flags & 4) && !e) return 0; if (p->D < 1) return 0; break;
-    case CC_EW_HC_LOW: case CC_EW_HC_INJ: case CC_EW_SCALE: if (!a) return 0; break;
+    case CC_EW_HC_LOW: case CC_EW_HC_INJ: case CC_EW_SCALE: case CC_EW_F16: if (!a) return 0; break;
     case CC_EW_HC_MIX: case CC_EW_HC_APPLY: if (!a || !b || p->D < 1 || p->C < 1) return 0; break;
     case CC_EW_GATE_ADD: if (!a || !b || !e || p->D < 1) return 0; break;
     /* Muse Spark's attention gate and residual gate: the kernel has had them since the
@@ -1522,6 +1537,7 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 }
 
 static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
+static int cc_kv16(void) { return 1; }   /* ew's F16 */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1537,5 +1553,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_w,
     cc_muse,
     cc_attn_w2,
+    cc_kv16,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

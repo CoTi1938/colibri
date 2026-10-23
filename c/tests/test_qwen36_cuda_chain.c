@@ -148,6 +148,7 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
 }
 
 int main(void) {
+    setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
     setenv("COLI_LMHEAD_GPU", "0", 1);
     setenv("COLI_DENSE_IDOT", "0", 1);          /* f32 activations on the CPU too: the chain's arithmetic */
@@ -180,7 +181,8 @@ int main(void) {
         int kv_ok = 1;
         for (int h = 0; h < KV; h++) {
             size_t off = (size_t)h * CAP * HD;
-            if (maxdiff(m.K[1] + off, ref.K[1] + off, (size_t)4 * HD) > 1e-4 || maxdiff(m.V[1] + off, ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
+            if (maxdiff((const float *)m.K[1] + off, (const float *)ref.K[1] + off, (size_t)4 * HD) > 1e-4 ||
+                maxdiff((const float *)m.V[1] + off, (const float *)ref.V[1] + off, (size_t)4 * HD) > 1e-4) kv_ok = 0;
         }
         ck(kv_ok, "the K/V rows reached the host cache as the CPU path wrote them");
     }
