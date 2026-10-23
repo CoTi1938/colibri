@@ -3783,7 +3783,9 @@ static int olmoe_edge_engine_open(
     capabilities->max_context_tokens = 4096;
     capabilities->num_layers = (uint32_t)config->n_layers;
     capabilities->bos_token_id = -1;
-    capabilities->eos_token_id = -1;
+    /* The stop the standalone chat arms (bos == eos == "|||IP_ADDRESS|||"). At -1 a
+     * Segment chat never stopped on its own and ran to its token limit. */
+    capabilities->eos_token_id = tok_id_of(&engine->tokenizer, "|||IP_ADDRESS|||");
     capabilities->resident_bytes = resident;
     *engine_impl = engine;
     return 0;
