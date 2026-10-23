@@ -995,6 +995,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
+        if (c0 > 0 && q36_chunk_control()) {   /* a STOP or CANCEL between two prompt chunks */
+            q36cc_dm_end(ch);
+            for (int i = 0; i < L; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+            ch->snap_valid = 0;
+            return 0;
+        }
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;

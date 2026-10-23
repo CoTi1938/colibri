@@ -5917,13 +5917,22 @@ static int trunk_probe_gpu_wins(Model *m){
     return wins;
 }
 
-/* Only single-slot CPU serve prefill supplies a control callback. Other
+/* Only single-slot serve prefill supplies a control callback. Other
  * forwards, including decode, speculation and Segment, never read stdin. */
 typedef struct {
     int (*poll)(void *ctx);
     void *ctx;
     int result;
 } Q36StepControl;
+
+/* The prompt's control for the chains (qwen36_chain.h, qwen36_cuda_chain.h): set by
+ * step_ex_control around their forward, polled between two prompt chunks. A chain that
+ * sees a STOP or CANCEL there returns 0 with control->result set: the chunks before it
+ * stand on the device, and step_ex_control drops the whole prompt (q36_prefill_abort). */
+static Q36StepControl *g_q36_ctl;
+static inline int q36_chunk_control(void) {
+    return g_q36_ctl && (g_q36_ctl->result = g_q36_ctl->poll(g_q36_ctl->ctx)) != 0;
+}
 
 static int layers_forward_control(Model *m, float *x, int S, int pos_base,
                                   int layer_begin, int layer_end,
@@ -6118,7 +6127,8 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
-    (void)chain_logit;
+    int stopped = 0;   /* a chain saw the prompt's control between two chunks */
+    (void)chain_logit; (void)stopped;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row. A partial chain
@@ -6130,8 +6140,12 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #endif
         if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
+        g_q36_ctl = control;
         chain_n = q36c_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        if (!chain_n) {
+        g_q36_ctl = NULL;
+        if (!chain_n && control && control->result) {   /* stopped between two prompt chunks */
+            free(chain_logit); chain_logit = NULL; stopped = 1;
+        } else if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36c_cpu_step(m, pos_base);
             /* Earlier chunks may have returned their final rows for Clef or
@@ -6143,15 +6157,19 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #endif
 #ifdef COLI_CUDA
     /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen36_cuda_chain.h), every layer */
-    if (g_cuda_chain && !chain_logit) {
+    if (g_cuda_chain && !chain_logit && !stopped) {
         int echo = 0, rows_only = 0;
 #ifndef QWEN36_NO_MAIN
         echo = g_echo_k > 0 && g_echo_id && S > 1;
 #endif
         if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
+        g_q36_ctl = control;
         chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        if (!chain_n) {
+        g_q36_ctl = NULL;
+        if (!chain_n && control && control->result) {
+            free(chain_logit); chain_logit = NULL; stopped = 1;
+        } else if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36cc_cpu_step(m, pos_base);
             for (int s = 0; s < S; s++)
@@ -6159,10 +6177,10 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
-    if (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
-                                               c->n_layers, 1, lf, control)) {
-        /* Some layers may have advanced, others not. Neither the previous
-         * prefix nor a partially processed prompt describes this state. */
+    if (stopped || (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
+                                                           c->n_layers, 1, lf, control))) {
+        /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
+         * the previous prefix nor a partially processed prompt describes this state. */
         q36_prefill_abort(m);
         free(x);
         if (lf) fclose(lf);
@@ -7480,17 +7498,14 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * the KV rows are position-indexed, so this has to be the real offset. */
     /* Keep all fresh rows in one pass through each layer, without adding
      * row-chunk traversals over streamed experts when the cache is small.
-     * Poll only the CPU text path; the other backends keep their own state and
-     * the multiplexed loop exclusively owns its command stream. */
+     * The CPU's layers poll between two layers (the device's matrices and the
+     * expert tier hold no state of the prompt), the Vulkan and CUDA chains
+     * between two prompt chunks (#2290: a client gone mid-prompt freed its slot
+     * only once the whole prompt was read). The multiplexed loop exclusively
+     * owns its command stream. */
     int interruptible = g_q36_mux_slots == 1 && q->logprobs == 0
                        && !getenv("DUMP_LAYERS") && !m->vis_rows
-                       && !qt_ready() && !qq_active();
-#ifdef COLI_VULKAN
-    if (g_vk_ready || vkt_ready()) interruptible = 0;
-#endif
-#ifdef COLI_CUDA
-    if (g_cuda_chain) interruptible = 0;
-#endif
+                       && !qq_active();
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
     int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;

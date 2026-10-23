@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -2439,11 +2440,15 @@ class DispatcherTest(unittest.TestCase):
             polls += 1
             return disconnected or polls > 20
 
-        with self.assertRaises(ClientCancelled):
+        log = io.StringIO()
+        with self.assertRaises(ClientCancelled), contextlib.redirect_stderr(log):
             engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: the departure and the freed slot are in the log
+        self.assertIn("the client left while the engine was generating", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_cancels_generation_before_first_frame(self):
         # #908: a client that disconnects while the engine is still prefilling
@@ -2477,17 +2482,22 @@ class DispatcherTest(unittest.TestCase):
                 outcome.append("cancelled")
 
         thread = threading.Thread(target=generate)
-        thread.start()
-        for _ in range(200):
-            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
-                break
-            time.sleep(0.01)
-        flag["cancelled"] = True
-        thread.join(timeout=2)
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            thread.start()
+            for _ in range(200):
+                if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                    break
+                time.sleep(0.01)
+            flag["cancelled"] = True
+            thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         engine.close()
         self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: a client gone while the prompt is read is named as such
+        self.assertIn("the client left while the engine was reading the prompt", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
