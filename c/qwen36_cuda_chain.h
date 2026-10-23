@@ -696,6 +696,14 @@ static void q36cc_mux_drop(Model *m) {
     for (int k = 0; k < ch->nconv; k++)
         if (!q36cc_conv_down(ch, m, &ch->conv[k])) { q36cc_mux_lost(m); return; }
 }
+/* q36c_pool_off's twin */
+static void q36cc_pool_off(Q36CChain *ch, Model *m) {
+    q36cc_mux_drop(m);
+    for (int k = 0; k < ch->nconv; k++) if (k != ch->conv_cur) q36cc_conv_free(m, &ch->conv[k]);
+    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1;
+    fprintf(stderr, "[chain] qwen36: a prompt's KV mirror does not fit beside the other conversations' state: "
+                    "each conversation's state goes through the host from here on\n");
+}
 static void q36cc_mux_leave(Model *m) {
     Q36CChain *ch = q36cc_of(m);
     if (ch && ch->conv && q36cc_pool_ok(ch)) { q36cc_conv_save(ch); return; }
@@ -1348,6 +1356,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         q36cc_conv_save(ch);
         mirror_ok = q36cc_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36cc_conv_load(ch, ch->conv_cur);
+        if (!mirror_ok) { q36cc_pool_off(ch, m); mirror_ok = q36cc_mirror(ch, m); }
     } else if (!ch->mx_rows) mirror_ok = q36cc_mirror(ch, m);
     if (!mirror_ok || !q36cc_scratch(ch, m, rows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
         (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN)) ||
