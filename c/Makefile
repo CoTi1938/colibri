@@ -3136,9 +3136,9 @@ tests/test_qgemv$(EXE): tests/test_qgemv.c
 # The float16 KV cache's rounding (kv16.h): the integer arithmetic the Vulkan shader and the
 # CUDA kernel use against the compiler's IEEE conversion, and the integer fallback's
 # conversions both ways. A rule each, so both are gates.
-tests/test_kv16$(EXE): tests/test_kv16.c kv16.h matmul_f32.h
+tests/test_kv16$(EXE): tests/test_kv16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_kv16_integer$(EXE): tests/test_kv16.c kv16.h matmul_f32.h
+tests/test_kv16_integer$(EXE): tests/test_kv16.c
 	$(CC) $(CFLAGS) -DKV16_INTEGER $< -o $@ $(LDFLAGS)
 
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
