@@ -2441,7 +2441,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
             expert_read(m,pl[i],pe[i],&tmp);
             VktExpertSrc src=k3_vk_src(m,pl[i],tmp.buf);
             XT(put)(pl[i],pe[i],&src);
-            free(tmp.base);
+            compat_aligned_free(tmp.base);   /* expert_read's posix_memalign: _aligned_malloc on Windows (compat.h), never free() (#2311) */
         }
         XT(put_done)();
         XT(warm_report)("kimi_k3", n, now_s() - t0);
@@ -4731,13 +4731,13 @@ static void kimi_segment_model_destroy(KimiSegmentEngine *engine) {
         if (model->ecache) {
             LCache *cache = &model->ecache[layer];
             for (int slot = 0; slot < cache->cap; slot++)
-                free(cache->s[slot].base);
+                compat_aligned_free(cache->s[slot].base);   /* expert_read's posix_memalign */
             free(cache->slot_by_expert); free(cache->s);
         }
     }
     for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
          slot++)
-        free(model->ws[slot].base);
+        compat_aligned_free(model->ws[slot].base);
     free(model->final_norm); free(model->out_sw);
     w_release_host(&model->lm_head);
     free(model->kstate); free(model->cwq); free(model->cwk); free(model->cwv);

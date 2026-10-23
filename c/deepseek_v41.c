@@ -5752,9 +5752,9 @@ static void vk_ram_given(void *ctx, size_t bytes) {
         if (cap < c->n_activated) cap = c->n_activated;
         if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
         if (cap > lc->cap) cap = lc->cap;
-        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back */
+        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back (posix_memalign'd: _aligned_malloc on Windows) */
             for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
-                free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
+                compat_aligned_free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
             }
         was = lc->cap; now = cap; lc->cap = cap;
     }
