@@ -6,6 +6,8 @@ Le fonti sono in inglese; le citazioni sono lasciate così per non tradurre male
 Come ho lavorato: ho aperto le pagine e copiato le frasi; le fonti principali
 (driver Linux, TechInsights, Oakley 2020 e 2025, Tom's Hardware, Samsung, Mac Performance Guide, Chen 2009 e 2011, Park 2026, Yang 2024, Queenie)
 le ho riaperte una seconda volta per controllare che le frasi ci fossero. Dove non ci sono riuscito lo dico accanto al fatto.
+Secondo giro sui buchi rimasti: ogni fatto nuovo è stato controllato riaprendo la pagina;
+sono entrati qui solo i fatti con la frase ritrovata sulla pagina.
 
 ## 1. Il controllore del disco degli M1 (ANS2)
 
@@ -88,11 +90,16 @@ Che cosa ne segue [D]:
   https://9to5mac.com/2022/07/14/m2-macbook-air-slower-ssd-base-model/
 - Un Air M1 da 256 GB misurato da Notebookcheck: 2798 MB/s in lettura, 2194 in scrittura [V]
   https://www.notebookcheck.net/M2-MacBook-Pro-13-with-256-GB-storage-has-a-33-50-slower-SSD-than-its-M1-equivalent.631793.0.html
-- TLC o no: **nessuna fonte primaria lo dice** per i pacchetti KICM225/KICM232/SDRGJHI4 [V, cercato in tre modi].
-  Un forum lo attribuisce a "96-layer 3D TLC BiCS" Kioxia, senza fonte [non verificato]:
+- TLC o no: **nessuna fonte primaria lo dice** per i pacchetti KICM225/KICM232 dell'Air [V, cercato in sei modi, anche in giapponese e cinese].
+  La pagina TechInsights non nomina il tipo di cella [V]. La marcatura SanDisk "SDRGJHI4" di iFixit non compare in nessun'altra fonte [V, cercato].
+  Il fratello maggiore sì: lo smontaggio del MacBook Pro 16" M1 Pro (2021, dati TechInsights) elenca "キオクシア 256GB 3D TLC NANDフラッシュメモリ 4個",
+  cioè quattro Kioxia 3D TLC da 256 GB [V] https://iphone-mania.jp/?p=472779
+  Un forum attribuisce all'Air "96-layer 3D TLC BiCS" Kioxia, senza fonte [S]:
   https://forums.appleinsider.com/discussion/233309/need-help-does-the-2023-m2-mac-mini-use-tlc-or-qlc-nand-flash-for-storage
-  Deduzione [D]: nel 2020 i pacchetti Kioxia/SanDisk da 128 GB erano BiCS a 3 bit per cella; Oakley scrive che "Most consumer SSDs store three bits per cell"
-  (vedi 1.4). Lo prendiamo per vero, ma resta una deduzione.
+  Il filo MacRumors sugli SSD saldati (tabella dei codici KICM per modello, pacchetti BGA110 "S5E") è irraggiungibile da qui (403) [S]:
+  https://forums.macrumors.com/threads/apple-silicon-soldered-ssd-upgrade-thread.2417822/
+  Deduzione [D]: Apple nel 2021 montava Kioxia 3D TLC sui Pro; nel 2020 i pacchetti Kioxia da 128 GB erano BiCS a 3 bit per cella;
+  Oakley scrive che "Most consumer SSDs store three bits per cell" (vedi 1.4). TLC per l'Air è molto probabile, ma resta una deduzione.
 
 ### 1.4 Howard Oakley (eclecticlight.co): misure e opinioni
 
@@ -160,7 +167,11 @@ Che cosa ne segue [D]:
   da 7 GB/s a "3.2 to 3.3 GB/sec"; "This looks like 2-tier flash behavior." [V] Mac Performance Guide, 19 giugno 2022.
   https://macperformanceguide.com/AppleMacStudioM1Ultra-SSD.html
   Un terzo di un disco quasi vuoto: è la regola del terzo dello spazio libero, su un SSD Apple [D].
+- MacBook Pro 2021 M1 Max, SSD da 4 TB, stesso metodo: "The plummet occurs at file 479 of 1000, equating to 1331 GiB = 1430GB, or about 35% of the 4TB flash drive.";
+  prima circa 7 GB/s, poi "3.2 to 3.3 GB/sec" [V] https://macperformanceguide.com/MacBookPro2021-SSD.html
+  L'autore nota che il 35 % non torna con un modello "1/3 veloce, 2/3 lento" puro; con la riserva nascosta e lo spazio già occupato torna meglio [D].
 - Mini M1 8 GB / 256 GB: "transfer performance dropped dramatically when using 16GB files" [V] (vedi 1.4).
+- Nessuno ha pubblicato una misura della cache su un Air o Pro da 256 o 512 GB: cercato su Notebookcheck, Max Tech, Reddit, MacRumors, forum fio [V, cercato; nulla].
 
 ### 2.3 Quando si svuota, e a che velocità
 
@@ -192,7 +203,7 @@ per più di mezz'ora. I tuoi 2,5-4 GB all'ora sono fuori scala rispetto ai primi
 - "Samsung's TurboWrite, as a point of comparison, was designed to work in a first-in, first-out (FIFO) fashion, with the static cache being filled first." [V]
   Tom's Hardware, recensione P41 (sopra).
 - Brevetto Silicon Motion US10740013B2 (2020): il controllore "selects three first SLC-data blocks, which have had valid data for the longest time (the oldest valid data)"
-  e li riprogramma in un blocco TLC [V; al secondo tentativo la pagina ha risposto 503, quindi non riaperta]
+  e "programs the data stored in the first SLC-data blocks into one of the TLC-spare blocks": tre blocchi SLC, i più vecchi, in un blocco TLC [V, riaperto e confermato]
   https://patents.google.com/patent/US10740013B2/en
 - Park 2026: alcuni dischi tengono "the oldest", altri "the newest" [V] (sezione 3).
 - Nessuna fonte parla di ordine per posizione (LBA) [D]. Gli schemi "per calore" esistono solo nella ricerca, non nei dischi in vendita [D, da Yang 2024].
@@ -207,6 +218,8 @@ per più di mezz'ora. I tuoi 2,5-4 GB all'ora sono fuori scala rispetto ai primi
   https://arxiv.org/pdf/2409.14360
 - Toshiba XL-FLASH (SLC): lettura sotto i 5 µs contro circa 50 µs del TLC 3D [S] https://www.anandtech.com/show/14707
 - Rassegna 2025: SLC 20-25 µs, TLC 66-170 µs, QLC 120-200 µs [S] https://arxiv.org/pdf/2507.10573
+- AnandTech, chip 3D TLC presentati all'ISSCC 2021: tempi di lettura (tR) da 40 a 58 µs secondo il produttore [S, sito irraggiungibile da qui]
+  https://www.anandtech.com/show/16491
 - Letture casuali più veloci dalla pSLC, su un disco dove si poteva spegnerla: "In random scenarios like this, the pSLC Cache significantly improved read performance." [V]
   https://theoverclockingpage.com/2024/08/23/the-impact-of-slc-cache-in-performance-of-an-nvme-ssd-benchmarks-and-results/?lang=en
 - Dati in SLC letti "artificialmente" veloci: Park 2026 [V] (sezione 3).
@@ -237,6 +250,22 @@ La Prova C del piano misura proprio questo.
 - Air M1 256 GB, Blackmagic (5 GB, quindi dentro la cache): 2190 MB/s in scrittura, 2676 in lettura [V]
   https://www.notebookcheck.net/M1-MacBook-Air-s-SSD-is-twice-as-fast-as-that-of-the-latest-Intel-based-model.504454.0.html
 - Nessuno ha pubblicato la grandezza della cache di un Air M1 da 256 GB, né una misura come la tua (latenza di lettura per zona) [D, cercato].
+
+### 2.8 Che cosa ha brevettato Apple (via Anobit)
+
+Un brevetto descrive un progetto possibile, non il firmware in vendita. Ma dice che cosa Apple sa fare e che parole usa.
+
+- US 8,886,990 B2, "Block management schemes in hybrid SLC/MLC memory" (Anobit, cessionario Apple; depositato 2012, concesso 2014):
+  l'area SLC fa da cache temporanea, "may be used for temporarily caching data received from the host, until the data is copied to its long-term destination address in MLC area 36";
+  "At a later point in time, the memory controller transfers the data from the SLC area for long-term storage in MLC area 36" [V]
+  https://patents.google.com/patent/US8886990B2/en
+  Nell'esempio l'area SLC è piccola (circa 50 blocchi contro circa 2000 MLC) e i blocchi di riserva stanno di preferenza in SLC [V, dal riassunto della pagina].
+- US 8,694,814 B1, "Reuse of host hibernation storage space by memory controller" (Anobit, cessionario Apple; 2010-2014):
+  "The SSD controller normally stores data using multiple bits per cell (MLC)" e, quando riconosce l'ibernazione,
+  "the SSD controller may switch to storing data using a SLC cache, which is later copied to MLC storage" [V]
+  https://patents.google.com/patent/US8694814
+- Nessun brevetto Apple trovato che parli di svuotamento a disco fermo, di ordine "i più vecchi prima" o di cache che segue lo spazio libero [V, cercato; nulla].
+  "Dynamic SLC/MLC blocks allocations" (US 8,407,400) è Micron, non Apple [V].
 
 ## 3. Ricavare l'interno di un SSD misurando da fuori
 

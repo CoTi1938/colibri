@@ -15,7 +15,8 @@ Niente è stato fatto sul Mac: qui ci sono solo lettura, conti, un piano e due s
 
 - Quello che hai misurato (77-80 µs contro 98-101 µs, zona di circa 10 GB che cala in ordine di scrittura
   a 2,5-4 GB/h) è coerente con una cache SLC svuotata in ordine di scrittura. Nessuna fonte lo conferma
-  per il disco Apple: nessuno lo ha misurato così. Le prove A-D lo chiudono.
+  per il disco Apple: nessuno lo ha misurato così, nemmeno dopo un secondo giro di ricerca. Le prove A-D lo chiudono.
+  Che le celle siano TLC resta una deduzione: i Pro M1 del 2021 montano Kioxia 3D TLC, per l'Air nessuno lo scrive.
 - Sfruttarla nel motore non vale la pena: al massimo 6 ms su 100 per passo, nella pratica 1-3, per poche ore,
   e con 13 GB liberi probabilmente meno. Le leve migliori sono la percentuale di hit in RAM e più letture in volo.
 
