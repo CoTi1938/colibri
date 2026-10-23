@@ -1073,6 +1073,11 @@ static int q36c_push_state(Q36Chain *ch, Model *m, int pos_base, int n_rows) {
             ch->kv_valid[i] = pos_base;
             continue;
         }
+        /* a ring rewound (a pin, a reused prefix shorter than what the device holds): its window
+         * before the step again from the host. A step uploads only the window's rows, so rows
+         * below a later window may never have reached the device, and a rewind reads them */
+        if (c->is_attn[i] && q36c_ring(m, i) && ch->kv_valid[i] > pos_base)
+            ch->kv_valid[i] = pos_base - c->window + 1 > 0 ? pos_base - c->window + 1 : 0;
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
         int t0 = ch->kv_valid[i], n = pos_base - t0, R = q36c_ring(m, i);
         if (R) {   /* a ring: the window's rows before pos_base, the host's ring rows into the same device rows */
@@ -1299,6 +1304,8 @@ static int q36c_mux_push(Q36Chain *ch, Model *m, int c0, int n) {
             v->dn_where = Q36C_BOTH;
         }
         for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+            if (c->is_attn[i] && q36c_ring(m, i) && v->kv_valid[i] > pos)   /* a ring rewound (q36c_push_state) */
+                v->kv_valid[i] = pos - c->window + 1 > 0 ? pos - c->window + 1 : 0;
             if (!c->is_attn[i] || v->kv_valid[i] >= pos) continue;
             int t0 = v->kv_valid[i], R = q36c_ring(m, i);
             if (R) {   /* a ring: the window's rows before pos */
