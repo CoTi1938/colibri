@@ -2311,6 +2311,40 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->eps       = (float)req_num(r,"rms_norm_eps");
     jval *th = json_get(r,"rope_theta"); c->theta = th ? (float)th->num : 10000.f;
     model_eos_json(json_get(r,"eos_token_id"));
+    /* A folder no colibri tool wrote has no qwen36_meta.json, and the defaults below are
+     * Qwen3.6's: an attention layer in four, Gated DeltaNet between. Another layout then
+     * stopped on a DeltaNet check that named nothing ("dn_vheads 0 / dn_kheads 0", #2321:
+     * Flint's MLX build). Said here instead: an MLX checkpoint (config.json's
+     * "quantization", group-affine weights packed in 32-bit words: the Apple Silicon
+     * build) is no format qwen36 reads, and a layer_types the defaults do not follow
+     * needs the converter. tools/make_qwen36_qpack_snap.py's views have the meta file. */
+    {
+        char meta[2048]; snprintf(meta, sizeof(meta), "%s/qwen36_meta.json", snap);
+        FILE *mf = fopen(meta, "rb");
+        if (mf) fclose(mf);
+        else {
+            jval *q = json_get(r, "quantization"), *mt = json_get(r, "model_type");
+            const char *type = mt && mt->t == J_STR ? mt->str : "?";
+            if ((q && q->t == J_OBJ) || json_get(r, "mlx_export")) {
+                fprintf(stderr, "[cfg] %s: an MLX checkpoint (model_type %s: group-affine weights packed in 32-bit words, "
+                                "the Apple Silicon build), which qwen36 does not read. Import a GGUF of the model "
+                                "(coli import <file>.gguf) or convert its original weights (tools/convert_qwen36.py); "
+                                "docs/qwen36.md -- refusing\n", snap, type);
+                exit(1);
+            }
+            jval *lt = json_get(r, "layer_types");
+            for (int i = 0; lt && lt->t == J_ARR && i < lt->len; i++) {
+                const char *k = lt->kids[i]->t == J_STR ? lt->kids[i]->str : "";
+                if (strcmp(k, i % 4 == 3 ? "full_attention" : "linear_attention")) {
+                    fprintf(stderr, "[cfg] %s: no qwen36_meta.json, and config.json's layer_types (model_type %s, layer %d "
+                                    "\"%s\") is not the Qwen3.6 layout the engine would assume. Convert the model with "
+                                    "tools/convert_qwen36.py, or import a GGUF of it (coli import <file>.gguf); "
+                                    "docs/qwen36.md -- refusing\n", snap, type, i, k);
+                    exit(1);
+                }
+            }
+        }
+    }
     free(buf); free(arena);
     model_eos_file(snap, "generation_config.json");
     /* Phase-1 defaults; overridden by qwen36_meta.json in load_meta.
@@ -2441,7 +2475,7 @@ static void load_meta(Cfg *c, const char *snap) {
      * every write below is bounded by this count, not by whatever the meta says. */
     const int is_attn_len = c->n_layers;
     char path[2048]; snprintf(path, sizeof(path), "%s/qwen36_meta.json", snap);
-    FILE *f = fopen(path, "rb"); if (!f) { printf("[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
+    FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf = malloc((size_t)n+1); if(!buf){fclose(f);return;}
     if(fread(buf,1,(size_t)n,f)!=(size_t)n){ free(buf); fclose(f); return; } buf[n]=0; fclose(f);
