@@ -1303,6 +1303,11 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_HC_LOW: case CC_EW_HC_INJ: case CC_EW_SCALE: if (!a) return 0; break;
     case CC_EW_HC_MIX: case CC_EW_HC_APPLY: if (!a || !b || p->D < 1 || p->C < 1) return 0; break;
     case CC_EW_GATE_ADD: if (!a || !b || !e || p->D < 1) return 0; break;
+    /* Muse Spark's attention gate and residual gate: the kernel has had them since the
+     * chain took Muse (cc_muse), but this switch refused them, so its every forward fell
+     * back to the host's step (tests/test_cuda_ew_ops_source.py) */
+    case CC_EW_SIGMUL: if (!a || !b) return 0; break;
+    case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
     default: return 0;
     }
     cc_ew_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
