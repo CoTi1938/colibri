@@ -1170,6 +1170,11 @@ typedef struct {
     int *ring_pos;
 } Q36Seq;
 typedef struct { Q36Seq *seq; int pos; } Q36Row;
+/* serve_mux's conversations (defined with it, below), for the chains that keep each
+ * conversation's state on the device (qwen36_chain.h, q36c_conv_*) */
+static int g_q36_mux_slots;
+static Q36Seq *g_q36_mux_seq;
+static int g_q36_mux_cur;
 
 typedef struct {
     Cfg c;
@@ -6098,6 +6103,7 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 static float *g_hidden_sink = NULL;
 
 #ifdef COLI_VULKAN
+static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: the chain swaps a conversation in to rebuild it */
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 static void q36_embed_row(Model *m, int id, int pos, float *row);
@@ -6414,9 +6420,23 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
         q36_embed_row(m, ids[s], INT_MAX, x + (int64_t)s*D);   /* never an image's row */
     }
     tier_rebuild_evicted(m);
-    m->mux_rows = rows;
-    layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
-    m->mux_rows = NULL;
+    float *chain_logit = NULL;
+#ifdef COLI_VULKAN
+    /* the Vulkan chain, each row's attention and DeltaNet on its conversation's state on the
+     * device (q36c_mux_step); else the host's path, every row's state on the host first */
+    if (g_vk_chain) {
+        chain_logit = falloc((int64_t)S * c->vocab);
+        if (!q36c_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36c_mux_host(m, rows, S, 0); }
+    }
+#endif
+    if (!chain_logit) {
+        m->mux_rows = rows;
+        layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
+        m->mux_rows = NULL;
+#ifdef COLI_VULKAN
+        if (g_vk_chain) q36c_mux_host(m, rows, S, 1);
+#endif
+    }
     for (int s = 0; s < S; s++) {
         Q36Seq *q = rows[s].seq;
         kv_prefix_record(&q->kvp, ids + s, rows[s].pos, 1);
@@ -6424,6 +6444,11 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
     }
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
+    if (chain_logit) {   /* the chain ran the final norm and lm_head */
+        q36_logits_out(c, chain_logit, (int64_t)S * c->vocab);
+        free(x);
+        return chain_logit;
+    }
     float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
     double _th = tm_now();
     for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
@@ -8049,7 +8074,7 @@ static void q36_mux_bind(Model *m, int slot){
     if (slot >= 0) q36_seq_swap(m, &g_q36_mux_seq[slot]);
     g_q36_mux_cur = slot;
 #ifdef COLI_VULKAN
-    if (g_vk_chain) q36c_mux_enter(m);
+    if (g_vk_chain) q36c_mux_enter(m, slot);
 #endif
 #ifdef COLI_CUDA
     if (g_cuda_chain) q36cc_mux_enter(m);
@@ -8120,6 +8145,9 @@ static void serve_mux(Model *m){
     int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
+#ifdef COLI_VULKAN
+    if (g_vk_chain) q36c_mux_init(m);   /* each conversation's state on the device while there is room */
+#endif
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */

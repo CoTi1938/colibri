@@ -1860,8 +1860,11 @@ flint_chain_serve() {
   for mode in 1 2; do
     COLI_VK_CHAIN=$mode CHAIN_SERVE_KV16=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
   done
-  # two conversations, the sliding layers' rings handed over with the rest
+  # two conversations, the sliding layers' rings in each one's place: one after the other,
+  # and at once (their decode rows in the same steps)
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain runs each conversation' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
 }
 family_qwen_chain() {
@@ -1935,10 +1938,23 @@ family_qwen_chain() {
   grep -q "the dense chain, 0 failures" prefill_control.log || fail "chain qwen36 prompt control"
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
-  # KV_SLOTS=2: the chain runs each conversation's prompts, the turns moving between the
-  # two (the device's state handed over at every change), the decode rows on the host's path
+  # KV_SLOTS > 1: each conversation's state on the device (qwen36_chain.h, q36c_conv_*). The
+  # turns moving between two conversations, one's prompt reused after the other's ran; then
+  # two and three at once, their decode rows in the same steps; then fewer places than
+  # conversations (COLI_VK_CHAIN_MUX): places handed over, steps on the host's path; then the
+  # device lost mid-step, every conversation's state rebuilt on the CPU (the text the CPU's)
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain runs each conversation' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  for n in 2 3; do
+    CHAIN_SERVE_SLOTS=$n CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+      $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=$n
+  done
+  for k in 0 1; do
+    CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
+      $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k
+  done
+  CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_TEXT=1 CHAIN_SERVE_EXPECT='rebuilding the state of' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_FAULT=120
   # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
   # between them at every turn's first decode step and next prompt
   CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json

@@ -81,6 +81,17 @@
 #define Q36C_DEV  1
 #define Q36C_BOTH 2
 
+/* KV_SLOTS > 1 (serve_mux): one conversation's state on the device, as the chain keeps
+ * the held one's (q36c_conv_*): its DeltaNet state and conv ring, its KV mirrors and
+ * their watermarks, and which side holds the newest DeltaNet state */
+typedef struct {
+    int slot;                                  /* the conversation's KV slot; -1: free */
+    VkcBuf **rec, **ring, **kc, **vc;          /* per layer, as Q36Chain's */
+    int *kv_valid;
+    int dn_where, host_zero, cap;
+    unsigned long long used;                   /* the step that last used it (least recently used goes first) */
+} Q36cConv;
+
 typedef struct {
     int ok, failed;
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
@@ -108,6 +119,12 @@ typedef struct {
     unsigned long long forwards, frames, host_ms_n;
     double wait_ms, host_ms;
     VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
+    /* KV_SLOTS > 1: the conversations' states (conv[conv_cur] is the held one's, whose
+     * arrays the fields above point at), and a multiplexed decode step's rows while it
+     * runs (q36c_mux_step: mx_rows set, each row's conversation in mx_conv) */
+    Q36cConv *conv; int nconv, conv_cur, conv_full;
+    unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps;
+    const Q36Row *mx_rows; Q36cConv **mx_conv;
 } Q36Chain;
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
@@ -731,25 +748,187 @@ static void q36c_cpu_one(Model *m, Q36Chain *ch, int pos_base) {
 static void q36c_cpu_step(Model *m, int pos_base) {
     for (int d = 0; d < 2; d++) q36c_cpu_one(m, q36c_of(m, d), pos_base);
 }
-/* KV_SLOTS > 1 (serve_mux): the chain runs the prompts of the conversation the Model
- * holds; the decode steps run every conversation's row on the host's path
- * (q36_step_rows). Before the held conversation leaves the Model its DeltaNet state
- * comes to the host, whose arrays are that conversation's until the swap; once
- * another one is held, nothing on the device is the new one's: its state goes up
- * from the host and every KV row again (q36c_push_state) at its next prompt. */
+/* ---- several conversations (KV_SLOTS > 1, serve_mux) ------------------------------
+ * The held conversation's state is the chain's own (the fields above, which point at
+ * its place); the others stay on the device beside it, in as many places as the device's
+ * free memory takes once the tier has its budget (COLI_VK_CHAIN_MUX caps the places beside the
+ * chain's own, as colibri's). A conversation the Model holds again finds its state where it left it, and
+ * a decode step runs every row whose conversation has a place in one forward
+ * (q36c_mux_step): the matrices once for all of them, each row's attention and DeltaNet on
+ * its own place. A conversation without a place takes the least recently used one, whose
+ * DeltaNet state goes to its host arrays first (its KV rows are the host's already).
+ * Without places (a second device, a partial chain, the KV split) the held conversation's
+ * DeltaNet state comes to the host when it leaves the Model, and the next one's state goes
+ * up from the host, every KV row again, at its next prompt. */
+static int q36c_pool_ok(Q36Chain *ch, Model *m) {
+    return ch && ch->ok && !ch->failed && g_q36_mux_slots > 1 && ch->d == 0 && !q36c_of(m, 1) &&
+           ch->lo == 0 && ch->n == m->c.n_layers && ch->head && !ch->ks.on;
+}
+static void q36c_conv_save(Q36Chain *ch) {
+    if (!ch->conv || ch->conv_cur < 0) return;
+    Q36cConv *v = &ch->conv[ch->conv_cur];
+    v->rec = ch->rec; v->ring = ch->ring; v->kc = ch->kc; v->vc = ch->vc; v->kv_valid = ch->kv_valid;
+    v->dn_where = ch->dn_where; v->host_zero = ch->host_zero; v->cap = ch->cap;
+}
+static void q36c_conv_load(Q36Chain *ch, int k) {
+    Q36cConv *v = &ch->conv[k];
+    ch->rec = v->rec; ch->ring = v->ring; ch->kc = v->kc; ch->vc = v->vc; ch->kv_valid = v->kv_valid;
+    ch->dn_where = v->dn_where; ch->host_zero = v->host_zero; ch->cap = v->cap;
+    ch->snap_valid = 0; ch->conv_cur = k;
+}
+/* A place's DeltaNet state into its conversation's host arrays (the Model's while it holds it) */
+static int q36c_conv_down(Q36Chain *ch, Model *m, Q36cConv *v) {
+    if (v->slot < 0 || v->dn_where != Q36C_DEV) return 1;
+    Cfg *c = &m->c;
+    float **rec = v->slot == g_q36_mux_cur ? m->DN_rec : g_q36_mux_seq[v->slot].DN_rec;
+    float **cv = v->slot == g_q36_mux_cur ? m->DN_conv : g_q36_mux_seq[v->slot].DN_conv;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    int ok = rec && cv;
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+        if (c->is_attn[i]) continue;
+        ok = vkc_read(v->rec[i], 0, rec[i], nr * sizeof(float)) && vkc_read(v->ring[i], 0, cv[i], nc * sizeof(float));
+    }
+    if (ok) v->dn_where = Q36C_BOTH;
+    return ok;
+}
+static void q36c_conv_free(Model *m, Q36cConv *v) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (v->rec) vkc_free(v->rec[i]); if (v->ring) vkc_free(v->ring[i]);
+        if (v->kc) vkc_free(v->kc[i]); if (v->vc) vkc_free(v->vc[i]);
+    }
+    free(v->rec); free(v->ring); free(v->kc); free(v->vc); free(v->kv_valid);
+    memset(v, 0, sizeof *v); v->slot = -1;
+}
+/* One more place, when the device has the room for it (and 512 MiB besides) */
+static int q36c_conv_new(Q36Chain *ch, Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, KV = c->kv_heads, kvd = c->k_head_dim;
+    const char *e = getenv("COLI_VK_CHAIN_MUX");   /* places beside the chain's own, as colibri's */
+    int most = e && *e ? 1 + atoi(e) : g_q36_mux_slots;
+    if (most > g_q36_mux_slots) most = g_q36_mux_slots;
+    if (ch->conv_full || ch->nconv >= most) return -1;
+    if (ch->cap != m->kv_cap && !q36c_mirror(ch, m)) return -1;   /* the rows a KV mirror takes */
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float);
+    size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float), need = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++)
+        need += c->is_attn[i] ? 2 * (size_t)KV * ch->kv_rows[i] * kvd * sizeof(float) : nr + nc;
+    size_t avail = vkc_dev_avail(), keep = (size_t)512 << 20;
+    Q36cConv v = {.slot = -1, .dn_where = Q36C_HOST, .cap = ch->cap};
+    int ok = need + keep <= avail;
+    if (ok) {
+        v.rec = calloc(L, sizeof *v.rec); v.ring = calloc(L, sizeof *v.ring);
+        v.kc = calloc(L, sizeof *v.kc); v.vc = calloc(L, sizeof *v.vc); v.kv_valid = calloc(L, sizeof(int));
+        ok = v.rec && v.ring && v.kc && v.vc && v.kv_valid;
+    }
+    for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+        if (c->is_attn[i]) {
+            size_t b = (size_t)KV * ch->kv_rows[i] * kvd * sizeof(float);
+            ok = (v.kc[i] = vkc_buf(b, VKC_DEV)) && (v.vc[i] = vkc_buf(b, VKC_DEV));
+        } else ok = (v.rec[i] = vkc_buf(nr, VKC_DEV)) && (v.ring[i] = vkc_buf(nc, VKC_DEV));
+    }
+    if (!ok) {
+        if (v.kv_valid) q36c_conv_free(m, &v);
+        ch->conv_full = 1;
+        fprintf(stderr, "[VK] qwen36 chain: the state of %d conversation%s stays on the device (one more takes %.2f GiB, "
+                        "%.2f GiB are free); the others' go through the host when they come back\n",
+                ch->nconv, ch->nconv == 1 ? "" : "s", need / 1073741824.0, avail / 1073741824.0);
+        return -1;
+    }
+    ch->conv[ch->nconv] = v;
+    return ch->nconv++;
+}
+/* slot's place: its own, a free one, a new one, or (evict) the least recently used one
+ * that this step does not use, its DeltaNet state to its host arrays first; -1 = none */
+static int q36c_conv_get(Q36Chain *ch, Model *m, int slot, int evict) {
+    for (int k = 0; k < ch->nconv; k++) if (ch->conv[k].slot == slot) return k;
+    int k = -1;
+    for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot < 0) k = j;
+    if (k < 0) k = q36c_conv_new(ch, m);
+    if (k < 0 && evict) {
+        for (int j = 0; j < ch->nconv; j++)
+            if (ch->conv[j].used != ch->conv_clock && (k < 0 || ch->conv[j].used < ch->conv[k].used)) k = j;
+        if (k < 0) return -1;
+        if (k == ch->conv_cur) q36c_conv_save(ch);
+        if (!q36c_conv_down(ch, m, &ch->conv[k])) return -1;
+        ch->conv_handed++;
+    }
+    if (k < 0) return -1;
+    Q36cConv *v = &ch->conv[k];   /* the conversation's state is the host's: it goes up at its next step */
+    v->slot = slot; v->dn_where = Q36C_HOST; v->host_zero = 0;
+    for (int i = 0; i < m->c.n_layers; i++) v->kv_valid[i] = 0;
+    return k;
+}
+/* serve_mux's start: the chain's own arrays become the held conversation's place */
+static void q36c_mux_init(Model *m) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!q36c_pool_ok(ch, m) || ch->conv || !(ch->conv = calloc((size_t)g_q36_mux_slots, sizeof *ch->conv))) return;
+    for (int k = 0; k < g_q36_mux_slots; k++) ch->conv[k].slot = -1;
+    ch->nconv = 1; ch->conv_cur = 0;
+    q36c_conv_save(ch);
+    ch->conv[0].slot = g_q36_mux_cur;
+}
+/* The device lost with places' DeltaNet state on it: each such conversation's state
+ * rebuilt on the CPU from its prefix record (q36c_recover, the conversation swapped in
+ * when the Model does not hold it) */
+static void q36c_mux_lost(Model *m) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!ch || !ch->conv) return;
+    q36c_conv_save(ch);
+    for (int k = 0; k < ch->nconv; k++) {
+        Q36cConv *v = &ch->conv[k];
+        if (v->slot < 0 || v->dn_where != Q36C_DEV) continue;
+        int held = v->slot == g_q36_mux_cur;
+        if (!held) q36_seq_swap(m, &g_q36_mux_seq[v->slot]);
+        q36c_recover(m, m->kv_len);
+        if (!held) q36_seq_swap(m, &g_q36_mux_seq[v->slot]);
+        v->dn_where = Q36C_HOST;
+    }
+}
+/* The held conversation leaves the Model: with places its state stays on the device;
+ * without, its DeltaNet state comes to the host (whose arrays are still its own) */
 static void q36c_mux_leave(Model *m) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (ch && ch->conv && q36c_pool_ok(ch, m)) { q36c_conv_save(ch); return; }
     for (int d = 0; d < 2; d++) q36c_cpu_one(m, q36c_of(m, d), m->kv_len);
 }
-static void q36c_mux_enter(Model *m) {
+/* slot is held now (-1: none, a decode step's turn): its place, or nothing on the device
+ * counts as its own */
+static void q36c_mux_enter(Model *m, int slot) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (ch && ch->conv && q36c_pool_ok(ch, m)) {
+        if (slot < 0) return;
+        ch->conv_clock++;   /* a new turn of the clock: no place is a step's now, any may be handed over */
+        int k = q36c_conv_get(ch, m, slot, 1);
+        if (k >= 0) { q36c_conv_load(ch, k); ch->conv[k].used = ch->conv_clock; return; }
+        q36c_recover(m, m->kv_len);   /* a place's state did not come back: the device is gone */
+        q36c_mux_lost(m);
+        return;
+    }
     for (int d = 0; d < 2; d++) {
-        Q36Chain *ch = q36c_of(m, d);
-        if (!ch || !ch->ok) continue;
-        ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
-            ch->kv_valid[i] = 0;
-            if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0);
+        Q36Chain *x = q36c_of(m, d);
+        if (!x || !x->ok) continue;
+        x->dn_where = Q36C_HOST; x->host_zero = 0; x->snap_valid = 0;
+        for (int i = x->lo; i < x->lo + x->n; i++) {
+            x->kv_valid[i] = 0;
+            if (m->c.is_attn[i]) vkc_kv_lower(&x->ks, x->attn_ord[i], 0);
         }
     }
+}
+/* A decode step on the host's path (q36_step_rows): every row's DeltaNet state on the host
+ * before (after = 0), the places' copies stale after it (after = 1) */
+static void q36c_mux_host(Model *m, const Q36Row *rows, int S, int after) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!ch || !ch->conv || !q36c_pool_ok(ch, m)) return;
+    q36c_conv_save(ch);
+    for (int s = 0; s < S; s++) {
+        int slot = (int)(rows[s].seq - g_q36_mux_seq);
+        for (int k = 0; k < ch->nconv; k++) {
+            Q36cConv *v = &ch->conv[k];
+            if (v->slot != slot) continue;
+            if (after) v->dn_where = Q36C_HOST;
+            else if (!q36c_conv_down(ch, m, v)) { q36c_mux_lost(m); return; }
+        }
+    }
+    if (ch->conv_cur >= 0) q36c_conv_load(ch, ch->conv_cur);
 }
 /* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
  * the device's copy in that slot; `len` positions stand, and the KV watermark comes
@@ -855,12 +1034,13 @@ static int q36c_attn_out(Q36Chain *ch, Model *m, Layer *l, int n) {
     }
     return vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
 }
-static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb) {
+/* The attention's rows before its cache: q, k and v, their norms and RoPE, K and V as the
+ * host's cache holds them */
+static int q36c_attn_qkv(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
-    int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
+    int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2;
     if (c->nope_layer && c->nope_layer[i]) half = 0;   /* Flint: a layer without RoPE */
-    const int win = c->win_layer && c->win_layer[i] ? c->window : 0;
     int ok = vkc_matmul(vk_qw_tensor(&l->q), ch->nrm, 0, ch->q, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->k), ch->nrm, 0, ch->k, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->v), ch->nrm, 0, ch->v, 0, n);
@@ -875,7 +1055,14 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
         VkcEw r = {VKC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
         ok = vkc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && vkc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
     }
-    if (!ok) return 0;
+    return ok;
+}
+static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb) {
+    Cfg *c = &m->c;
+    int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
+    int qo = H * qdim, kvo = KV * kvd, gate_dim = qdim > hd ? qdim - hd : 0, ok = 1;
+    const int win = c->win_layer && c->win_layer[i] ? c->window : 0;
+    if (!q36c_attn_qkv(ch, m, l, i, n)) return 0;
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
     if (ch->ks.on) {   /* the split: the rows into their window slots, the attention in two parts */
         VkcKvPart pk = {KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0, q36_kv16()},
@@ -964,6 +1151,97 @@ static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0,
     }
     return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
 }
+/* A multiplexed step's rows (ch->mx_rows from c0): the projections over all of them, each
+ * row's cache, attention and DeltaNet on its own conversation's place (one row each) */
+static int q36c_attention_mx(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0) {
+    Cfg *c = &m->c;
+    int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
+    int qo = H * qdim, kvo = KV * kvd, gate_dim = qdim > hd ? qdim - hd : 0;
+    const int win = c->win_layer && c->win_layer[i] ? c->window : 0, R = q36c_ring(m, i), rows = ch->kv_rows[i];
+    if (!q36c_attn_qkv(ch, m, l, i, n)) return 0;
+    size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
+    VkcRegion *rg = malloc(sizeof *rg * (size_t)KV);
+    int ok = rg && vkc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
+             vkc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);   /* the rows for the host */
+    for (int s = 0; s < n && ok; s++) {
+        Q36cConv *v = ch->mx_conv[c0 + s];
+        int pos = ch->mx_rows[c0 + s].pos;
+        for (int h = 0; h < KV; h++)
+            rg[h] = (VkcRegion){((size_t)h * rows + (R ? pos % R : pos)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        ok = vkc_copy_regions(v->kc[i], ch->k, rg, KV) && vkc_copy_regions(v->vc[i], ch->v, rg, KV);
+        VkcAttn a = {1, H, KV, hd, pos, rows, s * qo, qo, qdim, s * qo + hd, qo, qdim, gate_dim > 0, s * H * hd, H * hd, 0, 0,
+                     1.f / sqrtf((float)hd), 0, 0};
+        if (win || l->sinks) {
+            VkcAttnW w = {a, win, R, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+            ok = ok && vkc_attn_w(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w);
+        } else ok = ok && vkc_attn(ch->q, v->kc[i], v->vc[i], ch->ctx, ch->q, NULL, &a);
+    }
+    free(rg);
+    return ok && q36c_attn_out(ch, m, l, n);
+}
+static int q36c_deltanet_mx(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0) {
+    Cfg *c = &m->c;
+    int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim;
+    int ok = vkc_matmul(vk_qw_tensor(&l->dn_qkv), ch->nrm, 0, ch->qkv, 0, n) &&
+             vkc_matmul(vk_qw_tensor(&l->dn_z), ch->nrm, 0, ch->z, 0, n) &&
+             vkc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
+    for (int s = 0; s < n && ok; s++) {
+        Q36cConv *v = ch->mx_conv[c0 + s];
+        VkcDnConv cp = {1, CD, c->dn_convk, s * CD, CD, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+        VkcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
+                       vh + s * 2 * vh, 2 * vh, s * vd, vd, s * vd, vd, -1,
+                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
+                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+        ok = vkc_dnconv(ch->qkv, ch->prm, v->ring[i], ch->cv, NULL, &cp) &&
+             vkc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, v->rec[i], ch->prm, ch->dny, NULL, &rp);
+    }
+    return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
+}
+/* A multiplexed step's places, before its frame: a DeltaNet state the host holds goes up,
+ * and every KV row a place lacks below its row's position (the rows the host's path or a
+ * prompt wrote) */
+static int q36c_mux_push(Q36Chain *ch, Model *m, int c0, int n) {
+    Cfg *c = &m->c; int kvd = c->k_head_dim, KV = c->kv_heads, ok = 1;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int s = 0; s < n && ok; s++) {
+        Q36cConv *v = ch->mx_conv[c0 + s];
+        const Q36Seq *q = ch->mx_rows[c0 + s].seq;
+        int pos = ch->mx_rows[c0 + s].pos;
+        if (v->dn_where == Q36C_HOST) {
+            for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+                if (c->is_attn[i]) continue;
+                if (v->host_zero) ok = vkc_zero(v->rec[i], 0, nr) && vkc_zero(v->ring[i], 0, nc);
+                else ok = vkc_write(v->rec[i], 0, q->DN_rec[i], nr * sizeof(float)) &&
+                          vkc_write(v->ring[i], 0, q->DN_conv[i], nc * sizeof(float));
+            }
+            v->dn_where = Q36C_BOTH;
+        }
+        for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+            if (!c->is_attn[i] || v->kv_valid[i] >= pos) continue;
+            int t0 = v->kv_valid[i], R = q36c_ring(m, i);
+            if (R) {   /* a ring: the window's rows before pos */
+                if (t0 < pos - c->window + 1) t0 = pos - c->window + 1;
+                if (t0 < 0) t0 = 0;
+                for (int t = t0; t < pos && ok; ) {
+                    int r = t % R, run = pos - t < R - r ? pos - t : R - r;
+                    for (int h = 0; h < KV && ok; h++) {
+                        size_t at = ((size_t)h * R + r) * kvd;
+                        ok = q36c_kv_up(v->kc[i], at, q->K[i], (int64_t)at, (size_t)run * kvd) &&
+                             q36c_kv_up(v->vc[i], at, q->V[i], (int64_t)at, (size_t)run * kvd);
+                    }
+                    t += run;
+                }
+            } else
+                for (int h = 0; h < KV && ok; h++) {
+                    size_t src = ((size_t)h * m->max_t + t0) * kvd, dst = ((size_t)h * ch->kv_rows[i] + t0) * kvd;
+                    ok = q36c_kv_up(v->kc[i], dst, q->K[i], (int64_t)src, (size_t)(pos - t0) * kvd) &&
+                         q36c_kv_up(v->vc[i], dst, q->V[i], (int64_t)src, (size_t)(pos - t0) * kvd);
+                }
+            v->kv_valid[i] = pos;
+        }
+    }
+    return ok;
+}
 static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
     int ok = 1, SI = l->sh_I;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
@@ -998,6 +1276,19 @@ static void q36c_kv_down(Q36Chain *ch, Model *m, int i, int n, int pb) {
     if (!c->is_attn[i]) return;
     const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
     const int R = q36c_ring(m, i);
+    if (ch->mx_rows) {   /* a multiplexed step: each row into its own conversation's cache */
+        for (int s = 0; s < n; s++) {
+            Q36Seq *q = ch->mx_rows[s].seq;
+            int pos = ch->mx_rows[s].pos;
+            for (int h = 0; h < c->kv_heads; h++) {
+                size_t dst = q36_kv_at(m, i, h, pos), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+                q36_kv_put(q->K[i], (int64_t)dst, kv + src, c->k_head_dim);
+                q36_kv_put(q->V[i], (int64_t)dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim);
+            }
+            if (R && q->ring_pos) q->ring_pos[pos % R] = pos;
+        }
+        return;
+    }
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
             size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
@@ -1061,7 +1352,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     Cfg *c = &m->c; int D = c->hidden, L = ch->n, lo = ch->lo, hi = lo + L, E = c->n_experts;   /* L: the layers on the device */
     int part = hi < c->n_layers || !ch->head;
     if (part) { want_x = 1; nlogits = 0; }   /* the residual comes back; the CPU runs the rest and the head */
-    int mirror_ok = q36c_mirror(ch, m);
+    int mirror_ok = ch->mx_rows ? 1 : q36c_mirror(ch, m);   /* a multiplexed step's places are mirrored (q36c_mux_step) */
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int half = c->rotary_dim / 2;
@@ -1095,17 +1386,18 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
-            !q36c_push_state(ch, m, pb, n)) goto lost;
+            !(ch->mx_rows ? q36c_mux_push(ch, m, c0, n) : q36c_push_state(ch, m, pb, n))) goto lost;
         if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
         if (half) {   /* the CPU's own angles, cosines and sines (rope_head_partial / _mrope) */
             float *cs = (float *)vkc_ptr(ch->cs);
             for (int s = 0; s < n; s++) {
-                int p3[3]; int mr = m->mpos || m->rope_delta;
+                int p3[3]; int mr = !ch->mx_rows && (m->mpos || m->rope_delta);
+                int at = ch->mx_rows ? ch->mx_rows[c0 + s].pos : pb + s;   /* a multiplexed row: its own position */
                 if (mr) mrope_at(m, pb + s, p3);
                 for (int j = 0; j < half; j++) {
                     float inv = powf(c->theta, -2.0f * j / c->rotary_dim);
                     int axis = !mr ? 0 : (j % 3 == 1 && j < 3 * c->mrope_section[1]) ? 1 : (j % 3 == 2 && j < 3 * c->mrope_section[2]) ? 2 : 0;
-                    float ang = (mr ? p3[axis] : pb + s) * inv;
+                    float ang = (mr ? p3[axis] : at) * inv;
                     cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
                 }
             }
@@ -1118,7 +1410,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - 1 - lo) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
-            ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n, c0, ns));
+            if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36c_attention_mx(ch, m, l, i, n, c0) : q36c_deltanet_mx(ch, m, l, i, n, c0));
+            else ok = ok && (c->is_attn[i] ? q36c_attention(ch, m, l, i, n, pb) : q36c_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = vkc_copy(ch->lfd, (size_t)(i - lo) * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             if (c->muse) {   /* Muse Spark: the branch normalised, then the residual gate */
@@ -1203,8 +1496,16 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         for (int i = lo; i < hi; i++) if (E == 0 || q36_dense_l(c, i)) q36c_kv_down(ch, m, i, n, pb);
         if (dmoe) q36c_dmoe_done(ch, m, from, hi, n, pb);
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
-        ch->dn_where = Q36C_DEV; ch->host_zero = 0;
+        if (ch->mx_rows)   /* each row's place: its row on the device, its DeltaNet state there only */
+            for (int s = 0; s < n; s++) {
+                Q36cConv *v = ch->mx_conv[c0 + s];
+                for (int i = lo; i < hi; i++) if (c->is_attn[i]) v->kv_valid[i] = ch->mx_rows[c0 + s].pos + 1;
+                v->dn_where = Q36C_DEV; v->host_zero = 0;
+            }
+        else {
+            for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
+            ch->dn_where = Q36C_DEV; ch->host_zero = 0;
+        }
         if (last && !part) memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
     if (lf) fwrite(vkc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
@@ -1217,9 +1518,57 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     vkc_gemm_rows(-1);
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(ch->d); }
     vkc_device(0);
-    q36c_recover(m, pos_base);
+    if (!ch->mx_rows) q36c_recover(m, pos_base);   /* the held conversation (none in a multiplexed step) */
+    g_vk_chain = 0; ch->failed = 1;
+    if (ch->conv) q36c_mux_lost(m);                /* the others with their state on the device */
     *lost = 1;
     return 0;
+}
+
+/* place k's KV mirrors at the host's capacity (a place made before the first prompt) */
+static int q36c_conv_mirror(Q36Chain *ch, Model *m, int k) {
+    if (ch->conv[k].cap == m->kv_cap) return 1;
+    int cur = ch->conv_cur;
+    q36c_conv_save(ch);
+    q36c_conv_load(ch, k);
+    int ok = q36c_mirror(ch, m);
+    q36c_conv_save(ch);
+    if (cur >= 0) q36c_conv_load(ch, cur);
+    return ok;
+}
+/* One decode step of several conversations in the chain (serve_mux, KV_SLOTS > 1): row s is
+ * the token whose embedding is xh's row s, at rows[s].pos of rows[s].seq, every conversation
+ * parked. The matrices and the routed experts run once over the S rows, each row's
+ * attention and DeltaNet on its conversation's place; the K/V rows go to each conversation's
+ * host cache, its DeltaNet state stays on the device. 1 = done, logit holds S rows; 0 = the
+ * host's path runs the step (a conversation without a place, an image turn's rope positions,
+ * the device lost: every place's state is the host's again then). */
+static int q36c_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!g_vk_chain || !ch || !ch->conv || !q36c_pool_ok(ch, m) || S < 1 || S > q36c_chunk_rows(ch, m)) return 0;
+    for (int s = 0; s < S; s++) if (rows[s].seq->mpos || rows[s].seq->rope_delta) return 0;
+    Q36cConv **e = malloc((size_t)S * sizeof *e);
+    if (!e) return 0;
+    q36c_conv_save(ch);
+    ch->conv_clock++;
+    int ok = 1;
+    for (int s = 0; s < S && ok; s++) {
+        int k = q36c_conv_get(ch, m, (int)(rows[s].seq - g_q36_mux_seq), 1);
+        if ((ok = k >= 0)) { ch->conv[k].used = ch->conv_clock; e[s] = &ch->conv[k]; }
+    }
+    for (int s = 0; s < S && ok; s++) ok = q36c_conv_mirror(ch, m, (int)(e[s] - ch->conv));
+    int n = 0, ro = 0, lost = 0;
+    if (ok) {
+        ch->mx_rows = rows; ch->mx_conv = e;
+        n = q36c_forward_seg(m, ch, xh, S, 0, NULL, 0, S, logit, &ro, &lost);
+        ch->mx_rows = NULL; ch->mx_conv = NULL;
+    }
+    free(e);
+    if (lost) return 0;
+    if (ch->conv_cur >= 0) q36c_conv_load(ch, ch->conv_cur);
+    if (n) { ch->mux_steps++; ch->mux_rows += (unsigned long long)S; }
+    else ch->mux_host_steps++;
+    return n > 0;
 }
 
 /* Every layer the chains hold for S rows from host rows xh, the last row's logits into
@@ -1272,6 +1621,12 @@ static void q36c_report(Model *m) {
                         "the routed experts in the frame (%llu of them a prompt chunk's, %llu in the integer form), %.1f MiB on the device\n",
                 q36c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
                 ch->dm.steps, ch->dm.big_steps, st.moe_i8, st.dev_bytes / 1048576.0);
+        if (ch->conv)
+            fprintf(stderr, "[VK] %s chain: KV_SLOTS=%d: %llu decode steps of several conversations in the chain (%llu rows, "
+                            "%.2f a step), %llu on the host's path; %d conversation%s state on the device, %llu handed over\n",
+                    q36c_name(ch), g_q36_mux_slots, ch->mux_steps, ch->mux_rows,
+                    ch->mux_steps ? (double)ch->mux_rows / (double)ch->mux_steps : 0.0, ch->mux_host_steps,
+                    ch->nconv, ch->nconv == 1 ? "'s" : "s'", ch->conv_handed);
         vkc_kv_report(&ch->ks);
         vkc_dmoe_hyb_report(q36c_name(ch), &ch->dm);
         vkc_prof_print();

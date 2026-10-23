@@ -16,6 +16,10 @@ session's stderr must match (a lost device's rebuild, say, with COLI_VK_CHAIN_FA
 usage: vulkan_chain_serve.py <engine> <snapshot> [KEY=VALUE ...]   (extra environment)
 COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 runs
 prompts on the device and decode on the CPU, the state moving between them).
+CHAIN_SERVE_PAIRS=1 with CHAIN_SERVE_SLOTS=n sends the turns n at a time, one a slot,
+together: their decode rows run in the same steps (several conversations in one forward).
+CHAIN_SERVE_TEXT=1 compares each frame's kind, id and text only (a device lost mid-session:
+the state rebuilt on the CPU sums in another order, the numbers move in their last digits).
 CHAIN_SERVE_BACKEND=cuda runs the chain session on the CUDA chain instead (COLI_CUDA=1).
 CHAIN_SERVE_DIALECT picks the SUBMIT header: unset, ids r0, r1, ... and the options
 straight after top_p (what the qwen engines have always been sent); "numeric", ids 1,
@@ -75,6 +79,8 @@ def session(engine, snap, extra, chain):
     if os.environ.get("CHAIN_SERVE_CONTINUE") == "1":
         turns.append(None)
     nslots = int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
+    if os.environ.get("CHAIN_SERVE_PAIRS") == "1" and nslots > 1:
+        return pairs(p, err, turns, nslots)
     interleave = os.environ.get("CHAIN_SERVE_INTERLEAVE") == "1" and nslots > 1
     sched = []   # (turn index, slot); -1: a foreign turn on another slot between two of slot 0's
     for i in range(len(turns)):
@@ -120,15 +126,55 @@ def session(engine, snap, extra, chain):
     return out, b"".join(err).decode(errors="replace")
 
 
+def pairs(p, err, turns, nslots):
+    """CHAIN_SERVE_PAIRS=1: the turns go nslots at a time, one a slot, written together, so
+    the engine prefills them one after the other and decodes their rows in the same steps
+    (several conversations in one forward). The frames come in the engine's order, which
+    the CPU's session and the chain's share."""
+    turns = [t for t in turns if t is not None]
+    out = []
+    for k in range(0, len(turns), nslots):
+        group = turns[k:k + nslots]
+        wire = b""
+        for j, (prompt, max_tok, ext) in enumerate(group):
+            hdr = f"SUBMIT r{k + j} {j} {len(prompt)} {max_tok + 8 * j} 0 1" + (f" {ext}" if ext else "") + "\n"
+            wire += hdr.encode() + prompt + b"\n"
+        p.stdin.write(wire)
+        p.stdin.flush()
+        done = 0
+        while done < len(group):
+            line = p.stdout.readline()
+            if not line:
+                sys.exit("engine died:\n" + b"".join(err).decode(errors="replace")[-3000:])
+            kind = line.split(b" ", 1)[0]
+            if kind in (b"DATA", b"ECHO"):
+                body = p.stdout.read(int(line.split()[2]))
+                p.stdout.readline()
+                out.append(line.rstrip() + b" " + body)
+            elif kind == b"DONE":
+                out.append(b"DONE " + line.split()[1])
+                done += 1
+            elif kind == b"ERROR":
+                sys.exit(f"engine error: {line!r}")
+    p.stdin.close()
+    p.wait(timeout=120)
+    return out, b"".join(err).decode(errors="replace")
+
+
 KV16 = os.environ.get("CHAIN_SERVE_KV16") == "1"
 TOL = float(os.environ.get("CHAIN_SERVE_TOL", "5e-3" if KV16 else "1e-4"))
 WORST = [0.0]
+
+
+TEXT = os.environ.get("CHAIN_SERVE_TEXT") == "1"
 
 
 def close(a, b):
     if a == b:
         return True
     fa, fb = a.split(b" "), b.split(b" ")
+    if TEXT:   # the frame's kind, id and text; its numbers may differ (a state rebuilt on the CPU)
+        return len(fa) == len(fb) and fa[:2] == fb[:2] and fa[-1] == fb[-1]
     if len(fa) != len(fb):
         return False
     for x, y in zip(fa, fb):

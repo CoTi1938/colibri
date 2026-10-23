@@ -1765,7 +1765,24 @@ rebuilds the KDA state on the CPU from the input rows the chain records since th
 copy was last current (embedding rows, or the vision tower's), a prefill's worth of CPU
 work.
 
-**Several conversations at once (the other engines).** qwen36, qwen38, OLMoE, Inkling,
+**Several conversations at once (qwen36).** With `KV_SLOTS` above 1 the chain keeps each
+conversation's state on the device (its KV mirrors, DeltaNet state and conv ring), in as
+many places as the device's free memory takes once the expert tier has its budget
+(`COLI_VK_CHAIN_MUX` caps them). A prompt runs on the chain in its conversation's place,
+which keeps its state for the next turn; a decode step runs one row of every active
+conversation in one forward, the projections, the router and the routed experts over all
+the rows, each row's attention and DeltaNet on its own place, its new K/V rows to its
+conversation's host cache. A conversation without a place takes the least recently used
+one (that conversation's DeltaNet state goes to the host first); a step with a row whose
+conversation has no place runs on the host's path. A device lost mid-step rebuilds every
+conversation's state that was on the device from its prefix record, on the CPU. The end
+of a turn prints `[VK] qwen36 chain: KV_SLOTS=n: s decode steps of several conversations
+in the chain (r rows, ... a step), h on the host's path; p conversations' state on the
+device, e handed over`. The second device's chain, a partial chain and the KV split keep
+the older way: the chain runs each conversation's prompts, its state handed over through
+the host when the conversation changes, and the decode steps run on the host's path.
+
+**Several conversations at once (the other engines).** qwen38, OLMoE, Inkling,
 Kimi K3, MiMo, DeepSeek V4 and V4.1 decode `KV_SLOTS`' conversations together too, but
 their dense chain keeps one conversation's state on the device, so it stays off with
 more than one slot (a `[VK] <engine>: KV_SLOTS=n: the dense chain is off` line says
