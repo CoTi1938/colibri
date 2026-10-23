@@ -90,7 +90,7 @@ $env:SNAP = "$env:TEMP\vkprobe"; $env:COLI_VULKAN = "1"; $env:COLI_NO_OMP_TUNE =
 |---|---|---|
 | Routed experts | on with `COLI_VULKAN=1` (`COLI_VK_TIER=0` turns it off) | The shared routed-expert tier ([below](#the-routed-expert-tier-vk_tierc)): warm from `.coli_usage` at startup, then adapting while you chat, under a budget (`COLI_VK_TIER_GB`). The resident experts of each MoE step, prefill included, run as one async batch while the CPU loads and computes the others; they need **no RAM slot and no disk read**. Shown as the `vk` bucket in the hit-rate line, and in a `[VK] tier colibri run:` line at exit. `COLI_VK_EXPERTS=N`, the fixed top-N set this engine used to upload, is a deprecated alias: N caps the tier at N experts, `0` turns it off. |
 | Dense projections | `COLI_VK_DENSE=1` | q_a+kv_a fused into one submit, q_b, o; shared expert as a single fused expert-group submit. Resident int4/int8 weights upload once. |
-| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. |
+| MLA attention core | `COLI_VK_ATTN=1` | One dispatch per layer: absorbed query, scores over the KV window, softmax, weighted latent, value rows, **fused with the o-projection** (the context vector never leaves the GPU). The latent/rope KV lives in a persistent per-layer device mirror, appended ~2.3 KB/token/layer with the same invalidation points as the CUDA KV shadow. The mirror grows with the conversation (256 rows a layer, then powers of two up to the context), filled again from the host when it grows; a layer the device has no room for computes its attention on the CPU, and one line says so. |
 
 The `PIN_GB=0` (with `PIN` still set) in the example is deliberate: the expert
 tier warms from the same history a RAM pin would, so the pin's RAM is better
@@ -943,7 +943,9 @@ fixed set it replaces served S <= 4 only.
   deprecated alias: `N` caps the tier at N experts, `0` turns it off as `COLI_VK_TIER=0`
   does, and a line says so. `COLI_VK_RESERVE_GB` (the old reserve, 3 GB) adds what it
   asks beyond `COLI_VK_TIER_RESERVE_GB`. With `COLI_VK_ATTN=1` the absorb core's KV
-  mirror (`CTX` rows a layer) is reserved too. The dense set (`COLI_VK_DENSE=1`) is
+  mirror (`CTX` rows a layer) is reserved too, at most half of what the device has free:
+  the gateway's automatic context (131072 tokens on a large RAM) asked GLM-5.3 for 23.6 GB
+  of mirror on a 24 GB card and left the tier no expert (#2314). The dense set (`COLI_VK_DENSE=1`) is
   uploaded before the tier sizes itself, so the budget is what remains; the trunk's
   default here stays off. On an integrated GPU the tier takes its default share of RAM
   after the expert cache's (the startup reservation of the fixed set is gone).
