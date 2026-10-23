@@ -105,6 +105,12 @@ dho_family_glm() {
   # activations), the expert containers, prefill, the DSA selection, drafts
   for cap in 1 64; do dho_mla_gate colibri "dense-only colibri f32 cap=$cap" 1 SNAP=glm_tiny REF=ref_glm.json -- $cap 16 16; done
   dho_mla_gate colibri "dense-only colibri f32 prefill, chunks of 3" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
+  # KV16: the latent cache in float16 on the CPU and in the chain (which rounds its new rows
+  # alike before its attention reads them), and beside the COLI_VK_ATTN mirror. Tokens only:
+  # a value the CPU and the device compute a few bits apart can round to two halves an ulp
+  # apart (about 1e-3 in a logit, measured 8.7e-4 on the RTX), past the float32 gates' 1e-4
+  dho_mla_gate colibri "dense-only colibri KV16" 0 SNAP=glm_tiny REF=ref_glm.json KV16=1 -- 64 16 16
+  dho_mla_gate colibri "dense-only colibri KV16 prefill, chunks of 3" 0 SNAP=glm_tiny REF=ref_glm.json KV16=1 TF=1 COLI_VK_CHAIN_ROWS=3 -- 64 16 16
   for b in 8 4 3; do
     dho_mla_gate colibri "dense-only colibri ${b}-bit trunk and experts" 1 SNAP=glm_tiny REF=ref_glm.json IDOT=0 -- 2 $b $b
   done
@@ -121,6 +127,7 @@ dho_family_glm() {
   dho_mla_gate colibri "dense-only colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   dho_mla_gate colibri "dense-only colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
   dho_mla_gate colibri "dense-only colibri beside COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 -- 2 4 4
+  dho_mla_gate colibri "dense-only colibri KV16 beside COLI_VK_ATTN=1" 0 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 KV16=1 -- 2 4 4
   # prompts only: decode runs per matrix on the device; kv_b and the indexer stay on the
   # host (the CPU's attention reads them by row)
   CHAINMODE=2 dho_mla_gate colibri "dense-only colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
@@ -141,6 +148,9 @@ dho_family_glm() {
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
+  # the latent cache in float16, as a serve keeps it (two KV slots: the adoption of float16 rows)
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='latent KV cache in float16' CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2
   CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4
   # the steps the chain does not take (MUX=0): per matrix on the device, kv_b on the host
   CHAIN_MUX_EXPECT="$CHAIN_SERVE_EXPECT" CHAIN_MUX_STEPS=0 $PY tests/vulkan_chain_mux.py ./colibri glm_tiny_serve 3 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=0

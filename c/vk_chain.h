@@ -308,6 +308,8 @@ typedef struct {
     ColiVkTensor *o;              /* [D x H*V]; NULL: the context stays in s->ctx */
     VkcBuf *prm;                  /* the norm weights: q latent at q_norm (unused with q_lora 0), */
     size_t q_norm, kv_norm;       /*   kv latent at kv_norm (floats) */
+    int kv16;                     /* the new latent and rope rows rounded to float16 as they are written
+                                   * (the host keeps them in float16: colibri's KV16) */
 } VkcMla;
 typedef struct { VkcBuf *qa, *q, *kv, *qabs, *clat, *ctx; int rows; } VkcMlaScratch;
 typedef struct { VkcBuf *lat, *rope; int cap; } VkcMlaCache;   /* [cap][K] and [cap][R] (rope NULL with R 0) */
