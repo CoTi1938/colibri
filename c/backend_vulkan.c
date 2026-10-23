@@ -371,8 +371,10 @@ typedef struct { int bm, bn, wm, wn, bk; } VkCoopTile;
 
 /* Persistent device-side KV latent/rope cache for one layer (MLA attention).
  * Host appends rows as tokens decode (absolute-position indexing); the absorb
- * kernel reads them in place. Allocated once at max_t rows, like the CUDA
- * kv_dev shadow. */
+ * kernel reads them in place. It grows with the conversation (coli_vk_kv_grow),
+ * as the dense chain's mirror does: allocated at max_t rows, a 20-token chat with
+ * the gateway's 131072 tokens of context asked GLM-5.3's 79 layers for 23.6 GB on
+ * a 24 GB card, and every layer past the first ~40 failed at every token (#2314). */
 #define VK_KV_LAYERS 160
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
@@ -3344,10 +3346,7 @@ static int alloc_dev(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
 
-int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
-    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
-    VkKvLayer *v = &G.kv[layer];
-    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+static int kv_layer_alloc(VkKvLayer *v, int max_rows, int K, int Rd) {
     float p0 = G.prio; G.prio = 1.0f;            /* KV mirror rides every attention submit */
     int ok1, ok;
     if (g_up[0].on) {   /* staged: device-local, the rows through PW */
@@ -3364,6 +3363,43 @@ int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
     }
     v->rows = max_rows; v->K = K; v->R = Rd;
     return 1;
+}
+static void kv_layer_free(VkKvLayer *v) {
+    if (v->bl && G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
+        vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
+        vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
+    }
+    memset(v, 0, sizeof(*v));
+}
+int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+    return kv_layer_alloc(v, max_rows, K, Rd);
+}
+/* The least rows a layer's mirror could not get (0: none yet): no mirror that large is
+ * asked for again until coli_vk_kv_reset, so a full device costs one refusal, not one
+ * per layer and token. */
+static int g_kv_refused;
+int coli_vk_kv_grow(int layer, int need, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || need < 1 || max_rows < need || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl && v->rows >= need && v->K == K && v->R == Rd) return 1;
+    int cap = 256;
+    while (cap < need) cap *= 2;
+    if (cap > max_rows) cap = max_rows;
+    if (g_kv_refused && cap >= g_kv_refused) return 0;
+    /* the old rows go first (their pending copies with them): the new size needs the room */
+    if (v->bl) { if (PW.n && !pw_flush()) return 0; kv_layer_free(v); }
+    PW.last1[layer] = 0;
+    if (!kv_layer_alloc(v, cap, K, Rd)) {
+        if (!g_kv_refused)
+            fprintf(stderr, "[VK] attention KV mirror: no room on the device for %d rows a layer (layer %d); a layer "
+                            "whose rows do not fit computes its attention on the CPU\n", cap, layer);
+        g_kv_refused = cap;
+        return 0;
+    }
+    return 2;
 }
 
 /* Mirror one host cache row into the device copy (write-combined memory: the CPU
@@ -3387,15 +3423,8 @@ int coli_vk_kv_row(int layer, int pos, const float *L, const float *R) {
 /* Drop all per-layer KV device caches (cache resize in kv_alloc). */
 void coli_vk_kv_reset(void) {
     if (PW.n) pw_flush();   /* nothing pending may name a buffer that goes */
-    for (int i = 0; i < VK_KV_LAYERS; i++) {
-        VkKvLayer *v = &G.kv[i];
-        if (!v->bl) continue;
-        if (G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
-            vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
-            vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
-        }
-        memset(v, 0, sizeof(*v));
-    }
+    for (int i = 0; i < VK_KV_LAYERS; i++) if (G.kv[i].bl) kv_layer_free(&G.kv[i]);
+    g_kv_refused = 0;
 }
 
 /* Decode MLA absorption core for S causal query rows of one sequence, one submit:
@@ -6592,6 +6621,7 @@ static int run_expert_group(int fmt, int D, int I, int K) {
  * qabs = sum_d q[d]*deq(row rbase+d)*ws, scores over cache rows [st0, T-S+s],
  * softmax, weighted latent, value-row projection. */
 static int g_absorb_rewind;   /* write every row twice, first garbage: a rewound mirror */
+static int g_absorb_grow;     /* the mirror grown a row at a time (coli_vk_kv_grow), as colibri's decode does */
 static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0, int T, int layer) {
     size_t rb = ref_rowbytes(fmt, K);
     int O = H * (Q + V), ngK = (K + 63) / 64;
@@ -6606,14 +6636,24 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (int i = 0; i < T * K; i++) L[i] = (rand() % 200 - 100) / 100.0f;
     for (int i = 0; i < T * R; i++) Rr[i] = (rand() % 200 - 100) / 100.0f;
     float scale = 0.13f;
-    if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
+    if (g_absorb_grow) {   /* 256 rows, then 512, 1024 and T: each new buffer filled again from row 0 */
+        int valid = 0, grown = 0;
+        for (int t = 0; t < T; t++) {
+            int g = coli_vk_kv_grow(layer, t + 1, T, K, R);
+            if (!g) { printf("kv_grow failed at row %d\n", t); return 1; }
+            if (g == 2) { valid = 0; grown++; }
+            for (; valid <= t; valid++)
+                if (!coli_vk_kv_row(layer, valid, L + (size_t)valid * K, Rr + (size_t)valid * R)) { printf("kv_row failed\n"); return 1; }
+        }
+        if (grown != 4) { printf("kv_grow: %d buffers for %d rows, not 4\n", grown, T); return 1; }
+    } else if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
     if (g_absorb_rewind) {   /* garbage rows, then the real ones from the middle and from 0 */
         for (int t = 0; t < T; t++)
             if (!coli_vk_kv_row(layer, t, Rr, L)) { printf("kv_row failed\n"); return 1; }
         for (int t = T / 2; t < T; t++)
             if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     }
-    for (int t = 0; t < T; t++)
+    for (int t = 0; t < T && !g_absorb_grow; t++)
         if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     ColiVkTensor *kvb = NULL;
     if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
@@ -7435,6 +7475,11 @@ int main(int argc, char **argv) {
      * cases above. CI runs this on Lavapipe, where the benches below say nothing and
      * take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        if (G.pipe_att) {   /* the absorb core's KV mirror growing with the conversation (#2314), staged and mapped */
+            g_absorb_grow = 1;
+            bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+            g_absorb_grow = 0;
+        }
         printf("outputs digest %016llx\n", (unsigned long long)g_digest);
         bad |= run_late_cases();
         printf(bad ? "FAIL\n" : "PASS\n");
@@ -7555,6 +7600,9 @@ int main(int argc, char **argv) {
         g_absorb_rewind = 1;   /* every row written twice, out of order: a rewound mirror */
         bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 300, 9);
         g_absorb_rewind = 0;
+        g_absorb_grow = 1;     /* a mirror that grows with the conversation (#2314) */
+        bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+        g_absorb_grow = 0;
     }
     printf("outputs digest %016llx\n", (unsigned long long)g_digest);
     bad |= run_late_cases();

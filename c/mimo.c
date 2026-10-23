@@ -2213,7 +2213,7 @@ static void vk_tier_start(Model *m) {
             expert_read(m, pl[i], pe[i], &tmp);
             VktExpertSrc src = mimo_vk_src(m, pl[i], tmp.buf);
             XT(put)(pl[i], pe[i], &src);
-            free(tmp.base);
+            compat_aligned_free(tmp.base);   /* expert_read's posix_memalign: _aligned_malloc on Windows (compat.h), never free() */
         }
         XT(put_done)();
         m->hits = hits; m->miss = miss; m->bytes_read = bytes;

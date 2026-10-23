@@ -5539,7 +5539,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                                                 * mirror learns fp8 */
             int dsa_on=0; if(dnsel) for(int s=0;s<S;s++) if(dnsel[s]>0) dsa_on=1;
             int st0=m->kv_start[layer], T=pos_base+S;
-            if(!dsa_on&&T<=m->max_t&&coli_vk_kv_ensure(layer,m->max_t,kvl,c->qk_rope)){
+            int grown=!dsa_on&&T<=m->max_t ? coli_vk_kv_grow(layer,T,m->max_t,kvl,c->qk_rope) : 0;
+            if(grown==2) m->vk_kv_valid[layer]=0;   /* a grown mirror: its rows again from the host */
+            if(grown){
                 int ok=1;
                 for(int t=m->vk_kv_valid[layer];t<T&&ok;t++)
                     ok=coli_vk_kv_row(layer,t,coli_kv_row(m->Lc[layer],t,kvl),
@@ -11735,12 +11737,25 @@ static void vk_tier_start(Model *m){
         return;
     }
     /* What the device still has to hold besides the experts: the absorb core's KV
-     * mirror (COLI_VK_ATTN, allocated at the first decode, CTX rows a layer), and
+     * mirror (COLI_VK_ATTN, growing with the conversation up to CTX rows a layer), and
      * COLI_VK_RESERVE_GB, the old name of this reserve, beyond the tier's own. The dense
-     * set is already on the device (vk_dense_preload ran first) and counted as used. */
+     * set is already on the device (vk_dense_preload ran first) and counted as used.
+     * The mirror's room: CTX rows a layer, at most half of what the device has free, so
+     * the experts keep the other half (#2314: the gateway's 131072 tokens asked GLM-5.3
+     * for 23.6 GB on a 24 GB card and left the tier none); a longer conversation grows it
+     * while there is room, and a layer that finds none computes its attention on the CPU. */
     double dense=0;
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
-        dense+=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0; }
+        double mir=(double)(g_glmc_partial ? g_glmc_fit.n : NL)*ctx*(c->kv_lora+c->qk_rope)*4.0;
+        const char *tr=getenv("COLI_VK_TIER_RESERVE_GB");
+        double half=((double)coli_vk_free_bytes()-(tr&&*tr?atof(tr):1.0)*1073741824.0)/2;
+        if(half>0&&mir>half){
+            fprintf(stderr,"[VK] colibri: the attention KV mirror of %d tokens (%.1f GiB) does not fit beside the experts: "
+                    "%.1f GiB kept for it, half of what the device has free (COLI_VK_TIER_RESERVE_GB keeps more)\n",
+                    ctx,mir/1073741824.0,half/1073741824.0);
+            mir=half;
+        }
+        dense+=mir; }
     /* a partial chain: nothing more of the trunk goes up, but the chain's first forward
      * allocates its scratch and the N layers' KV mirrors */
     if(g_glmc_partial) dense+=(double)g_glmc_lazy;
