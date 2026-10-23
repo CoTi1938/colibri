@@ -14304,7 +14304,10 @@ int main(int argc, char **argv){
     /* The oracle's references were written by float32 arithmetic: its runs keep a float32
      * KV cache unless KV16 says otherwise (nothing has allocated the cache yet; the chain
      * reads g_kv16 at each step) */
-    if(g_kv16 && !(getenv("KV16") && *getenv("KV16"))) g_kv16=0;
+    if(g_kv16 && !(getenv("KV16") && *getenv("KV16"))){
+        g_kv16=0;
+        fprintf(stderr,"[KV16] an oracle run keeps the KV cache in float32 (KV16=1 for float16)\n");
+    }
     /* Diagnostic modes take precedence over TF and do not read predictions. */
     int teacher_forcing=getenv("TF")!=NULL && !getenv("REPLAY") && !getenv("CONSIST");
     const char *refpath=getenv("REF")?getenv("REF"):"ref_glm.json";
