@@ -104,7 +104,10 @@ static inline float kv16_dot_lanes(const float *x, const uint16_t *w, int I) {
         for (int j = 0; j < h; j++) a[j] += a[j+h];
     return a[0];
 }
-/* y += a * x, the float16 row widened (the float row's own loop: y + a*x, fused) */
+/* y += a * x, the float16 row widened (the float row's own loop: y + a*x, fused). The
+ * fusion is spelled out (MATMUL_F32_MADD) rather than left to the compiler, which fuses
+ * y += a*x only from -O2 on: at -O1 (the ASan build) the tail would round twice while the
+ * F16C body does not. */
 static inline void kv16_axpy(float *y, float a, const uint16_t *x, int n) {
     int i = 0;
 #ifdef KV16_F16C
@@ -112,6 +115,6 @@ static inline void kv16_axpy(float *y, float a, const uint16_t *x, int n) {
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i))), _mm256_loadu_ps(y + i)));
 #endif
-    for (; i < n; i++) y[i] += a * kv16_to(x[i]);
+    for (; i < n; i++) y[i] = MATMUL_F32_MADD(y[i], a, kv16_to(x[i]));
 }
 #endif
