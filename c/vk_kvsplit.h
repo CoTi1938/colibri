@@ -526,7 +526,7 @@ typedef struct {
     const float *q1; size_t q1_row, q1_seg;
     const float *q2; size_t q2_row, q2_seg;
     const void *k1;  size_t k1_grp, k1_pos;   /* k1 and v: floats, or float16 with kv16 */
-    const float *k2; size_t k2_grp, k2_pos;
+    const void *k2;  size_t k2_grp, k2_pos;   /* floats, or float16 with kv16 */
     const void *v;   size_t v_grp, v_pos;
     /* Inkling: score = tau[s] * (q . k * scale + bias), bias = sum_j r[s*r_row + h*r_seg + j]
      * * relp[j*ext + d] for d = pos_base + s - t < ext (NULL tau / r: none) */
@@ -569,7 +569,10 @@ static inline void vkc_kv_vadd(const VkcKvHostAttn *p, int grp, int t, float w, 
 static inline float vkc_kv_score(const VkcKvHostAttn *p, int s, int h, int grp, int t, const float *qa, const float *qb) {
     size_t k1 = (size_t)grp * p->k1_grp + (size_t)t * p->k1_pos;
     float a = p->kv16 ? vkc_kv_dot16(qa, (const uint16_t *)p->k1 + k1, p->d1) : vkc_kv_dot(qa, (const float *)p->k1 + k1, p->d1);
-    if (qb) a += vkc_kv_dot(qb, p->k2 + (size_t)grp * p->k2_grp + (size_t)t * p->k2_pos, p->d2);
+    if (qb) {
+        size_t k2 = (size_t)grp * p->k2_grp + (size_t)t * p->k2_pos;
+        a += p->kv16 ? vkc_kv_dot16(qb, (const uint16_t *)p->k2 + k2, p->d2) : vkc_kv_dot(qb, (const float *)p->k2 + k2, p->d2);
+    }
     float v = a * p->scale;
     if (p->r) {
         int dist = p->pos_base + s - t;
@@ -971,8 +974,9 @@ typedef struct {
     int S, H, K, R, pos_base, kv_start;
     int qa_off, qa_row, qa_seg, qr_off, qr_row, qr_seg, o_off, o_row, o_seg, sel_off, sel_row;
     float scale;
-    const float *Lh, *Rh;
+    const void *Lh, *Rh;           /* floats, or float16 with kv16 */
     size_t nqa;                    /* (set by vkc_kv_mla) the qa floats F1 brings down */
+    int kv16;
 } VkcKvMla;
 static int vkc_kv_mla_rec(VkcKvMla *a, int s0, int ns, int fin) {
     VkcKvSplit *ks = a->ks;
@@ -1004,7 +1008,7 @@ static int vkc_kv_mla_host(void *u, const float *q, const int *sel) {
     if (!vkc_kv_cold_rows(ks, a->li, a->pos_base, a->S, 0, a->kv_start, sel, a->sel_row)) return 0;
     VkcKvHostAttn h = {a->S, a->H, a->H, a->K, a->R, a->K, a->scale, q, (size_t)a->qa_row, (size_t)a->qa_seg,
                        q + a->nqa, (size_t)a->qr_row, (size_t)a->qr_seg, a->Lh, 0, (size_t)a->K, a->Rh, 0, (size_t)a->R,
-                       a->Lh, 0, (size_t)a->K, NULL, NULL, 0, 0, NULL, 0, 0, 0, 0};
+                       a->Lh, 0, (size_t)a->K, NULL, NULL, 0, 0, NULL, 0, 0, 0, 0, a->kv16};
     vkc_kv_host_attn(ks, &h, ks->hpart, ks->hpart + (size_t)a->S * a->H * a->K);
     return 1;
 }
@@ -1022,7 +1026,7 @@ static int vkc_kv_mla(VkcKvMla *a) {
         const void *host[2] = {a->Lh, a->Rh};
         size_t grp[2] = {0, 0}, ps[2] = {(size_t)a->K, (size_t)a->R};
         int nseg[2] = {1, 1}, sl[2] = {a->K, a->R};
-        if (vkc_kv_shadow(ks, a->li, a->R > 0 ? 2 : 1, host, grp, ps, nseg, sl, a->pos_base, 0)) {
+        if (vkc_kv_shadow(ks, a->li, a->R > 0 ? 2 : 1, host, grp, ps, nseg, sl, a->pos_base, a->kv16)) {
             ks->dev_cold++; ks->splits++;   /* a step with a host part, on the device */
             VkcKvsMerge mg = {a->S * a->H, a->H, a->K, 0, a->H * a->K, a->K, a->S * a->H * a->K, 0, a->S * a->H * a->K,
                               a->o_off, a->o_row, a->o_seg, 0, 0, 0, 0};
@@ -1239,7 +1243,7 @@ static int vkc_kv_mla_qkv(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratch
 }
 static int vkc_kv_mla_attn(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratch *s, int S, int pos_base, int kv_start,
                            VkcMlaCache *c, VkcBuf *sel, size_t sel_off, int sel_row, VkcBuf *gate, size_t gate_off,
-                           VkcBuf *out, size_t out_off, const float *Lh, const float *Rh) {
+                           VkcBuf *out, size_t out_off, const void *Lh, const void *Rh) {
     int H = m->H, QR = m->Q + m->R, HK = H * m->K, HV = H * m->V;
     if (S < 1 || S > s->rows) return 0;
     int ok;
@@ -1251,7 +1255,7 @@ static int vkc_kv_mla_attn(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratc
         ok = vkc_mla_hgemv(m->k_abs, s->q, s->qabs, NULL, &a);
     }
     VkcKvMla a = {ks, li, s->qabs, s->q, c->lat, c->rope, sel, s->clat, S, H, m->K, m->R, pos_base, kv_start,
-                  0, HK, m->K, m->Q, H * QR, QR, 0, HK, m->K, (int)sel_off, sel ? sel_row : 0, m->scale, Lh, Rh, 0};
+                  0, HK, m->K, m->Q, H * QR, QR, 0, HK, m->K, (int)sel_off, sel ? sel_row : 0, m->scale, Lh, Rh, 0, m->kv16};
     ok = ok && vkc_kv_mla(&a);
     VkcHgemv v = {0, S, H, m->V, m->kv_b ? m->Q + m->V : m->V, m->kv_b ? m->Q : 0, 0, HK, m->K, 0, HV, m->V,
                   (int)gate_off, HV, gate != NULL};

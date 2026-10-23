@@ -2597,6 +2597,11 @@ int vkc_mla_qkv(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int 
         VkcMlaRow rk = {S, 1, m->R, m->R, m->rope_style, m->K, KR, 0, pos_base * m->R, m->R, 0, 0, m->R, 0, 0, 0, 0.f};
         ok = vkc_mla_rope(s->q, cs, s->q, &rq) && vkc_mla_rope(s->kv, cs, c->rope, &rk);
     }
+    if (ok && m->kv16) {   /* the rows as the host's float16 cache holds them, before anything reads them */
+        VkcEw rl = {VKC_EW_F16, S * m->K, m->K, 0, 0, 0, pos_base * m->K, pos_base * m->K, 0, 0, 0, 1.f};
+        VkcEw rr = {VKC_EW_F16, S * m->R, m->R, 0, 0, 0, pos_base * m->R, pos_base * m->R, 0, 0, 0, 1.f};
+        ok = vkc_ew(c->lat, c->lat, NULL, NULL, NULL, &rl) && (m->R == 0 || vkc_ew(c->rope, c->rope, NULL, NULL, NULL, &rr));
+    }
     if (ok && down)
         ok = vkc_copy(down, down_off, c->lat, (size_t)pos_base * m->K, (size_t)S * m->K) &&
              (m->R == 0 || vkc_copy(down, down_off + (size_t)S * m->K, c->rope, (size_t)pos_base * m->R, (size_t)S * m->R));
