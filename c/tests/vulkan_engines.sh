@@ -1856,6 +1856,10 @@ flint_chain_serve() {
   # same turns (a pin restored, a prefix reused, a cache that grows), the CPU's frames
   CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
   COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='keep a ring of 14 rows' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  # the KV cache in float16, as a serve keeps it: the chain rounds its rows as the host does
+  for mode in 1 2; do
+    COLI_VK_CHAIN=$mode CHAIN_SERVE_KV16=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9
+  done
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
@@ -1921,6 +1925,7 @@ family_qwen_chain() {
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
+  CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
   # between them at every turn's first decode step and next prompt
   CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
