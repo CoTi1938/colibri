@@ -253,7 +253,10 @@ int main(void) {
       /* cc_ops() caches the table once per process: ask the engine's gate directly */
       ck(coli_cuda_chain_ops() == NULL, "the backend has no table");
       fake_chain_absent = 0;
-      ck(q36cc_setup(&m2, 2) == NULL, "KV_SLOTS > 1 keeps the chain off");
+      /* KV_SLOTS > 1: the chain stays on, each conversation's state in a place of its own
+       * (q36cc_conv_*, serve_mux) */
+      Q36CChain *c2 = q36cc_setup(&m2, 2);
+      ck(c2 != NULL && c2->ok, "KV_SLOTS > 1 keeps the chain on");
       (void)m2; }
 
     printf(" F. speculative steps under the tier\n");
