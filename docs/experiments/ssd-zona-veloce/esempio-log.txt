@@ -1,0 +1,41 @@
+# esempio SINTETICO di log di 'disco leggi' (non una misura vera): serve a mostrare il formato che disco_mappa.py riconosce
+disco leggi /Users/io/Models/qwen36_i4_gs64.bin s16 30000 0 0 1
+file: /Users/io/Models/qwen36_i4_gs64.bin  dim: 22.00 GB  blocco 16 KiB  letture 30000
+inizio: 2026-10-23 19:55:00
+pezzo  0:  0.00- 0.69 GB  mediana   99.2 us  (min 84.2  p90 111.2  n 938)
+pezzo  1:  0.69- 1.38 GB  mediana  100.0 us  (min 85.0  p90 112.0  n 938)
+pezzo  2:  1.38- 2.06 GB  mediana   78.2 us  (min 63.2  p90 90.2  n 938)
+pezzo  3:  2.06- 2.75 GB  mediana   78.1 us  (min 63.1  p90 90.1  n 938)
+pezzo  4:  2.75- 3.44 GB  mediana   77.4 us  (min 62.4  p90 89.4  n 938)
+pezzo  5:  3.44- 4.12 GB  mediana   78.2 us  (min 63.2  p90 90.2  n 938)
+pezzo  6:  4.12- 4.81 GB  mediana   79.8 us  (min 64.8  p90 91.8  n 938)
+pezzo  7:  4.81- 5.50 GB  mediana   79.0 us  (min 64.0  p90 91.0  n 938)
+pezzo  8:  5.50- 6.19 GB  mediana   79.7 us  (min 64.7  p90 91.7  n 938)
+pezzo  9:  6.19- 6.88 GB  mediana   78.8 us  (min 63.8  p90 90.8  n 938)
+pezzo 10:  6.88- 7.56 GB  mediana   79.0 us  (min 64.0  p90 91.0  n 938)
+pezzo 11:  7.56- 8.25 GB  mediana   78.7 us  (min 63.7  p90 90.7  n 938)
+pezzo 12:  8.25- 8.94 GB  mediana   76.5 us  (min 61.5  p90 88.5  n 938)
+pezzo 13:  8.94- 9.62 GB  mediana   79.5 us  (min 64.5  p90 91.5  n 938)
+pezzo 14:  9.62-10.31 GB  mediana   79.1 us  (min 64.1  p90 91.1  n 938)
+pezzo 15: 10.31-11.00 GB  mediana  100.0 us  (min 85.0  p90 112.0  n 938)
+pezzo 16: 11.00-11.69 GB  mediana   97.8 us  (min 82.8  p90 109.8  n 938)
+pezzo 17: 11.69-12.38 GB  mediana   97.8 us  (min 82.8  p90 109.8  n 938)
+pezzo 18: 12.38-13.06 GB  mediana   98.6 us  (min 83.6  p90 110.6  n 938)
+pezzo 19: 13.06-13.75 GB  mediana   99.0 us  (min 84.0  p90 111.0  n 938)
+pezzo 20: 13.75-14.44 GB  mediana   99.8 us  (min 84.8  p90 111.8  n 938)
+pezzo 21: 14.44-15.12 GB  mediana   99.5 us  (min 84.5  p90 111.5  n 938)
+pezzo 22: 15.12-15.81 GB  mediana  100.0 us  (min 85.0  p90 112.0  n 938)
+pezzo 23: 15.81-16.50 GB  mediana   98.9 us  (min 83.9  p90 110.9  n 938)
+pezzo 24: 16.50-17.19 GB  mediana   99.8 us  (min 84.8  p90 111.8  n 938)
+pezzo 25: 17.19-17.88 GB  mediana   99.9 us  (min 84.9  p90 111.9  n 938)
+pezzo 26: 17.88-18.56 GB  mediana   98.8 us  (min 83.8  p90 110.8  n 938)
+pezzo 27: 18.56-19.25 GB  mediana  101.2 us  (min 86.2  p90 113.2  n 938)
+pezzo 28: 19.25-19.94 GB  mediana  100.1 us  (min 85.1  p90 112.1  n 938)
+pezzo 29: 19.94-20.62 GB  mediana  100.7 us  (min 85.7  p90 112.7  n 938)
+pezzo 30: 20.62-21.31 GB  mediana   98.9 us  (min 83.9  p90 110.9  n 938)
+pezzo 31: 21.31-22.00 GB  mediana   98.8 us  (min 83.8  p90 110.8  n 938)
+istogramma (us):
+   60- 65 | #################
+   65- 70 | ######################
+   70- 75 | ##
+   75- 80 | ##################
