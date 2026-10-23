@@ -2215,6 +2215,18 @@ so, a token is one frame.
   on an RTX PRO 4000: a layer 47-53 us (as the CUDA chain's 51), the gate and up pass 80
   -> 66 us and down 29 -> 17 in the chain profile, the decode 67.3-68.4 -> 76.5-78.3 tok/s,
   the teacher-forced loss the same (1.7576). `COLI_VK_MOE_GV=0` keeps chain_moe.comp's.
+- int4 per group (4) with groups of whole steps: the loop of a lane's steps waits for each
+  load in turn, which on a Radeon 8060S (RADV) left a Qwen3.6 layer at 160 us, 78 GB/s.
+  Where a row is a whole number of steps a lane at the lanes chosen above (Qwen3.6's 2048
+  and 512 inputs: eight), the pipeline built with `HQ` (a specialization constant, with the
+  steps a lane in `NQ`) loads every step and scale of the lane first, gate's and up's
+  together, then sums them; each step's product is rounded before it is added in both that
+  path and the loop (`precise`), so the two give the same bits (tests/test_vk_chain checks
+  it) and the tier's small experts, on the loop, stay the chain's. Gate and up as two
+  loops instead of one interleaved took the loop alone 160 -> 119 us. Radeon 8060S,
+  Qwen3.6's shapes (`COLI_VK_CHAIN_BENCH=moe`, K 8 of 256): one row 160 -> 100 us, two
+  282 -> 166, three 385 -> 239; Qwen3.6-35B-A3B int4-g64 decode 45.0 -> 50.3 tok/s with the
+  same text. `COLI_VK_MOE_GV_HQ=0` keeps the loop.
 - The books follow at the frame's end, from the ids that come down with it: the history
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.

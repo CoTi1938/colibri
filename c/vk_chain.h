@@ -488,6 +488,9 @@ int vkc_prewarm(const VkcPrewarm *w);
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* chain_moe_gv.comp's int4 fast path (each lane's steps loaded ahead, the loop's bits):
+ * 1 on, 0 off, -1 from COLI_VK_MOE_GV_HQ (default on). For tests. */
+void vkc_moe_gv_hq(int on);
 /* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
  * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
  * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by
