@@ -707,7 +707,7 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
     }
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
         if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
-            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0}};
+            VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0, 0}};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], pt, R ? 2 : 1, pb);
             ch->kv_valid[i] = pb;

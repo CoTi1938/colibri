@@ -1087,7 +1087,7 @@ static int vkc_kv_rel_host(void *u, const float *q, const int *sel) {
     VkcKvHostAttn h = {a->S, a->H, a->H / a->KVH, a->hd, 0, a->hd, a->scale, q, (size_t)a->q_row, (size_t)a->hd,
                        NULL, 0, 0, a->Kh, a->k_grp, a->k_pos, NULL, 0, 0, a->Vh, a->v_grp, a->v_pos,
                        a->tau_h, a->d_rel > 0 ? q + a->nq : NULL, (size_t)a->r_row, (size_t)a->d_rel, a->relp_h, a->d_rel,
-                       a->ext, a->pos_base, 0};
+                       a->ext, a->pos_base, 0, 0};
     vkc_kv_host_attn(ks, &h, ks->hpart, ks->hpart + (size_t)a->S * a->H * a->hd);
     return 1;
 }
@@ -1233,7 +1233,7 @@ static int vkc_kv_mla_qkv(VkcKvSplit *ks, int li, const VkcMla *m, VkcMlaScratch
                           int pos_base, VkcBuf *cs, VkcMlaCache *c, VkcMlaCache *tmp, VkcBuf *down, size_t down_off) {
     VkcMlaCache t = {tmp->lat, tmp->rope, S};
     if (tmp->cap < S || !vkc_mla_qkv(m, s, x, x_off, S, 0, cs, &t, down, down_off)) return 0;
-    VkcKvPart pl = {1, m->K, NULL, 0, c->lat, 0}, pr = {1, m->R, NULL, 0, c->rope, 0};
+    VkcKvPart pl = {1, m->K, NULL, 0, c->lat, 0, 0}, pr = {1, m->R, NULL, 0, c->rope, 0, 0};
     return vkc_kv_store(ks, li, &pl, tmp->lat, 0, (size_t)m->K, 0, pos_base, S) &&
            (m->R == 0 || vkc_kv_store(ks, li, &pr, tmp->rope, 0, (size_t)m->R, 0, pos_base, S));
 }
