@@ -3848,6 +3848,27 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
 int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
+/* The room the driver leaves in the system-RAM heap the host pool lives in (G.memtype_sys's):
+ * its budget less its usage (VK_EXT_memory_budget), else the heap's size; 0 when unknown. The
+ * heap is not all the RAM: NVIDIA's on Linux is three quarters of it (46.9 of 62.6 GiB on an
+ * RTX PRO 4000's host), on Windows about half, and blocks past it are refused (#2314). */
+size_t coli_vk_tier_host_heap_room(void) {
+    if (!G.ready || !G.phys || G.memtype_sys < 0) return 0;
+    const char *t = getenv("COLI_VK_TIER_HOST_HEAP_GB");   /* tests: the room a driver would leave */
+    if (t && *t && atof(t) > 0) return (size_t)(atof(t) * 1073741824.0);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    uint32_t hi = mp.memoryTypes[G.memtype_sys].heapIndex;
+#ifdef VK_EXT_memory_budget
+    if (G.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        if (bud.heapBudget[hi]) return bud.heapBudget[hi] > bud.heapUsage[hi] ? (size_t)(bud.heapBudget[hi] - bud.heapUsage[hi]) : 0;
+    }
+#endif
+    return (size_t)mp.memoryHeaps[hi].size;
+}
 void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
