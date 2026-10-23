@@ -211,6 +211,7 @@ void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV
  * through its mapping, never staged. 1 when the device can: a discrete card with
  * bufferDeviceAddress and a host-visible type in system RAM. */
 int  coli_vk_tier_host_pool(void);
+size_t coli_vk_tier_host_heap_room(void);   /* what the driver leaves in that pool's system-RAM heap (0: unknown) */
 /* The tier's extra layers (an MTP head's experts, another size than the main ones'):
  * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
  * (as coli_vk_tier_tensor). */

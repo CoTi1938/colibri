@@ -2046,6 +2046,24 @@ static Q38Seq *g_q38_mux_seq;              /* [slots]: the conversations the Mod
 static Q38PrefixCache *g_q38_mux_prefix;   /* [slots]: their prefix caches */
 static int g_q38_mux_cur;                  /* the slot the Model holds, -1 when every one is parked */
 
+/* The state a serve allocates once it runs: the attention layers' K, V and index keys
+ * at the context for every slot (the MTP head's rows with one), the DeltaNet layers'
+ * state for the slots past the Model's. Pages the RAM does not count until they are
+ * written, which a host pool (the Vulkan tier's, the CUDA chain's) must leave. */
+static size_t q38_state_later(Model *m){
+    const Cfg *c=&m->c;
+    int ctx=m->max_t>0?m->max_t:qwen38_max_ctx();
+    if(ctx>c->max_positions)ctx=c->max_positions;
+    size_t t=(size_t)ctx,kv=0,dn=0;
+    for(int i=0;i<c->layers;i++)
+        if(c->is_attn[i])kv+=t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float);
+        else dn+=((size_t)c->dn_vheads*c->dn_kdim*c->dn_vdim+(size_t)c->dn_conv_dim*(c->dn_convk-1))*sizeof(float);
+    int n=g_q38_mux_slots>1?g_q38_mux_slots:1;
+    size_t mtp=q38_layer_rows(m)>c->layers&&n==1?t*((size_t)2*c->kv_heads*c->head_dim+(size_t)c->idx_dim)*sizeof(float):0;
+    return kv*(size_t)n+dn*(size_t)(n-1)+mtp;
+}
+
+
 typedef struct {
     ServeReq q;
     int active, stop, cancel, limited;
@@ -3163,6 +3181,7 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=q38_vk_tier_ram_reserve(m,cap,ram_expert,igpu),
                   .ram_floor=q38_vk_tier_ram_reserve(m,c->topk,ram_expert,igpu),.ram_given=q38_vk_ram_given,
+                  .ram_later=q38_state_later(m),
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
                   .stage=g_vk_chain,   /* the chain stages a prompt chunk's host pool experts */

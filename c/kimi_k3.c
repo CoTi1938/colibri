@@ -638,6 +638,7 @@ static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning
 enum { K3_CKPT_MAX = 8 };
 static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
 static double k3_ckpt_reserve_gb(const Model *m, int slots);
+static double g_k3_ram_later;            /* the KV cache and checkpoints the serve allocates after the plan (bytes) */
 static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
                                           * slots. STRICTLY OPT-IN, 0 = off (default,
                                           * engine behaves exactly as before). */
@@ -1452,6 +1453,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
          * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
         double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
         double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
+        g_k3_ram_later = (kv_gb + ckpt_gb) * 1e9;   /* allocated once it serves: the tier's host pool leaves it (#2314) */
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -2421,6 +2423,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
                   .max_rows=K3_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
                   .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
+                  .ram_later=(size_t)g_k3_ram_later,
                   .dense_bytes=dense_bytes,
                   .in_ram=k3_vk_in_ram,.ram_ctx=m,
                   .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
