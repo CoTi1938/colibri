@@ -6102,8 +6102,8 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
  * DECIDE path sets it around its one prefill and nothing else ever does. */
 static float *g_hidden_sink = NULL;
 
+static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conversation in to rebuild it */
 #ifdef COLI_VULKAN
-static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: the chain swaps a conversation in to rebuild it */
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 static void q36_embed_row(Model *m, int id, int pos, float *row);
@@ -6429,12 +6429,21 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
         if (!q36c_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36c_mux_host(m, rows, S, 0); }
     }
 #endif
+#ifdef COLI_CUDA
+    if (!chain_logit && g_cuda_chain) {   /* the same on the CUDA chain */
+        chain_logit = falloc((int64_t)S * c->vocab);
+        if (!q36cc_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36cc_mux_host(m, rows, S, 0); }
+    }
+#endif
     if (!chain_logit) {
         m->mux_rows = rows;
         layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
         m->mux_rows = NULL;
 #ifdef COLI_VULKAN
         if (g_vk_chain) q36c_mux_host(m, rows, S, 1);
+#endif
+#ifdef COLI_CUDA
+        if (m->cchain) q36cc_mux_host(m, rows, S, 1);
 #endif
     }
     for (int s = 0; s < S; s++) {
@@ -8077,7 +8086,7 @@ static void q36_mux_bind(Model *m, int slot){
     if (g_vk_chain) q36c_mux_enter(m, slot);
 #endif
 #ifdef COLI_CUDA
-    if (g_cuda_chain) q36cc_mux_enter(m);
+    if (g_cuda_chain) q36cc_mux_enter(m, slot);
 #endif
 }
 
@@ -8147,6 +8156,9 @@ static void serve_mux(Model *m){
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
 #ifdef COLI_VULKAN
     if (g_vk_chain) q36c_mux_init(m);   /* each conversation's state on the device while there is room */
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q36cc_mux_init(m);
 #endif
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
@@ -8806,8 +8818,9 @@ int main(int argc, char **argv) {
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
     if (g_vk_chain && g_q36_mux_slots > 1)
-        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain runs each conversation's prompts; the decode steps run "
-                        "every conversation's row on the expert tier and the per-matrix path\n", g_q36_mux_slots);
+        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain keeps each conversation's state on the device while there "
+                        "is room, and runs its prompts and every conversation's decode rows (COLI_VK_CHAIN_MUX caps the places)\n",
+                g_q36_mux_slots);
     if (g_vk_ready) {
         /* COLI_VK_IMPORT: 1 the device reads the dense rows in place, 0 it copies them.
          * Unset: in place for a model without routed experts (Qwen3.8-27B, Clef) on a

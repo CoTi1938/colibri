@@ -1862,7 +1862,7 @@ flint_chain_serve() {
   done
   # two conversations, the sliding layers' rings in each one's place: one after the other,
   # and at once (their decode rows in the same steps)
-  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain runs each conversation' \
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain keeps each conversation' \
     $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
@@ -1943,12 +1943,15 @@ family_qwen_chain() {
   # two and three at once, their decode rows in the same steps; then fewer places than
   # conversations (COLI_VK_CHAIN_MUX): places handed over, steps on the host's path; then the
   # device lost mid-step, every conversation's state rebuilt on the CPU (the text the CPU's)
-  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain runs each conversation' \
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_INTERLEAVE=1 CHAIN_SERVE_CONTINUE=1 CHAIN_SERVE_EXPECT='the dense chain keeps each conversation' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
   for n in 2 3; do
     CHAIN_SERVE_SLOTS=$n CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=$n
   done
+  # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
   for k in 0 1; do
     CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k

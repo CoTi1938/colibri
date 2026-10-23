@@ -18,6 +18,7 @@ COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 r
 prompts on the device and decode on the CPU, the state moving between them).
 CHAIN_SERVE_PAIRS=1 with CHAIN_SERVE_SLOTS=n sends the turns n at a time, one a slot,
 together: their decode rows run in the same steps (several conversations in one forward).
+CHAIN_SERVE_LONG=n (with CHAIN_SERVE_PAIRS) puts n bytes before each group's first prompt.
 CHAIN_SERVE_TEXT=1 compares each frame's kind, id and text only (a device lost mid-session:
 the state rebuilt on the CPU sums in another order, the numbers move in their last digits).
 CHAIN_SERVE_BACKEND=cuda runs the chain session on the CUDA chain instead (COLI_CUDA=1).
@@ -137,6 +138,8 @@ def pairs(p, err, turns, nslots):
         group = turns[k:k + nslots]
         wire = b""
         for j, (prompt, max_tok, ext) in enumerate(group):
+            if j == 0 and LONG:   # a conversation past the places' first mirrors (they grow)
+                prompt = bytes(97 + (t * 7) % 26 for t in range(LONG)) + prompt
             hdr = f"SUBMIT r{k + j} {j} {len(prompt)} {max_tok + 8 * j} 0 1" + (f" {ext}" if ext else "") + "\n"
             wire += hdr.encode() + prompt + b"\n"
         p.stdin.write(wire)
@@ -167,6 +170,7 @@ WORST = [0.0]
 
 
 TEXT = os.environ.get("CHAIN_SERVE_TEXT") == "1"
+LONG = int(os.environ.get("CHAIN_SERVE_LONG", "0"))
 
 
 def close(a, b):
