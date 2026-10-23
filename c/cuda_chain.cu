@@ -120,10 +120,11 @@ __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict_
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
 /* win > 0: a sliding window, the row's last win positions; snk: a sink logit per head at
- * snk[sink_off + h], in the denominator only (CcAttnW) */
+ * snk[sink_off + h], in the denominator only (CcAttnW); ring > 0: the cache a ring of that
+ * many rows, position t in row t % ring (a sliding layer's, cc_attn_wr) */
 __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
-        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {
+        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
     __shared__ float qs[256];
     __shared__ float pe[128];
     __shared__ int   pt[128];
@@ -149,6 +150,7 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         float sv = -3.0e38f;
         if (i < n) {
             int t = list ? sel[lb + 1 + i] : i;
+            if (ring) t %= ring;
             pt[tid] = t;
             int kb = p.k_off + (kbase + t) * p.hd;
             float a = 0.f;
@@ -220,7 +222,7 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
 template<int HD>
 __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
-        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {   /* CcAttnW's window and sinks */
+        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {   /* CcAttnW's window and sinks, a ring */
 #if CC_FA_BODY
     using namespace nvcuda;
     constexpr int LD = HD + 8, NDT = HD / 16, NDS = NDT / 4, LS = CC_FA_BC + 4, LP = CC_FA_BC + 8;
@@ -269,7 +271,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             int k0 = kb * CC_FA_BC;
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
-                float v = key < nt ? kc[p.k_off + (g * p.cap + key) * HD + d] : 0.f;
+                float v = key < nt ? kc[p.k_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
                 skv[kl * LD + d] = __float2half(v);
             }
             __syncthreads();
@@ -308,7 +310,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             __syncthreads();   /* P complete, K consumed */
             for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
                 int kl = e / HD, d = e - kl * HD, key = k0 + kl;
-                float v = key < nt ? vc[p.v_off + (g * p.cap + key) * HD + d] : 0.f;
+                float v = key < nt ? vc[p.v_off + (g * p.cap + (ring ? key % ring : key)) * HD + d] : 0.f;
                 skv[kl * LD + d] = __float2half(v);
             }
             __syncthreads();
@@ -1116,7 +1118,7 @@ __host__ __device__ static inline int cc_attn_dec_len(int n, int H) {
 #define CC_ATTN_DEC_ROWS 8   /* a decode step's or a verify's rows (every engine's verify) */
 __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
-        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {
+        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
@@ -1136,7 +1138,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         __syncthreads();
         int kbase = kvh * p.cap;
         for (int j = wp; j < cnt; j += 8) {
-            const float *kr = kc + p.k_off + (size_t)(kbase + t0 + j) * hd;
+            const float *kr = kc + p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
             float a = 0.f;
             for (int d = lane; d < hd; d += 32) a += qs[d] * kr[d];
             for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
@@ -1160,7 +1162,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         for (int g = 0; g < 8; g++) l += red[g];
         for (int d = tid; d < hd; d += 256) {
             float acc = 0.f;
-            for (int j = 0; j < cnt; j++) acc += sc[j] * vc[p.v_off + (size_t)(kbase + t0 + j) * hd + d];
+            for (int j = 0; j < cnt; j++) acc += sc[j] * vc[p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + d];
             xs[xo + 2 + d] = acc;
         }
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
@@ -1447,12 +1449,13 @@ static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d :
  * on the tensor cores (cc_attn_fk), a decode's or a verify's rows split over their positions
  * (cc_attn_dec_k, only where a prompt takes cc_attn_fk, as in cc_attn), else cc_attn_k; each
  * row's positions the window's, the sink in each softmax's denominator. */
-static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
+static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w, int ring) {
     CcCtx *c = live();
     if (!w) return 0;
     const CcAttn *p = &w->a;
     if (!c || !q || !kc || !vc || !o || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 ||
-        p->sel_row > 0 || w->win < 0 || (w->sink && !snk) || (p->has_gate && !gate)) return 0;
+        p->sel_row > 0 || w->win < 0 || (w->sink && !snk) || (p->has_gate && !gate) || ring < 0 ||
+        (ring && (ring != p->cap || w->win < 1 || ring < w->win + p->S - 1))) return 0;   /* a ring holds the step's rows and their windows */
     if (!w->win && !w->sink) return cc_attn(q, kc, vc, o, gate, nullptr, p);
     const float *sk = w->sink ? fp(snk) : nullptr;
     const int win = w->win, so = w->sink_off;
@@ -1464,9 +1467,9 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
     if (fk && p->S >= fl) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
-        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
-        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
-        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so);
+        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
         return launched(c, "attn (tensor cores, window, sinks)");
     }
 #endif
@@ -1478,10 +1481,10 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         if (k > 0) {
             CcAttn a = *p; a.S = k;
             cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a,
-                                                                                win, sk, so);
+                                                                                win, sk, so, ring);
             if (!launched(c, "attn (window, sinks)")) return 0;
             CcAttnW b = *w; b.a.S -= k; b.a.pos_base += k; b.a.q_off += k * p->q_row; b.a.o_off += k * p->o_row; b.a.g_off += k * p->g_row;
-            return cc_attn_w(q, kc, vc, o, gate, snk, &b);
+            return cc_attn_w2(q, kc, vc, o, gate, snk, &b, ring);
         }
         int nb = 1;
         for (int r = 0; r < p->S; r++) {
@@ -1498,16 +1501,19 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         }
         if (c->adec) {
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }
     }
     #undef CC_WPOS
     cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, *p,
-                                                                         win, sk, so);
+                                                                         win, sk, so, ring);
     return launched(c, "attn (window, sinks)");
+}
+static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
+    return cc_attn_w2(q, kc, vc, o, gate, snk, w, 0);
 }
 
 static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
@@ -1525,5 +1531,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_moe_stage_op, cc_host_up, cc_host_up_done,
     cc_attn_w,
     cc_muse,
+    cc_attn_w2,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
