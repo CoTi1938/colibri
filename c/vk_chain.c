@@ -1367,7 +1367,7 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         VkPipeline gp = nr > 1 ? (xg ? KC.gemv4xn : KC.gemv4n) : xg ? KC.gemv4x : KC.gemv4;
         ok = record(gp, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
-    else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
+    else if (path >= 0 && KC.tg && !ti->wide && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
         ok = record(KC.tg, bd, 4, &pc, sizeof pc, (uint32_t)((S + 63) / 64), (uint32_t)(ti->O / 128), 1);
         KC.st.tile_gemms += ok;
