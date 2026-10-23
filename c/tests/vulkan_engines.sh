@@ -1866,6 +1866,14 @@ flint_chain_serve() {
     $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 Q36_KV_RING_SPARE=9 KV_SLOTS=2
+  # Muse Spark (attention only, its prefixes reused in part): three conversations at once, a
+  # pin one of them saved rewinding another, whose ring's window must come up again from the
+  # host (its numbers run larger: 1e-3)
+  $PY tools/make_muse_tiny.py --out muse_tiny --emit-ref muse_tiny/ref.json --experts F32 > /dev/null
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('muse_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/muse_tiny/model.gguf", "mode": "link", "arch": "muse", "parts": 1}\n' "$PWD" > muse_tiny/gguf.json
+  CHAIN_SERVE_TOL=1e-3 CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 muse_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0 KV_SLOTS=3
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1

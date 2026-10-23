@@ -784,6 +784,11 @@ static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
     }
     int kvd = c->k_head_dim, KV = c->kv_heads;
     for (int i = 0; i < c->n_layers && ok; i++) {
+        /* a ring rewound (a pin, a reused prefix shorter than what the device holds): its window
+         * before the step again from the host. A step uploads only the window's rows, so rows
+         * below a later window may never have reached the device, and a rewind reads them */
+        if (c->is_attn[i] && q36_kv_rows(m, i) != m->max_t && ch->kv_valid[i] > pos_base)
+            ch->kv_valid[i] = pos_base - c->window + 1 > 0 ? pos_base - c->window + 1 : 0;
         if (!c->is_attn[i] || ch->kv_valid[i] >= pos_base) continue;
         int t0 = ch->kv_valid[i], n = pos_base - t0, R = q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0;
         if (R) {   /* the host's ring (q36_kv_rows): the window's rows before pos_base, each run of its rows to the
@@ -992,6 +997,8 @@ static int q36cc_mux_push(Q36CChain *ch, Model *m, int c0, int n) {
             v->dn_where = Q36CC_BOTH;
         }
         for (int i = 0; i < c->n_layers && ok; i++) {
+            if (c->is_attn[i] && q36_kv_rows(m, i) != m->max_t && v->kv_valid[i] > pos)   /* a ring rewound */
+                v->kv_valid[i] = pos - c->window + 1 > 0 ? pos - c->window + 1 : 0;
             if (!c->is_attn[i] || v->kv_valid[i] >= pos) continue;
             int t0 = v->kv_valid[i], R = q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0;
             if (R) {
