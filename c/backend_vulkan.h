@@ -451,6 +451,9 @@ const char *coli_vk_device_name(void);
  * coli_vk_init_env_tier(engine, 0). */
 int coli_vk_init_env(const char *engine);
 int coli_vk_init_env_tier(const char *engine, int tier_on);
+/* "[VK] <engine>: COLI_VULKAN is not set: the Vulkan device stays unused", once a process
+ * (coli_vk_init_env_tier says it; an engine that skips the call says it itself) */
+void coli_vk_say_unused(const char *engine);
 /* Where an engine's dense (resident, non-expert) matrices run, the one rule every
  * engine follows. COLI_VK_DENSE set and non-empty: 0 keeps them on the CPU, any other
  * number puts them on the device. Unset: the engine's default `def`, except that with
