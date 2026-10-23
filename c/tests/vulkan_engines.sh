@@ -1822,6 +1822,10 @@ qwen36_gguf_chain_gates() {
   CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool's experts on the CPU" all GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
     COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no expert in the host pool"; }
+  # the pool leaves the RAM of the KV cache the engine allocates after it (#2314: the pool took
+  # that room and the cache's allocation failed at start)
+  grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
   grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps

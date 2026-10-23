@@ -8338,6 +8338,21 @@ static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
     return 1;
 }
 static void vk_release(void *ctx, void *h) { (void)ctx; slot_release((Slot *)h); }
+/* What the serve allocates once the tier is up (VktConfig.ram_later): the KV cache at the
+ * served context, a sliding layer's ring (q36_ring_for), for each conversation (KV_SLOTS),
+ * and the attention's score rows, one per thread (#2314: a pool sized from the RAM free
+ * before them took their room and the KV cache's allocation failed). */
+static size_t q36_kv_later(Model *m) {
+    Cfg *c = &m->c; int ctx = qwen36_max_ctx(), R = q36_ring_for(c, ctx);
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), b = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        if (c->is_attn[i]) b += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
+    int thr = 1;
+#ifdef _OPENMP
+    thr = omp_get_max_threads();
+#endif
+    return b * (size_t)(g_q36_mux_slots > 1 ? g_q36_mux_slots : 1) + (size_t)thr * ctx * sizeof(float);
+}
 static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int4, int expert_mixed) {
     Cfg *c = &m->c;
     if (!g_vk_ready || c->n_experts == 0 || qq_active()) return;
@@ -8399,6 +8414,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
+                    .ram_later = q36_kv_later(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
                     .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx()) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,

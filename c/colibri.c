@@ -10619,6 +10619,7 @@ static void repin_pass_limit(Model *m,int limit){
 typedef struct { KVState kv; int *hist, len, first;
                  ColiPinPool pins; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
+static double kvb_transient_bytes(Model *m, int max_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -11781,12 +11782,19 @@ static void vk_tier_start(Model *m){
               xgu.kind=VKT_SRC_NONE;
           }
       } }
+    /* what the serve fills after this: the KV cache at CTX (each slot's) and the attention's
+     * reconstruction, as cap_for_ram counts them (#2314). Counted even when allocated: its
+     * pages are RAM only once written, so the free RAM here does not show them yet. */
+    double later=0;
+    { int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+      later=kv_pool_bytes(m,ctx)+kvb_transient_bytes(m,ctx); }
     VktConfig vc={.engine="colibri", .layers=NL, .experts=E, .hidden=c->hidden, .inter=c->moe_inter, .topk=c->topk,
                   .gate_up=gu, .down=dn, .act=VKT_ACT_SWIGLU, .act_limit=0.f,
                   .extra_layers=xgu.kind!=VKT_SRC_NONE, .extra_gate_up=xgu, .extra_down=xdn,
                   .max_rows=GLM_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
                   .ram_floor=(size_t)((double)c->topk*expert_cache_row_bytes(m,m->ebits)), .ram_given=vk_ram_given,
+                  .ram_later=(size_t)later,
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
@@ -12541,6 +12549,21 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     return one*slots;
 }
 
+/* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
+ * materialising kvb_all, so the transient to reserve is the flash ceiling plus
+ * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
+ * The reserve mirrors the trigger in attention_rows: same env, same default. */
+static double kvb_transient_bytes(Model *m, int max_ctx){
+    Cfg *c=&m->c;
+    double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+    int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
+    double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
+                  + (double)max_ctx*c->n_heads*2*4.0;
+    if(flash_mb>0 && kvb_b>capped) kvb_b = capped;
+    return kvb_b;
+}
+
 
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
@@ -12639,16 +12662,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
-    double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
-    /* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
-     * materialising kvb_all, so the transient to reserve is the flash ceiling plus
-     * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
-     * The reserve mirrors the trigger in attention_rows: same env, same default. */
-    { int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
-      int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
-      double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
-                    + (double)max_ctx*c->n_heads*2*4.0;
-      if(flash_mb>0 && kvb_b>capped) kvb_b = capped; }
+    double kvb_b = kvb_transient_bytes(m,max_ctx);
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
      * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
