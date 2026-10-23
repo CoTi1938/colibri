@@ -1062,6 +1062,15 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     int snapped = 0, dmoe = q36c_dmoe(ch, m, rows);
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
+        if (c0 > 0 && q36_chunk_control()) {   /* a STOP or CANCEL between two prompt chunks */
+            for (int i = lo; i < hi; i++) {   /* the rows past pos_base were this prompt's */
+                if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+                if (c->is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], pos_base);
+            }
+            ch->snap_valid = 0;
+            vkc_gemm_rows(-1);
+            return 0;
+        }
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
@@ -1222,6 +1231,7 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
     int n2 = q36c_forward_seg(m, ch2, xh, S, pos_base, lf, want_x, nlogits, logit, &ro, &lost);
     vkc_device(0); g_q36_vk_dev = 0;
     if (lost) return 0;
+    if (!n2 && g_q36_ctl && g_q36_ctl->result) return 0;   /* stopped between two chunks: the caller drops the prompt */
     if (!n2) {   /* declined before touching its device: the CPU runs its layers this step */
         q36c_cpu_one(m, ch2, pos_base);
         *rows_only = 1;

@@ -1924,6 +1924,12 @@ family_qwen_chain() {
   DMOE=1 lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
+  # a STOP or CANCEL at every boundary between two prompt chunks of 8 rows (#2290): the
+  # prompt dropped, the chain's state from zeros, the retry's logits a cold run's
+  make tests/test_qwen36_prefill_control VK=1
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_CHAIN_ROWS=8 COLI_DENSE_I8=0 QWEN36_TINY=qwen36_tiny_c \
+    ./tests/test_qwen36_prefill_control 8 | tee prefill_control.log
+  grep -q "the dense chain, 0 failures" prefill_control.log || fail "chain qwen36 prompt control"
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   CHAIN_SERVE_KV16=1 CHAIN_SERVE_EXPECT='KV cache: float16' $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   # COLI_VK_CHAIN=2, prompts on the device and decode on the CPU: the state crosses
