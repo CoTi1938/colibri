@@ -1366,7 +1366,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
 #endif
         g_k3_vk=coli_vk_init_env_tier("kimi_k3",vkt_wanted()&&any_sparse&&!cuda_on);
         k3_dho_decide(m,vkt_wanted()&&any_sparse&&!cuda_on,cuda_on);   /* COLI_VK_DENSE_HOST, before the cache is sized */
-    }
+    } else if(!(getenv("K3_VK")&&*getenv("K3_VK"))) coli_vk_say_unused("kimi_k3");   /* #2289 (K3_VK=0 closes it on purpose) */
 #endif
 #ifdef COLI_METAL
     { const char *ev=getenv("K3_METAL");

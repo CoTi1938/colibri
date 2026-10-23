@@ -1173,7 +1173,22 @@ int coli_vk_init(const char *spv_path) {
     {
         const char *e = getenv("COLI_VK_COOP");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0')) {
+        /* AMD's own driver (Windows, 32.0.32015.7029) crashed inside its compiler on a
+         * Radeon 780M once the cooperative-matrix features were on, before the engine was
+         * ready, with subgroups of 64 and of 32 alike (#2289): a crash in the driver no
+         * fallback here can catch, so the default leaves them off on that driver.
+         * RADV runs them on the same chip (measured). COLI_VK_COOP=1 tries them. */
+        int amd_own = 0;
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 dp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+            vkGetPhysicalDeviceProperties2(G.phys, &dp2);
+            amd_own = dp.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !(e && *e == '1');
+            if (amd_own && !(e && *e == '0'))
+                fprintf(stderr, "[VK] cooperative matrix off on AMD's own driver (%s %s: it crashed compiling the shader "
+                                "on a Radeon 780M, #2289); COLI_VK_COOP=1 tries it\n", dp.driverName, dp.driverInfo);
+        }
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0') && !amd_own) {
             VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12f};
             vkGetPhysicalDeviceFeatures2(G.phys, &f2);
             VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp = {
@@ -2631,9 +2646,19 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
     return on;
 }
 
+/* #2289: a COLI_VULKAN set in another console left a Vulkan build on the CPU without a
+ * word. The build says the device stays unused, and why, once a process. */
+void coli_vk_say_unused(const char *engine) {
+    static int said;
+    const char *on = getenv("COLI_VULKAN");
+    if (said++) return;
+    fprintf(stderr, "[VK] %s: %s: the Vulkan device stays unused (COLI_VULKAN=1 uses it)\n", engine,
+            on && *on ? "COLI_VULKAN=0" : "COLI_VULKAN is not set");
+}
+
 int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
-    if (!on || !atoi(on)) return 0;
+    if (!on || !atoi(on)) { coli_vk_say_unused(engine); return 0; }
     char buf[1024];
     const char *spv = coli_vk_shader_path(buf, sizeof buf);
     int ok = coli_vk_init(spv) && coli_vk_available();

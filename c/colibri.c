@@ -13747,6 +13747,7 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
 #endif
 #ifdef COLI_VULKAN
+    if(!(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN")))) coli_vk_say_unused("colibri");   /* #2289 */
     if(getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))){
         char spvbuf[512]; const char *spv = vk_resolve_spv(spvbuf, sizeof(spvbuf));
         g_vulkan = coli_vk_init(spv);
