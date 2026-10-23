@@ -1825,8 +1825,9 @@ qwen36_gguf_chain_gates() {
   grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
-  # holds a few experts, the pool takes those, the engine's cache keeps the rest
-  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool within the driver's heap" all GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
+  # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
+  # CPU computes those experts: no layer's routed experts all in the frame)
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool within the driver's heap" none GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
     COLI_VK_TIER_HOST=1 COLI_VK_TIER_HOST_HEAP_GB=2.001 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
   grep -q "host pool on, [1-9].*not all of them: the driver's heap for it leaves" vk.log || { cat vk.log; fail "chain qwen36 GGUF: the host pool past the driver's heap"; }
 }
