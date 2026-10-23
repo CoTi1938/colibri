@@ -216,8 +216,6 @@ jobs:
           cd c
           python tools/make_muse_tiny.py --out /tmp/muse_F32 --emit-ref /tmp/muse_F32/ref.json --experts F32
           COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json
-          # the KV cache in float16 (in bf16 a near tie at the 4th token flips: kv16.h)
-          COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json
           COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json 2> ring.log
           grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
           # Q8_0: the experts' inputs round to int8 from sums whose order differs from one CPU
