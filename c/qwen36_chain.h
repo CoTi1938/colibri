@@ -956,6 +956,17 @@ static void q36c_mux_drop(Model *m) {
     for (int k = 0; k < ch->nconv; k++)
         if (!q36c_conv_down(ch, m, &ch->conv[k])) { q36c_mux_lost(m); return; }
 }
+/* The held conversation's place cannot hold its prompt even with the others' mirrors gone:
+ * the places close (every state to the host, the others' buffers freed) and the chain keeps
+ * one conversation's state again, its mirror at the host's capacity or split past the
+ * device (q36c_mirror); the conversations' turns then go through the host as without places */
+static void q36c_pool_off(Q36Chain *ch, Model *m) {
+    q36c_mux_drop(m);
+    for (int k = 0; k < ch->nconv; k++) if (k != ch->conv_cur) q36c_conv_free(m, &ch->conv[k]);
+    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1;
+    fprintf(stderr, "[VK] qwen36 chain: a prompt's KV mirror does not fit beside the other conversations' state: "
+                    "each conversation's state goes through the host from here on\n");
+}
 static void q36c_mux_leave(Model *m) {
     Q36Chain *ch = q36c_of(m, 0);
     if (ch && ch->conv && q36c_pool_ok(ch, m)) { q36c_conv_save(ch); return; }
@@ -1431,6 +1442,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         q36c_conv_save(ch);
         mirror_ok = q36c_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36c_conv_load(ch, ch->conv_cur);
+        if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m); }
     } else mirror_ok = q36c_mirror(ch, m);
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
