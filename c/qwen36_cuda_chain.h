@@ -234,11 +234,14 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     if (m->cchain) return ((Q36CChain *)m->cchain)->ok ? (Q36CChain *)m->cchain : NULL;
     if (!cc_available()) { fprintf(stderr, "[chain] qwen36: the CUDA backend has no chain (an older DLL); the per-matrix path\n"); return NULL; }
     if (!qt_ready()) { fprintf(stderr, "[chain] qwen36: no CUDA expert tier; the chain stays off\n"); return NULL; }
-    if (qq_active() || g_pilot || mux_slots > 1) {
+    if (qq_active() || g_pilot) {
         fprintf(stderr, "[chain] qwen36: %s; the chain stays off\n",
-                qq_active() ? "a qpack container" : g_pilot ? "PILOT prefetch reads the residual on the host" : "KV_SLOTS > 1 keeps one state per conversation on the host");
+                qq_active() ? "a qpack container" : "PILOT prefetch reads the residual on the host");
         return NULL;
     }
+    if (mux_slots > 1)
+        fprintf(stderr, "[chain] qwen36: KV_SLOTS=%d: the chain runs each conversation's prompts; the decode steps run "
+                        "every conversation's row on the tier and the host\n", mux_slots);
     if (c->muse && !cc_muse_ready()) {
         fprintf(stderr, "[chain] qwen36: the CUDA backend has no Muse Spark norms and gates (an older DLL); the per-matrix path\n");
         return NULL;
@@ -503,6 +506,14 @@ static void q36cc_cpu_step(Model *m, int pos_base) {
     if (!q36cc_sync_one(m, ch)) { q36cc_recover(m, m->kv_len); return; }
     ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
     for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
+}
+/* KV_SLOTS > 1: as q36c_mux_leave / q36c_mux_enter (qwen36_chain.h) */
+static void q36cc_mux_leave(Model *m) { q36cc_cpu_step(m, m->kv_len); }
+static void q36cc_mux_enter(Model *m) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok) return;
+    ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
 }
 /* A rejected draft: the state after the verify's row `slot` is the device's copy in
  * that slot; `len` positions stand, and the KV watermark comes down to them. */

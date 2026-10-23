@@ -8037,9 +8037,23 @@ typedef struct {
 
 static void q36_mux_bind(Model *m, int slot){
     if (g_q36_mux_cur == slot) return;
+    /* the chains' device state is the held conversation's: its DeltaNet state to the
+     * host before it leaves, nothing on the device the next one's */
+#ifdef COLI_VULKAN
+    if (g_vk_chain && g_q36_mux_cur >= 0) q36c_mux_leave(m);
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain && g_q36_mux_cur >= 0) q36cc_mux_leave(m);
+#endif
     if (g_q36_mux_cur >= 0) q36_seq_swap(m, &g_q36_mux_seq[g_q36_mux_cur]);   /* the held one back */
     if (slot >= 0) q36_seq_swap(m, &g_q36_mux_seq[slot]);
     g_q36_mux_cur = slot;
+#ifdef COLI_VULKAN
+    if (g_vk_chain) q36c_mux_enter(m);
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q36cc_mux_enter(m);
+#endif
 }
 
 /* The whole context's KV for every slot, before READY: slot 0 is the Model's own. */
@@ -8162,8 +8176,12 @@ static void serve_mux(Model *m){
             free(lo);
         }
         if (ended) {
+#ifdef COLI_CUDA
+            q36cc_report(m);
+#endif
 #ifdef COLI_VULKAN
             vk_report();
+            q36c_report(m);   /* the prompts the chain ran */
             vk_tier_turn(m, "turn");
 #endif
             emap_emit(m);
@@ -8759,11 +8777,9 @@ int main(int argc, char **argv) {
     /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
-    if (g_vk_chain && g_q36_mux_slots > 1) {
-        g_vk_chain = 0;
-        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
-                        "the expert tier runs every conversation's experts\n", g_q36_mux_slots);
-    }
+    if (g_vk_chain && g_q36_mux_slots > 1)
+        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain runs each conversation's prompts; the decode steps run "
+                        "every conversation's row on the expert tier and the per-matrix path\n", g_q36_mux_slots);
     if (g_vk_ready) {
         /* COLI_VK_IMPORT: 1 the device reads the dense rows in place, 0 it copies them.
          * Unset: in place for a model without routed experts (Qwen3.8-27B, Clef) on a

@@ -731,6 +731,26 @@ static void q36c_cpu_one(Model *m, Q36Chain *ch, int pos_base) {
 static void q36c_cpu_step(Model *m, int pos_base) {
     for (int d = 0; d < 2; d++) q36c_cpu_one(m, q36c_of(m, d), pos_base);
 }
+/* KV_SLOTS > 1 (serve_mux): the chain runs the prompts of the conversation the Model
+ * holds; the decode steps run every conversation's row on the host's path
+ * (q36_step_rows). Before the held conversation leaves the Model its DeltaNet state
+ * comes to the host, whose arrays are that conversation's until the swap; once
+ * another one is held, nothing on the device is the new one's: its state goes up
+ * from the host and every KV row again (q36c_push_state) at its next prompt. */
+static void q36c_mux_leave(Model *m) {
+    for (int d = 0; d < 2; d++) q36c_cpu_one(m, q36c_of(m, d), m->kv_len);
+}
+static void q36c_mux_enter(Model *m) {
+    for (int d = 0; d < 2; d++) {
+        Q36Chain *ch = q36c_of(m, d);
+        if (!ch || !ch->ok) continue;
+        ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+            ch->kv_valid[i] = 0;
+            if (m->c.is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0);
+        }
+    }
+}
 /* A rejected draft: the state after the verify's row `slot` (its first slot+1 rows) is
  * the device's copy in that slot; `len` positions stand, and the KV watermark comes
  * down to them (the rows past them are the rejected drafts'). */

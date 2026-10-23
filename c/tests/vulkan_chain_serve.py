@@ -21,7 +21,9 @@ straight after top_p (what the qwen engines have always been sent); "numeric", i
 2, ... (glm53); "colibri", numeric ids and the grammar-bytes field (0) before the
 options (colibri's multiplexed serve). CHAIN_SERVE_SLOTS=n sends request i to KV slot
 i % n (the engine needs KV_SLOTS=n): the turns move between sessions, and with them
-whatever state the chain keeps on the device. CHAIN_SERVE_CONTINUE=1 adds a last turn
+whatever state the chain keeps on the device. CHAIN_SERVE_INTERLEAVE=1 with it keeps the
+turns on slot 0 and runs another conversation's short turn on the other slots between two
+of them: a turn then reuses its own conversation's prompt after the device held another's. CHAIN_SERVE_CONTINUE=1 adds a last turn
 that continues the one before it exactly (its prompt, what it wrote, two bytes more) and
 asks for enough tokens to grow the cache: the state is reused while the KV mirrors are
 made again from the host's rows, which then have to hold what the device wrote.
@@ -65,16 +67,25 @@ def session(engine, snap, extra, chain):
              (base + b"QRSk", 4, "")]
     if os.environ.get("CHAIN_SERVE_CONTINUE") == "1":
         turns.append(None)
+    nslots = int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
+    interleave = os.environ.get("CHAIN_SERVE_INTERLEAVE") == "1" and nslots > 1
+    sched = []   # (turn index, slot); -1: a foreign turn on another slot between two of slot 0's
+    for i in range(len(turns)):
+        sched.append((i, 0 if interleave else i % nslots))
+        if interleave and i + 1 < len(turns):
+            sched.append((-1, 1 + i % (nslots - 1)))
     out = []
-    for i, turn in enumerate(turns):
-        if turn is None:   # the turn before, what it wrote and two bytes more; a cache that grows
-            prompt, max_tok, ext = turns[i - 1][0] + written + b"mn", 12, ""
-            turns[i] = (prompt, max_tok, ext)
-        prompt, max_tok, ext = turns[i]
+    written = last = b""
+    for j, (i, slot) in enumerate(sched):
+        if i < 0:   # another conversation's turn: the device's state moves away and back
+            prompt, max_tok, ext = b"abc" + bytes([97 + j % 26]) * (5 + j % 7), 3, ""
+        else:
+            if turns[i] is None:   # the turn before, what it wrote and two bytes more; a cache that grows
+                turns[i] = (turns[i - 1][0] + last + b"mn", 12, "")
+            prompt, max_tok, ext = turns[i]
         written = b""
         dialect = os.environ.get("CHAIN_SERVE_DIALECT", "")
-        rid = f"{i + 1}" if dialect in ("numeric", "colibri") else f"r{i}"
-        slot = i % int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
+        rid = f"{j + 1}" if dialect in ("numeric", "colibri") else f"r{j}"
         hdr = (f"SUBMIT {rid} {slot} {len(prompt)} {max_tok} 0 1" + (" 0" if dialect == "colibri" else "") +
                (f" {ext}" if ext else "") + "\n")
         p.stdin.write(hdr.encode() + prompt + b"\n")
@@ -92,6 +103,8 @@ def session(engine, snap, extra, chain):
                     written += body
             elif kind == b"DONE":
                 out.append(b"DONE " + line.split()[1])
+                if i >= 0:
+                    last = written
                 break
             elif kind == b"ERROR":
                 sys.exit(f"engine error: {line!r}")
