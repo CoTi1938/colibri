@@ -16,6 +16,7 @@ session's stderr must match (a lost device's rebuild, say, with COLI_VK_CHAIN_FA
 usage: vulkan_chain_serve.py <engine> <snapshot> [KEY=VALUE ...]   (extra environment)
 COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 runs
 prompts on the device and decode on the CPU, the state moving between them).
+CHAIN_SERVE_BACKEND=cuda runs the chain session on the CUDA chain instead (COLI_CUDA=1).
 CHAIN_SERVE_DIALECT picks the SUBMIT header: unset, ids r0, r1, ... and the options
 straight after top_p (what the qwen engines have always been sent); "numeric", ids 1,
 2, ... (glm53); "colibri", numeric ids and the grammar-bytes field (0) before the
@@ -44,7 +45,13 @@ READY = b"\x01\x01READY\x01\x01"
 def session(engine, snap, extra, chain):
     kv = {} if KV16 else {"Q36_KV": "f32", "KV16": "0"}   # float16 only when asked (the docstring says why)
     env = dict(os.environ, SNAP=snap, SERVE="1", COLI_PREFIX_LOG="1", Q38_PREFIX_LOG="1", **kv, **extra)
-    if chain:
+    if chain and os.environ.get("CHAIN_SERVE_BACKEND") == "cuda":   # the CUDA chain (a CUDA=1 build)
+        env.update(COLI_VULKAN="0", COLI_CUDA="1", COLI_USAGE=os.path.abspath("chain-serve.usage"))
+        try:
+            os.remove(env["COLI_USAGE"])
+        except FileNotFoundError:
+            pass
+    elif chain:
         env.update(COLI_VULKAN="1", COLI_VK_CHAIN=os.environ.get("COLI_VK_CHAIN", "1"), COLI_VK_TIER_SYNC="1",
                    COLI_USAGE=os.path.abspath("chain-serve.usage"))
         try:
@@ -144,7 +151,7 @@ def main():
     for text in (err_cpu, err):   # a sanitized build reports into the engine's stderr
         if "ERROR: AddressSanitizer" in text or "runtime error:" in text:
             sys.exit("FAIL: sanitizer diagnostic\n" + text[-4000:])
-    forwards = [l for l in err.splitlines() if " chain: " in l and "forwards" in l]
+    forwards = [l for l in err.splitlines() if (" chain: " in l or l.startswith("[chain]")) and "forwards" in l]
     reuse = [l for l in err.splitlines() if "[PREFIX] reusing" in l or ("prefix] request" in l and "reused=0/" not in l)]
     pins = err.count("[PIN]")
     if not forwards:
