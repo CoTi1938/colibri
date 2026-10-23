@@ -548,6 +548,16 @@ KV configuration actually allows. Tool calling in pi works on the engines in
 the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
 pi's tool calls fail the same way any OpenAI `tools` request does.
 
+The same provider entry serves the other engines — swap the model `id` and
+`name` (`qwen3.6-colibri` for Qwen3.6, `deepseek-v4-flash-colibri` for DeepSeek
+V4 Flash; `coli status` prints the id of the running model). Serve with a
+context that fits pi's preamble plus the working set: pi sends its system
+prompt, tool catalog and project instructions — about 5,000 tokens — before the
+first user word, so start the server with e.g. `coli serve --ctx 32768` and set
+`contextWindow` to the same value. Measured with pi 1.4.0 against
+Qwen3.6-35B-A3B resident in RAM (Vulkan, Ryzen 9 9950X): the ~4,900-token
+preamble prefills in about 30 s, and follow-up turns reuse the cached prefix.
+
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
