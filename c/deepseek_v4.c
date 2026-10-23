@@ -1297,7 +1297,11 @@ uint64_t coli_v4_os_available_memory(void) {
     MEMORYSTATUSEX status;
     memset(&status, 0, sizeof(status));
     status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? (uint64_t)status.ullAvailPhys : 0;
+    /* the commit still grantable bounds it too: what decides whether the next malloc
+     * succeeds (compat_meminfo_gb, #1375) */
+    if (!GlobalMemoryStatusEx(&status)) return 0;
+    return status.ullAvailPageFile && status.ullAvailPageFile < status.ullAvailPhys
+        ? (uint64_t)status.ullAvailPageFile : (uint64_t)status.ullAvailPhys;
 #elif defined(__APPLE__)
     /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
      * kernel could hand out without swapping: free + inactive pages -- the
