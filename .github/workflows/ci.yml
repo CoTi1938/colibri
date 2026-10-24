@@ -1395,6 +1395,7 @@ jobs:
           # prefilled ones by the vendor's own design. The override says so.
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c

@@ -83,6 +83,7 @@
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
+#include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1309,6 +1310,12 @@ typedef struct {
      * they pause for a while and the guard re-measures. */
     int pause, min_accept, max_verify;
     uint64_t window_prop, window_acc;
+    /* How many of a round's drafts to verify, from the head's own confidence in each
+     * (DeepSeek's confidence-scheduled verification, DeepInfer): sigmoid of its score is
+     * the acceptance it predicts, spec_draft.h's gate maps it through what it measured and
+     * against what a verify of that many rows costs here. V41_DSPARK_GATE=0: every draft. */
+    SpecGate gate;
+    int gated;
 } Spec;
 
 typedef struct {
@@ -4004,6 +4011,8 @@ static void spec_load(Model *m, int ecap) {
      * writes its whole block; verifying fewer of them trades acceptance for a smaller
      * bill when a round is rejected early. */
     sp->max_verify = getenv("V41_DSPARK_MAX") ? atoi(getenv("V41_DSPARK_MAX")) : 0;
+    sp->gated = !(getenv("V41_DSPARK_GATE") && *getenv("V41_DSPARK_GATE") == '0');
+    spec_gate_init(&sp->gate, 0);
     if (sp->min_accept < 0) sp->min_accept = 0;
     if (sp->min_accept > 100) sp->min_accept = 100;
     /* The released config.json carries every dspark_* key and NOT n_mtp_layers:
@@ -5584,10 +5593,25 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         ? spec_step(m, token, m->last_start, m->last_rows, batch, confidence) : 0;
             if (m->spec.max_verify > 0 && drafted > m->spec.max_verify) drafted = m->spec.max_verify;
             if (drafted > budget - emitted) drafted = budget - emitted;
-            if (drafted <= 0) { forward(m, &token, 1, logits); continue; }
+            float pconf[SPEC_MAX_DRAFTS];
+            if (drafted > 0 && m->spec.gated) {   /* the depth this round's drafts are worth */
+                if (drafted > SPEC_MAX_DRAFTS) drafted = SPEC_MAX_DRAFTS;
+                for (int i = 0; i < drafted; i++) pconf[i] = 1.0f / (1.0f + expf(-confidence[i]));
+                drafted = spec_gate_pick_p(&m->spec.gate, SPEC_SRC_MTP, drafted, pconf, NULL);
+            }
+            double step_t0 = now_s();
+            if (drafted <= 0) {
+                forward(m, &token, 1, logits);
+                if (m->spec.active) spec_gate_forward(&m->spec.gate, 1, now_s() - step_t0);
+                continue;
+            }
             batch[0] = token;
             int accepted = spec_verify(m, batch, drafted + 1, logits,
                                        command.temperature, command.top_p);
+            if (m->spec.gated) {
+                spec_gate_forward(&m->spec.gate, drafted + 1, now_s() - step_t0);
+                spec_gate_result_p(&m->spec.gate, SPEC_SRC_MTP, accepted < drafted ? accepted + 1 : drafted, accepted, pconf);
+            }
             m->spec.proposed += (uint64_t)drafted;
             m->spec.accepted += (uint64_t)accepted;
             m->spec.window_prop += (uint64_t)drafted;
@@ -5650,10 +5674,17 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
              * every number except the one that matters. */
             if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
         }
-        if (stats && m->spec.active && m->spec.proposed > proposed0)
+        if (stats && m->spec.active && m->spec.proposed > proposed0) {
             fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
                     (unsigned long long)(m->spec.accepted - accepted0),
                     (unsigned long long)(m->spec.proposed - proposed0));
+            if (m->spec.gated) {
+                char gd[512];
+                spec_gate_describe(&m->spec.gate, SPEC_SRC_MTP, gd, sizeof gd);
+                fprintf(stderr, "[v41] DSpark gate: %s; %llu rounds took a plain step\n", gd,
+                        (unsigned long long)m->spec.gate.declined[SPEC_SRC_MTP]);
+            }
+        }
         if (cancelled) {
             coli_serve_write_error(stdout, command.id, "CANCELLED");
             coli_serve_command_dispose(&command);
