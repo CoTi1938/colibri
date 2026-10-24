@@ -55,6 +55,16 @@ class DsparkGateTest(unittest.TestCase):
         # the random head is wrong almost always: the gate learns it and verifies less
         self.assertTrue((prop and prop[-1] < prop_full[-1]) or (declined and declined[-1] > 0), err[-2000:])
 
+    def test_the_guard_counts_the_drafts_the_gate_left_unverified(self):
+        # the stages read their experts for every draft written; a head the gate keeps declining
+        # is a cost with nothing to show, so the acceptance guard must still pause it
+        plain, _ = run(V41_DSPARK="0")
+        text, err = run(V41_DSPARK="1", V41_DSPARK_MINACC="60")
+        self.assertEqual(text, plain)
+        self.assertIn("pausing for 64 tokens", err)
+        written = [int(x) for x in re.findall(r"drafts accepted this turn \((\d+) written\)", err)]
+        self.assertTrue(written and written[-1] >= 10, err[-2000:])
+
 
 if __name__ == "__main__":
     unittest.main()

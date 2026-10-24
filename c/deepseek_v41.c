@@ -1316,6 +1316,7 @@ typedef struct {
      * against what a verify of that many rows costs here. V41_DSPARK_GATE=0: every draft. */
     SpecGate gate;
     int gated;
+    uint64_t written;           /* drafts the stages wrote, verified or not (the guard's count) */
 } Spec;
 
 typedef struct {
@@ -5546,7 +5547,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         int block = m->spec.active ? c->spec_block : 0;
         int *batch = block ? xmalloc((size_t)(block + 1) * sizeof(int), "draft batch") : NULL;
         float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
-        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted;
+        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted, written0 = m->spec.written;
         /* the prompt seeds the draft head's windows; nothing is drafted from it */
         if (m->spec.active) spec_step(m, 0, m->last_start, m->last_rows, NULL, NULL);
         while (emitted < budget && !cancelled && !done_early) {
@@ -5592,12 +5593,17 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             if (m->spec.max_verify > 0 && drafted > m->spec.max_verify) drafted = m->spec.max_verify;
             if (drafted > budget - emitted) drafted = budget - emitted;
             float pconf[SPEC_MAX_DRAFTS];
+            /* the guard counts every draft written: the stages' experts were read for each, and
+             * one the gate leaves unverified is a draft that bought nothing */
+            int wrote = drafted > 0 ? drafted : 0;
             if (drafted > 0 && m->spec.gated) {   /* the depth this round's drafts are worth */
                 if (drafted > SPEC_MAX_DRAFTS) drafted = SPEC_MAX_DRAFTS;
                 for (int i = 0; i < drafted; i++) pconf[i] = 1.0f / (1.0f + expf(-confidence[i]));
                 drafted = spec_gate_pick_p(&m->spec.gate, SPEC_SRC_MTP, drafted, pconf, NULL);
             }
             double step_t0 = now_s();
+            m->spec.written += (uint64_t)wrote;
+            m->spec.window_prop += (uint64_t)wrote;
             if (drafted <= 0) {
                 forward(m, &token, 1, logits);
                 if (m->spec.active) spec_gate_forward(&m->spec.gate, 1, now_s() - step_t0);
@@ -5612,7 +5618,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             }
             m->spec.proposed += (uint64_t)drafted;
             m->spec.accepted += (uint64_t)accepted;
-            m->spec.window_prop += (uint64_t)drafted;
             m->spec.window_acc += (uint64_t)accepted;
             for (int i = 0; i < accepted; i++) {
                 int drafted_token = batch[1 + i];
@@ -5672,10 +5677,11 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
              * every number except the one that matters. */
             if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
         }
-        if (stats && m->spec.active && m->spec.proposed > proposed0) {
-            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
+        if (stats && m->spec.active && m->spec.written > written0) {
+            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn (%llu written)\n",
                     (unsigned long long)(m->spec.accepted - accepted0),
-                    (unsigned long long)(m->spec.proposed - proposed0));
+                    (unsigned long long)(m->spec.proposed - proposed0),
+                    (unsigned long long)(m->spec.written - written0));
             if (m->spec.gated) {
                 char gd[512];
                 spec_gate_describe(&m->spec.gate, SPEC_SRC_MTP, gd, sizeof gd);
