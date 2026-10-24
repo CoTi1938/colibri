@@ -604,11 +604,10 @@ def env_for_engine(a, arch, plan=None):
         # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
         # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
         # ONLY working channel was a poisoned system variable (#509's exact shape).
-    # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
-    # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
-    # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
-    # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo"):
+    # --ram reaches engines and gateway planners that consume RAM_GB. kimi_k3
+    # gained a RAM budget in #855; qwen36's gateway turns it into the positional
+    # cache cap, so it must receive the flag even though the engine gets that cap.
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo", "qwen36"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # Expert workers: env_for() wires these for glm; glm53 goes through
