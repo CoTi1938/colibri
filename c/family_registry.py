@@ -418,7 +418,7 @@ def _qwen38_geometry(config, context, _model_dir):
     rope = rope if isinstance(rope, dict) else config
     partial = rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0))
     if (isinstance(partial, bool) or not isinstance(partial, (int, float)) or
-            not math.isfinite(partial) or partial <= 0):
+            not math.isfinite(partial) or not 0 < partial <= 1):
         raise ValueError(f"{family}: invalid partial_rotary_factor")
     rotary_dim = int(head_dim * partial)
     if rotary_dim < 1 or rotary_dim > head_dim or rotary_dim % 2:

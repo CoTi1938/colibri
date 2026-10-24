@@ -318,6 +318,37 @@ class FamilyRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_position_embeddings"):
             planner_geometry(bad, 32)
 
+    def test_qwen38_partial_rotary_above_one_does_not_truncate_into_range(self):
+        # int(256 * 1.001) is 256, so the derived-dimension check never sees
+        # that the factor is larger than the head. The indexer dim is the
+        # head dim too, or the sparse-indexer check would reject it first.
+        text = {
+            "model_type": "qwen4_exp_text",
+            "num_hidden_layers": 48, "hidden_size": 2560, "vocab_size": 248320,
+            "max_position_embeddings": 262144, "eos_token_id": 248044,
+            "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+            "rope_parameters": {"partial_rotary_factor": 1.001},
+            "layer_types": ["linear_attention"] * 36 + ["full_attention"] * 12,
+            "indexer_kv_heads": 1, "indexer_head_dim": 256,
+            "indexer_n_heads": 4, "indexer_budget": 2048, "indexer_compress_ratio": 4,
+            "linear_num_value_heads": 48, "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4, "hc_count": 4, "hc_lowrank": 320,
+            "ple_layer_ids": [2], "ple_embed_dim": 2560,
+            "ple_conv_kernel_size": 4, "ngram_size": 3,
+            "heads_per_ngram": 8, "split_ngram_parts": 128,
+            "num_experts": 512, "moe_intermediate_size": 640,
+            "num_experts_per_tok": 10, "shared_expert_intermediate_size": 640,
+        }
+        family = _build_registry(FAMILIES)[1]["qwen4_exp_text"]
+        over = type("R", (), {"descriptor": family, "family_config": text, "model_dir": "."})()
+        with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
+            planner_geometry(over, 32)
+        exact = json.loads(json.dumps(text))
+        exact["rope_parameters"]["partial_rotary_factor"] = 1.0
+        ok = type("R", (), {"descriptor": family, "family_config": exact, "model_dir": "."})()
+        self.assertEqual(planner_geometry(ok, 32).configured_experts, 512)
+
     def test_qwen38_gguf_directory_is_sized_as_the_file_holds_it(self):
         # tools/gguf_import.py: resource_plan names each expert's slice of the
         # fused ggml tensor like a checkpoint expert, dtype "GGUF_<type>"; the
