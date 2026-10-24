@@ -257,6 +257,10 @@ typedef struct ColiCudaChainOps {
     int  (*attn_wr)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring);
     /* kv16: 1 when ew takes CC_EW_F16 (an older backend's kernel would skip it without a word) */
     int  (*kv16)(void);
+    /* rope_f16: rope on x, then each of a segment's seg values of x, and of v at x's offsets,
+     * rounded to float16 as ew's CC_EW_F16 rounds them: a float16 KV cache's new K and V rows
+     * in one launch, the bits of rope and two ew (qwen36_cuda_chain.h); absent: those three */
+    int  (*rope_f16)(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -330,6 +334,13 @@ static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *ga
 static inline int cc_kv16_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, kv16) + sizeof t->kv16 && t->kv16 && t->kv16();
+}
+static inline int cc_rope_f16_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, rope_f16) + sizeof t->rope_f16 && t->rope_f16;
+}
+static inline int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg) {
+    return cc_rope_f16_ready() ? cc_ops()->rope_f16(x, v, cs, p, seg) : 0;
 }
 static inline int cc_muse_ready(void) {
     const ColiCudaChainOps *t = cc_ops();

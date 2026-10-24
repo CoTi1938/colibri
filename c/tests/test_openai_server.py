@@ -3729,6 +3729,22 @@ class HTTPTest(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     self.assertEqual(len(self.engine.calls), before)
 
+    def test_non_json_numeric_constants_are_rejected(self):
+        """Python's json.loads accepts NaN, Infinity and -Infinity, none of which
+        is JSON (RFC 8259 section 6): they reached the engine as a 200."""
+        for path, fields in self._json_limit_routes():
+            for metadata in (b"NaN", b"Infinity", b"-Infinity",
+                             b'{"x":[1,NaN]}'):
+                with self.subTest(path=path, metadata=metadata):
+                    before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self._request_with_raw_metadata(path, fields, metadata)
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(json.load(response)["error"]["type"],
+                                         "invalid_request_error")
+                    self.assertEqual(len(self.engine.calls), before)
+
     def test_unpaired_surrogate_is_a_client_error(self):
         """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
         string between the two halves of an emoji). json.loads accepts it, no
@@ -4698,6 +4714,31 @@ class TrailingAssistantTurnTest(unittest.TestCase):
                 with self.assertRaises(APIError):
                     resolve_generation_prompt(messages, {})
 
+    def test_rejects_a_non_string_text_part(self):
+        """A text part whose `text` is not a string is a client error: joining it
+        raised TypeError, which do_POST answered with HTTP 500."""
+        for text in (5, None, ["x"]):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+            with self.on(), patch("openai_server.ARCH", "qwen36"):
+                with self.assertRaises(APIError) as caught:
+                    resolve_generation_prompt(messages, {})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, "messages.1.content.0.text")
+
+    def test_glm53_rejects_non_string_assistant_content(self):
+        """A completed assistant turn bypasses continuation validation. Numeric and
+        object content reached `"</think>" in content` and became HTTP 500."""
+        for content in (1.5, {"text": "not a content-part list"}):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "b"}]
+            with self.subTest(content=content):
+                with self.assertRaises(APIError) as caught:
+                    render_chat_glm53(messages)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "messages.1.content")
+
     def test_rejects_tools_and_tool_calls(self):
         with self.on(), patch("openai_server.ARCH", "glm53"):
             with self.assertRaises(APIError):
@@ -4809,6 +4850,15 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             self.assertEqual(normal, cont + END + cue)
             self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
             self.assertFalse(cont.endswith("<|end_message|>"))
+
+    def test_inkling_rejects_an_object_role(self):
+        """A role that is an object is unhashable. role_token.get(role) raised
+        TypeError, which do_POST answered with HTTP 500."""
+        messages = [{"role": {"x": 1}, "content": "go"}]
+        with self.assertRaises(APIError) as caught:
+            render_chat_inkling(messages)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, "messages.0.role")
 
     def test_only_the_final_assistant_turn_is_opened(self):
         """Across every continuation family: only the TRAILING assistant turn is opened, and

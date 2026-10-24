@@ -1325,13 +1325,15 @@ def decode_wav_mono16k(data, param):
     down), sample rate must already be 16 kHz — resampling belongs at the
     capture edge, not in the gateway."""
     import struct as _struct
-    np = _np()
     if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise APIError(400, "Audio must be a RIFF/WAVE file.", param, "invalid_value")
+    end = 8 + _struct.unpack_from("<I", data, 4)[0]
+    if end < 12 or end > len(data):
+        raise APIError(400, "WAV file has an invalid RIFF boundary.", param, "invalid_value")
     pos, fmt, raw = 12, None, None
-    while pos + 8 <= len(data):
+    while pos + 8 <= end:
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
-        if pos + 8 + size > len(data):
+        if pos + 8 + size + (size & 1) > end:
             raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
@@ -1341,8 +1343,11 @@ def decode_wav_mono16k(data, param):
         elif cid == b"data":
             raw = body
         pos += 8 + size + (size & 1)
+    if pos != end:
+        raise APIError(400, "WAV file has a truncated chunk header.", param, "invalid_value")
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
+    np = _np()
     audio_format, channels, rate, _, _, bits = fmt
     if channels == 0:
         raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
@@ -2246,7 +2251,7 @@ def _muse_fn_line(fn, where):
     desc = fn.get("description") or ""
     params = fn.get("parameters") or {}
     if fn.get("defer_loading"):
-        desc = desc + " [deferred: use tool_search to load full schema]"
+        desc = _jinja_string(desc) + " [deferred: use tool_search to load full schema]"
         return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
                 _muse_esc(_muse_json(desc)) + ', "defer_loading": true}')
     if isinstance(params, dict) and not params:
@@ -2407,9 +2412,16 @@ def render_chat_muse(messages, enable_thinking=True, reasoning_effort=None, tool
                 call_id = message.get("tool_call_id")
                 name = call_id or ""
                 for other in messages:
-                    for call in (other.get("tool_calls") or []) if isinstance(other, dict) else []:
-                        if call_id is not None and isinstance(call, dict) and call.get("id") == call_id:
-                            name = (call.get("function") or {}).get("name", name)
+                    calls = other.get("tool_calls") if isinstance(other, dict) else None
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict) or call.get("id") != call_id:
+                            continue
+                        function = call.get("function")
+                        found = function.get("name") if isinstance(function, dict) else None
+                        if isinstance(found, str) and found:
+                            name = found
             if not name:
                 raise APIError(400, "A tool message needs a `name` or a `tool_call_id` that names a call.",
                                f"messages.{index}")
@@ -3211,9 +3223,9 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        rtok = role_token.get(role)
-        if rtok is None:
+        if not isinstance(role, str) or role not in role_token:
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        rtok = role_token[role]
         # the template emits the effort hint inline, right before the first
         # non-system message — not at the end. Position matters: it changes the
         # exact token sequence the model was trained on.
@@ -3803,7 +3815,11 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                                    f"messages.{index}.content.{position}.text")
                 texts.append(text)
             content = "".join(texts)
-        content = content or ""
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
+            raise APIError(400, "Message content must be a string or an array of text parts.",
+                           f"messages.{index}.content")
         if role == "user":
             prompt.append(f"<|user|>{content}")
         elif role == "system":
@@ -3924,7 +3940,8 @@ def _dsv41_merge_turns(messages):
                           "reasoning_content": reasoning,
                           "tool_calls": _history_tool_calls(message.get("tool_calls"), index)})
         elif role in ("user", "tool"):
-            block = ({"kind": "tool_result", "id": message.get("tool_call_id") or "",
+            result_id = message.get("tool_call_id")
+            block = ({"kind": "tool_result", "id": result_id if isinstance(result_id, str) else "",
                       "text": v41_dsml.render_tool_result(text)} if role == "tool"
                      else {"kind": "text", "id": "", "text": text})
             if turns and turns[-1]["role"] == "user":
@@ -3941,7 +3958,7 @@ def _dsv41_merge_turns(messages):
             order = {}
             for at, call in enumerate(turn["tool_calls"]):
                 identifier = call.get("id") if isinstance(call, dict) else None
-                if identifier:
+                if isinstance(identifier, str) and identifier:   # an object or array id is unhashable
                     order[identifier] = at
         elif turn["role"] == "user" and order:
             results = [p for p in turn["parts"] if p["kind"] == "tool_result"]
@@ -4115,8 +4132,14 @@ def resolve_generation_prompt(messages, body):
                        "continue from.", "messages")
     raw = last.get("content")
     if isinstance(raw, list):                       # multimodal parts: only the text counts
-        text = "".join(part.get("text", "") for part in raw
-                       if isinstance(part, dict) and part.get("type") == "text")
+        texts = []
+        for index, part in enumerate(raw):
+            if isinstance(part, dict) and part.get("type") == "text":
+                if not isinstance(part.get("text"), str):
+                    raise APIError(400, "Text content parts require a string `text` field.",
+                                   f"{where}.content.{index}.text")
+                texts.append(part["text"])
+        text = "".join(texts)
     elif raw is None:
         text = ""
     elif isinstance(raw, str):
@@ -7316,6 +7339,10 @@ class APIServer(ThreadingHTTPServer):
         super().close_request(request)
 
 
+def _reject_json_constant(name):
+    raise json.JSONDecodeError(f"{name} is not a JSON value", name, 0)
+
+
 def _content_length(value):
     # int() also accepts signs and underscores, but HTTP lengths are 1*DIGIT.
     # Read and early-error drain must agree on that exact framing grammar.
@@ -7619,7 +7646,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # mid-body, and the drain will notice the EOF and close (#597 item 3).
         self._body_read = len(raw) == length
         try:
-            body = json.loads(raw)
+            # parse_constant: NaN/Infinity/-Infinity are Python extensions, not JSON.
+            body = json.loads(raw, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
         except (ValueError, RecursionError):
