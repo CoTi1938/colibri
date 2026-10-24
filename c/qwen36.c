@@ -6878,6 +6878,8 @@ typedef struct {
     int mtp_force, mtp_force_row;
     int mtp, ahead_src;          /* Q36_MTP: the head drafts too; the source of the verify ahead */
     int mtp_depth;               /* Q36_MTP_DRAFTS: drafts per verify, 1..7 (1 unset); 0 ("auto") = the gate's pick up to 7 */
+    int mtp_pstep;               /* Q36_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
+    float ahead_p[Q36_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     uint64_t mtp_drafts, mtp_accepted;
     int force, force_row;        /* COLI_LOOKUP_FORCE (tests): the oracle's tokens as the proposal */
     int *hist, hist_n, hist_cap; /* the tokens fed so far and the one about to be: what lookup searches */
@@ -6935,6 +6937,10 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     e = getenv("Q36_MTP_DRAFTS");
     sp->mtp_depth = !e || !*e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
     if (sp->mtp_depth < 0 || sp->mtp_depth > Q36_SPEC_ROWS - 1) { fprintf(stderr, "Q36_MTP_DRAFTS must be 0 (auto) or 1..%d\n", Q36_SPEC_ROWS - 1); exit(1); }
+    /* the depth a verify carries, from each step's drafts' probabilities (spec_gate_pick_p),
+     * within the one above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
+    e = getenv("Q36_MTP_PSTEP");
+    sp->mtp_pstep = !(e && *e == '0');
     if (sp->lookup && prompt && np > 0) {
         sp->hist_cap = np + 256;
         sp->hist = (int *)malloc((size_t)sp->hist_cap * sizeof(int));
@@ -6984,7 +6990,9 @@ static void q36_spec_rollback(Model *m, int len, int keep) {
 
 static void q36_spec_settle(Model *m, Q36Spec *sp, int keep, int rejected) {
     if (keep < sp->ahead_n) q36_spec_rollback(m, sp->ahead_pos + keep, keep);
-    spec_gate_result(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1);
+    if (sp->ahead_src == SPEC_SRC_MTP && sp->mtp_pstep)
+        spec_gate_result_p(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1, sp->ahead_p);
+    else spec_gate_result(&sp->gate, sp->ahead_src, keep - 1 + (rejected ? 1 : 0), keep - 1);
     free(sp->ahead_logit); sp->ahead_logit = NULL; sp->ahead_n = sp->ahead_i = 0;
 }
 
@@ -7068,6 +7076,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
             d[0] = q36_mtp_draft(m, tok, pos, hd);
+            sp->ahead_p[0] = g_q36_mtp.last_p;
             double t_first = now_s();
             static float pmin = -1.f;
             if (pmin < 0) { const char *pe = getenv("Q36_MTP_PMIN"); pmin = pe && *pe ? (float)atof(pe) : 0.f; }
@@ -7075,7 +7084,18 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                 if (g_q36_mtp.last_p < pmin) { k = j; break; }   /* the head is unsure: no deeper draft */
                 double t1 = now_s();
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
+                sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
+                /* this draft is not worth its row: a deeper one, no likelier, is not written */
+                if (sp->mtp_pstep && !sp->mtp_force && j + 1 < k &&
+                    !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j + 1, sp->ahead_p)) { k = j + 1; break; }
+            }
+            /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
+             * confidence-scheduled verification): the drafts past it go unverified. The first
+             * stays (the head pass that made it is a plain step's too). */
+            if (sp->mtp_pstep && !sp->mtp_force && k > 1) {
+                int kp = spec_gate_pick_p(&sp->gate, SPEC_SRC_MTP, k, sp->ahead_p, NULL);
+                k = kp < 1 ? 1 : kp;
             }
             t_verify += now_s() - t_first;   /* the deeper drafts are the gate's draft cost, not the verify's */
             free(hd);

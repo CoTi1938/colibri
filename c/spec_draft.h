@@ -205,6 +205,19 @@ static inline int spec_gate_pick_p(SpecGate *g, int src, int maxk, const float *
     return best;
 }
 
+/* Whether the newest of n drafts already written is worth its verify row, from their
+ * estimates p[0..n): when a shorter verify is worth more, a deeper draft (its acceptance
+ * no higher than this one's) is not worth writing. 1 with the gate off or no estimates. */
+static inline int spec_gate_deeper_p(const SpecGate *g, int src, int n, const float *p) {
+    if (g->off || !p || n <= 1 || src < 0 || src >= SPEC_NSRC) return 1;
+    if (n > SPEC_MAX_DRAFTS) return 0;
+    double a[SPEC_MAX_DRAFTS] = {0};
+    for (int j = 0; j < n; j++) { if (p[j] < 0.0f) return 1; a[j] = spec_gate_p_rate(g, src, p[j]); }
+    double vn = spec_gate_value_a(g, src, n, a);
+    for (int k = 1; k < n; k++) if (spec_gate_value_a(g, src, k, a) > vn) return 0;
+    return 1;
+}
+
 /* How many of the up to maxk drafts src can offer the next verify should carry: 0 for a
  * plain step. *value gets that depth's value (1 for a plain step). */
 static inline int spec_gate_pick(SpecGate *g, int src, int maxk, double *value) {

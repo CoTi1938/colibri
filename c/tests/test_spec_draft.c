@@ -140,6 +140,12 @@ static void test_gate_p(void) {
     CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, doubt, NULL) == 0, "doubtful drafts: a plain step");
     int k = spec_gate_pick_p(&g, SPEC_SRC_MTP, 5, mixed, NULL);
     CHECK(k == 2, "the third draft is doubtful: the first two only, got %d", k);
+    /* while drafting: the newest draft worth its row or not */
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 2, mixed), "two likely drafts: write a third");
+    CHECK(!spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, mixed), "a doubtful third: no fourth");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 1, doubt), "one draft: the depth's call is not this one's");
+    const float unknown[3] = {0.9f, -1.0f, 0.9f};
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, unknown), "an estimate missing: keep drafting");
     /* the bins learn: drafts the source calls sure that fail drag their bin down */
     int b = spec_gate_pbin(0.95f);
     double r0 = g.pb[SPEC_SRC_MTP][b];
@@ -153,6 +159,7 @@ static void test_gate_p(void) {
     /* off, or no estimates: every draft */
     spec_gate_init(&g, 1);
     CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 4, doubt, NULL) == 4, "gate off: every draft");
+    CHECK(spec_gate_deeper_p(&g, SPEC_SRC_MTP, 3, doubt), "gate off: every draft written");
     spec_gate_init(&g, 0);
     CHECK(spec_gate_pick_p(&g, SPEC_SRC_MTP, 4, NULL, NULL) == 4, "no estimates: every draft");
 }
