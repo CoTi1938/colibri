@@ -4654,13 +4654,11 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
         mvb(logits + (size_t)(rows_out ? t : 0) * c->vocab, &m->head, branch_in);
     }
     trace("logits", -1, logits + (size_t)(rows_out ? n - 1 : 0) * c->vocab, c->vocab);
-#ifdef COLI_VULKAN
-    {   /* DUMP=<path>: every logits row this forward computed, for the Vulkan gates */
+    {   /* DUMP=<path>: every logits row this forward computed, for the gates that compare bits */
         static FILE *dump; static int dump_init;
         if (!dump_init) { const char *d = getenv("DUMP"); dump_init = 1; if (d && *d) dump = fopen(d, "wb"); }
         if (dump) { fwrite(logits, sizeof(float), (size_t)(rows_out ? n : 1) * c->vocab, dump); fflush(dump); }
     }
-#endif
 
     m->pos += n_all;
     /* Recorded where the tokens entered the state, and only for the MAIN stream:

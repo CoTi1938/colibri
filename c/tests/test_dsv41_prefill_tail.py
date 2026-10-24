@@ -4,15 +4,13 @@ own, so they run on a prompt's last D * (W - 1) + 1 rows and give the same bits.
 
 The tiny fixture (tools/make_dsv41_tiny.py) has that layout: six layers, compress ratios
 0 2 2 1 1 0, layer 3 the last cache owner and the candidate source, a window of 8, so the
-exact tail is 2 * 7 + 1 = 15 rows. A prompt of 200 rows takes it. V41_TRACE=1 prints the
-logits of every forward (their sum and first values); the run with the tail must print the
-lines of the run without it (V41_PREFILL_TAIL=0), the prompt's forward and every decode step
-after it, and a tail shorter than the exact one (DeepSeek's kind, V41_PREFILL_TAIL=4 here)
-must not, which says the tail ran.
+exact tail is 2 * 7 + 1 = 15 rows. A prompt of 200 rows takes it. DUMP writes the logits
+rows of every forward, the prompt's and every decode step's after it; the run with the tail
+must write the bytes of the run without it (V41_PREFILL_TAIL=0), and a tail one row shorter
+(V41_PREFILL_TAIL=14) must not, which says the tail ran and that 15 is the shortest exact one.
 
 On the Vulkan chain (DSV41_CHAIN=1, a VK=1 build: the deepseek-chain family runs it on
-Lavapipe) V41_TRACE would turn the chain off, so DUMP writes every forward's logits rows
-instead, and the tail's file must be the bytes of the file without it.
+Lavapipe) the same comparison runs with the chain on and chunks of 16 rows.
 """
 import tempfile
 import os
@@ -30,25 +28,31 @@ PROMPT = bytes((7 * i + 3) % 200 + 32 for i in range(200))   # one id per byte, 
 
 
 def run(tail, dspark="0"):
-    env = {"SNAP": str(FIXTURE), "SERVE": "1", "CTX": "256", "OMP_NUM_THREADS": "2",
-           "V41_DSPARK": dspark, "V41_TRACE": "1", "COLI_VULKAN": "0"}
-    if tail is not None:
-        env["V41_PREFILL_TAIL"] = tail
-    engine = ServeEngine(ENGINE, ["8"], env, reuse=False)
-    try:
-        text = engine.ask("t", PROMPT, 24)
-    finally:
-        err = engine.close()
-        engine.p.stdout.close(); engine.p.stderr.close()
-    logits = [l for l in err.splitlines() if l.startswith("T logits")]
-    return text, logits, err
+    with tempfile.TemporaryDirectory() as d:
+        dump = os.path.join(d, "logits.bin")
+        env = {"SNAP": str(FIXTURE), "SERVE": "1", "CTX": "256", "OMP_NUM_THREADS": "2",
+               "V41_DSPARK": dspark, "COLI_VULKAN": "0", "DUMP": dump,
+               "V41_DSPARK_GATE": "0"}   # every draft verified: the gate's pick follows measured times
+        if tail is not None:
+            env["V41_PREFILL_TAIL"] = tail
+        engine = ServeEngine(ENGINE, ["8"], env, reuse=False)
+        try:
+            text = engine.ask("t", PROMPT, 24)
+        finally:
+            err = engine.close()
+            engine.p.stdout.close(); engine.p.stderr.close()
+        data = b""
+        if os.path.exists(dump):
+            with open(dump, "rb") as f:
+                data = f.read()
+    return text, data, err
 
 
 def run_chain(tail, dspark="0"):
     with tempfile.TemporaryDirectory() as d:
         dump = os.path.join(d, "logits.bin")
         env = {"SNAP": str(FIXTURE), "SERVE": "1", "CTX": "256", "OMP_NUM_THREADS": "2",
-               "V41_DSPARK": dspark, "COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "DUMP": dump,
+               "V41_DSPARK": dspark, "COLI_VULKAN": "1", "COLI_VK_CHAIN": "1", "DUMP": dump, "V41_DSPARK_GATE": "0",
                "COLI_VK_CHAIN_ROWS": "16"}   # chunks of 16 rows: the ones before the tail stop at layer 3
         if tail is not None:
             env["V41_PREFILL_TAIL"] = tail
@@ -76,25 +80,27 @@ def chain_ops(err):
                      "built V4.1 engine and tiny fixture required")
 class PrefillTailTest(unittest.TestCase):
     def test_the_exact_tail_gives_every_row_s_bits(self):
-        text_all, logits_all, err_all = run("0")
-        text, logits, err = run(None)
+        text_all, dump_all, err_all = run("0")
+        text, dump, err = run(None)
         self.assertNotIn("[v41] prefill: the layers after", err_all)
         self.assertIn("[v41] prefill: the layers after layer 3 run on a prompt's last 15 rows", err)
-        self.assertGreater(len(logits), 20)            # the prompt's forward and the decode steps
-        self.assertEqual(logits, logits_all)
+        self.assertGreater(len(dump), 20 * 4 * 256, err[-2000:])   # 24 rows of 256 logits: the prompt and its decode steps
+        self.assertEqual(dump, dump_all)
         self.assertEqual(text, text_all)
 
-    def test_a_shorter_tail_is_approximate(self):
-        _, logits_all, _ = run("0")
-        _, logits, err = run("4")
-        self.assertIn("last 4 rows (V41_PREFILL_TAIL", err)
-        self.assertNotEqual(logits, logits_all)
+    def test_a_row_shorter_is_approximate(self):
+        _, dump_all, _ = run("0")
+        _, dump, err = run("14")
+        self.assertIn("last 14 rows (V41_PREFILL_TAIL", err)
+        self.assertEqual(len(dump), len(dump_all))
+        self.assertNotEqual(dump, dump_all)
 
     def test_dspark_seeded_from_the_tail_drafts_the_same(self):
         # the stages' window is within the tail: the same drafts, so the same forwards
-        text_all, logits_all, _ = run("0", dspark="1")
-        text, logits, _ = run(None, dspark="1")
-        self.assertEqual(logits, logits_all)
+        text_all, dump_all, _ = run("0", dspark="1")
+        text, dump, _ = run(None, dspark="1")
+        self.assertGreater(len(dump), 0)
+        self.assertEqual(dump, dump_all)
         self.assertEqual(text, text_all)
 
 
