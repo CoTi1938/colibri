@@ -1381,6 +1381,8 @@ typedef struct {
      * speculative step keeps only the prefix that verified, and the next draft has to
      * seed the stages with exactly the positions that were committed */
     int last_start, last_rows;
+    int last_from;                          /* where the last forward's rows began: last_start but for a prompt's tail */
+    unsigned long long prefill_tail_rows;   /* prompt rows the layers after the cross-layer source did not run (v41_prefill_tail) */
     /* Whether THIS forward's rows may be rolled back, i.e. whether it is the
      * speculative verify batch. The per-layer undo buffers (ring_save,
      * cstate_save_*) are sized for one draft block and nothing else, because
@@ -4216,7 +4218,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
      * a cold conversation starts drafting; a resumed one starts immediately,
      * which costs a draft round's reads and can only change the acceptance
      * rate, never a token -- every draft is verified before it is emitted. */
-    if (start_pos == 0) { free(main_x); free(scratch); return 0; }
+    if (start_pos == 0 || (start_pos == m->last_start && m->last_from == 0)) {   /* a prompt's tail began at 0 too */
+        free(main_x); free(scratch); return 0;
+    }
 
     float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
     for (int i = 0; i < block; i++) {
@@ -4382,12 +4386,48 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 
+/* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay",
+ * DeepInfer, doc/inference_deployment_qa.md). From the first layer with compress_ratio 1 on
+ * (20 in V4.1, n_prefill_layer there), the layers read the long context only from that
+ * layer's caches: its compressed KV and index keys (kv_source, index_owner) and its
+ * candidate blocks (candidate_source). What else they keep is a window of their own. So
+ * once that layer has run on every row of a prompt, a row's output in the layers after it
+ * reaches the answer only through those windows, W - 1 rows back a layer: with D layers
+ * after it, the last D * (W - 1) + 1 rows give the last row and every window the next step
+ * reads exactly as all the rows do (2414 of a prompt in V4.1: 19 layers, a window of 128).
+ * The layers after it run on that tail only, with the same bits.
+ *
+ * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
+ * (DEEPINFER_YOCO_PREFILL_KEEP_TOKENS), a window and its backtracking, below the exact tail
+ * and so approximate; 0 runs every row. Returns the tail, or 0 where every row runs (a
+ * verify, the logits of every row, a prompt not past the tail, a model without the
+ * layout); *after gets the layer after which the tail starts. */
+static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, int *after) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("V41_PREFILL_TAIL"); env = e && *e ? atoi(e) : -1; }
+    *after = -1;
+    if (spec_batch || keep_rows || env == 0 || c->window < 1) return 0;
+    int P = -1;
+    for (int i = 0; i < c->n_layers; i++) if (c->compress_ratio[i] == 1) { P = i; break; }
+    if (P < 0 || P >= c->n_layers - 1 || !c->kv_source[P]) return 0;
+    for (int i = P + 1; i < c->n_layers; i++)       /* every later layer reads P's caches and owns none */
+        if (c->kv_source[i] || (c->compress_ratio[i] > 0 && c->index_owner[i] != P)) return 0;
+    if (c->candidate_source >= 0 && c->candidate_source != P) return 0;
+    int D = c->n_layers - 1 - P;
+    long exact = (long)D * (c->window - 1) + 1, tail = env > 0 ? env : exact;
+    if (tail < 1 || n - tail < 64) return 0;        /* not worth a copy */
+    *after = P;
+    return (int)tail;
+}
+
 static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
                          const uint8_t *image_mask, int keep_rows) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
     int start_pos = m->pos;
+    const int n_all = n, start_all = start_pos;   /* the prompt's rows, whatever the tail does */
+    int tail_after = -1, tail = v41_prefill_tail(c, n, spec_batch, keep_rows, &tail_after);
     /* The index-key schedule for a batched step: which layer publishes at each of its
      * sub-steps. It has to be known before the layers run, because a layer that comes
      * later in the stack still publishes before this layer's later rows read. */
@@ -4560,6 +4600,24 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
                          residual + (size_t)t * hc * dim, post + (size_t)t * hc,
                          comb + (size_t)t * hc * hc, hc, dim);
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));   /* the FFN's, for the next block */
+        if (layer == tail_after && tail > 0 && tail < n) {   /* v41_prefill_tail: the prompt's tail from here on */
+            int r0 = n - tail;
+            memmove(h, h + (size_t)r0 * hc * dim, (size_t)tail * hc * dim * sizeof(float));
+            memmove(pre_mix, pre_mix + (size_t)r0 * hc, (size_t)tail * hc * sizeof(float));
+            if (targets)   /* the DSpark input a target layer at or before this one already wrote */
+                memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
+            if (m->candidates && m->candidate_rows == n) {
+                memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
+                m->candidate_rows = tail;
+            }
+            n = tail; start_pos += r0;
+            if (trace_row >= n) trace_row = n - 1;
+            m->prefill_tail_rows += (unsigned long long)r0;
+            static int said;
+            if (!said++) fprintf(stderr, "[v41] prefill: the layers after layer %d run on a prompt's last %d rows "
+                                         "(%s; V41_PREFILL_TAIL=0 runs them all)\n", layer, tail,
+                                 getenv("V41_PREFILL_TAIL") && *getenv("V41_PREFILL_TAIL") ? "V41_PREFILL_TAIL" : "the same bits");
+        }
     }
 
     /* the last block's FFN mix collapses the stream one final time */
@@ -4584,14 +4642,17 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     }
 #endif
 
-    m->pos += n;
+    m->pos += n_all;
     /* Recorded where the tokens entered the state, and only for the MAIN stream:
      * the draft stages read this window and never write it, so a speculative
      * round adds nothing here until spec_verify commits through forward_batch. */
     if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
-    kv_prefix_record(&m->kvp, ids, start_pos, n);
+    kv_prefix_record(&m->kvp, ids, start_all, n_all);
+    /* the rows main_hidden holds, which DSpark's stages are seeded from: the tail when the
+     * prompt took one (their window is within it) */
     m->last_start = start_pos;
     m->last_rows = n;
+    m->last_from = start_all;
     m->forwards++;
     free(collapsed); free(comb); free(post); free(pre);
     free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
@@ -4768,7 +4829,7 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
         v41_mux_bind(m, slots[t]);
         kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
         m->pos = pos[t] + 1;
-        m->last_start = pos[t]; m->last_rows = 1;
+        m->last_start = m->last_from = pos[t]; m->last_rows = 1;
     }
     m->forwards++;
     free(pos); free(collapsed); free(comb); free(post); free(pre);
