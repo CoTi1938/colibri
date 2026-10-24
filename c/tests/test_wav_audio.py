@@ -106,6 +106,24 @@ class WavAudioTest(unittest.TestCase):
         decoded = openai_server.decode_wav_mono16k(wav, 'audio')
         self.np.testing.assert_array_equal(decoded, [0.25, -0.5])
 
+    def test_odd_trailing_chunk_may_omit_its_pad(self):
+        # RIFF ends on a 1-byte JUNK body. The pad byte is not in the file.
+        # wave reads the PCM; requiring the pad rejects a playable file.
+        data = struct.pack('<h', 16384)
+        chunks = self.chunk(b'fmt ', self.fmt()) + self.chunk(b'data', data)
+        chunks += b'JUNK' + struct.pack('<I', 1) + b'x'
+        wav = b'RIFF' + struct.pack('<I', 4 + len(chunks)) + b'WAVE' + chunks
+        decoded = openai_server.decode_wav_mono16k(wav, 'audio')
+        self.np.testing.assert_array_equal(decoded, [0.5])
+
+    def test_odd_chunk_missing_its_pad_before_the_end_is_rejected(self):
+        data = struct.pack('<h', 16384)
+        junk = b'JUNK' + struct.pack('<I', 1) + b'x'   # no pad, and data follows
+        chunks = self.chunk(b'fmt ', self.fmt()) + junk + self.chunk(b'data', data)
+        wav = b'RIFF' + struct.pack('<I', 4 + len(chunks)) + b'WAVE' + chunks
+        with self.assertRaises(openai_server.APIError):
+            openai_server.decode_wav_mono16k(wav, 'audio')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1333,8 +1333,13 @@ def decode_wav_mono16k(data, param):
     pos, fmt, raw = 12, None, None
     while pos + 8 <= end:
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
-        if pos + 8 + size + (size & 1) > end:
+        if pos + 8 + size > end:
             raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
+        # An odd chunk is word-padded, but the pad is optional when the RIFF
+        # size ends on that chunk's body. Python's wave module reads the PCM
+        # in that file. A missing pad earlier still swallows the next header,
+        # so only a chunk that ends on the boundary may omit it.
+        pad = (size & 1) and (pos + 8 + size < end)
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
             if len(body) < 16:
@@ -1342,7 +1347,7 @@ def decode_wav_mono16k(data, param):
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
-        pos += 8 + size + (size & 1)
+        pos += 8 + size + pad
     if pos != end:
         raise APIError(400, "WAV file has a truncated chunk header.", param, "invalid_value")
     if fmt is None or raw is None:
