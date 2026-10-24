@@ -1382,6 +1382,7 @@ typedef struct {
      * seed the stages with exactly the positions that were committed */
     int last_start, last_rows;
     int last_from;                          /* where the last forward's rows began: last_start but for a prompt's tail */
+    int ptail_after, ptail_rows;            /* this forward's tail (v41_prefill_tail), for the chain: 0 rows = none */
     unsigned long long prefill_tail_rows;   /* prompt rows the layers after the cross-layer source did not run (v41_prefill_tail) */
     /* Whether THIS forward's rows may be rolled back, i.e. whether it is the
      * speculative verify batch. The per-layer undo buffers (ring_save,
@@ -4420,6 +4421,29 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
     return (int)tail;
 }
 
+/* Past the source layer: the rows of the tail to the front of every per-row buffer the
+ * later layers read (the streams and their mix, the DSpark input a target layer at or
+ * before the source wrote, the candidate mask), the forward's rows and start the tail's. */
+static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
+    const Cfg *c = &m->c;
+    int dim = c->dim, hc = c->hc_mult, r0 = *n - tail;
+    memmove(h, h + (size_t)r0 * hc * dim, (size_t)tail * hc * dim * sizeof(float));
+    memmove(pre_mix, pre_mix + (size_t)r0 * hc, (size_t)tail * hc * sizeof(float));
+    if (targets && m->main_hidden)
+        memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
+    if (m->candidates && m->candidate_rows == *n) {
+        memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
+        m->candidate_rows = tail;
+    }
+    *n = tail; *start_pos += r0;
+    if (*trace_row >= tail) *trace_row = tail - 1;
+    m->prefill_tail_rows += (unsigned long long)r0;
+    static int said;
+    if (!said++) fprintf(stderr, "[v41] prefill: the layers after layer %d run on a prompt's last %d rows "
+                                 "(%s; V41_PREFILL_TAIL=0 runs them all)\n", m->ptail_after, tail,
+                         getenv("V41_PREFILL_TAIL") && *getenv("V41_PREFILL_TAIL") ? "V41_PREFILL_TAIL" : "the same bits");
+}
+
 static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
                          const uint8_t *image_mask, int keep_rows) {
@@ -4522,6 +4546,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     }
 
     int rows_out = spec_batch || keep_rows;
+    m->ptail_after = tail_after; m->ptail_rows = tail;
 #ifdef COLI_VULKAN
     /* the dense chain runs its layers on the device (every layer, or a partial chain's
      * first N, the streams of every row then back here); 0: the CPU runs them all */
@@ -4530,6 +4555,8 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
 #else
     int chained = 0;
 #endif
+    if (tail > 0 && tail < n && chained > tail_after)   /* the chain took the tail past the source: its rows from here on */
+        v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     for (int layer = chained; layer < c->n_layers; layer++) {
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
@@ -4600,24 +4627,8 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
                          residual + (size_t)t * hc * dim, post + (size_t)t * hc,
                          comb + (size_t)t * hc * hc, hc, dim);
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));   /* the FFN's, for the next block */
-        if (layer == tail_after && tail > 0 && tail < n) {   /* v41_prefill_tail: the prompt's tail from here on */
-            int r0 = n - tail;
-            memmove(h, h + (size_t)r0 * hc * dim, (size_t)tail * hc * dim * sizeof(float));
-            memmove(pre_mix, pre_mix + (size_t)r0 * hc, (size_t)tail * hc * sizeof(float));
-            if (targets)   /* the DSpark input a target layer at or before this one already wrote */
-                memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
-            if (m->candidates && m->candidate_rows == n) {
-                memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
-                m->candidate_rows = tail;
-            }
-            n = tail; start_pos += r0;
-            if (trace_row >= n) trace_row = n - 1;
-            m->prefill_tail_rows += (unsigned long long)r0;
-            static int said;
-            if (!said++) fprintf(stderr, "[v41] prefill: the layers after layer %d run on a prompt's last %d rows "
-                                         "(%s; V41_PREFILL_TAIL=0 runs them all)\n", layer, tail,
-                                 getenv("V41_PREFILL_TAIL") && *getenv("V41_PREFILL_TAIL") ? "V41_PREFILL_TAIL" : "the same bits");
-        }
+        if (layer == tail_after && tail > 0 && tail < n)   /* v41_prefill_tail: the prompt's tail from here on */
+            v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     }
 
     /* the last block's FFN mix collapses the stream one final time */

@@ -1176,7 +1176,12 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         }
         if (!ok) goto lost;
         int pending = 0;
-        for (int i = lo; i < hi && ok; i++) {
+        /* a chunk all before the prompt's tail stops after the cross-layer source
+         * (v41_prefill_tail): the layers after it run on the tail only */
+        int top = hi;
+        if (m->ptail_rows > 0 && m->ptail_after < hi - 1 && c0 + nr <= n - m->ptail_rows)
+            top = m->ptail_after + 1 > lo ? m->ptail_after + 1 : lo;   /* a second device's segment: none of it */
+        for (int i = lo; i < top && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {                                 /* the FFN branch of the layer before */
                 VkcEw add = {VKC_EW_ADD, nr * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
