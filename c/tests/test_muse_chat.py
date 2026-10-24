@@ -225,6 +225,17 @@ class MuseGatewayTest(unittest.TestCase):
         with self.assertRaises(openai_server.APIError):
             openai_server.render_chat_muse(ordered, tools=[WEATHER], current_date=DATE)
 
+    def test_a_deferred_tool_with_a_non_string_description_renders(self):
+        """A deferred tool appended its note to `description` with +, so a number,
+        array or object there raised TypeError, which do_POST answers with 500."""
+        for description in (5, ["x"], {"a": 1}):
+            with self.subTest(description=description):
+                tool = {"type": "function", "function": {
+                    "name": "lookup", "description": description, "defer_loading": True}}
+                got = openai_server.render_chat_muse([{"role": "user", "content": "x"}],
+                                                     tools=[tool], current_date=DATE)
+                self.assertIn("[deferred: use tool_search to load full schema]", got)
+
 
 if __name__ == "__main__":
     unittest.main()
