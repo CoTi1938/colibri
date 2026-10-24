@@ -189,7 +189,7 @@ static inline int spec_gate_pick_p(SpecGate *g, int src, int maxk, const float *
     if (maxk > SPEC_MAX_DRAFTS) maxk = SPEC_MAX_DRAFTS;
     if (g->off || !p) return maxk;
     if (g->since_plain >= SPEC_REFRESH) { g->declined[src]++; return 0; }
-    double a[SPEC_MAX_DRAFTS];
+    double a[SPEC_MAX_DRAFTS] = {0};
     for (int j = 0; j < maxk; j++) a[j] = spec_gate_p_rate(g, src, p[j]);
     int best = 0; double bv = 1.0;
     for (int k = 1; k <= maxk; k++) {
