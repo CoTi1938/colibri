@@ -36,6 +36,12 @@ class PortRangeTests(unittest.TestCase):
         self.addCleanup(sock.close)
         return sock
 
+    def test_port_below_one_is_setup_error(self):
+        for port in (0, -1):
+            with self.subTest(port=port):
+                with self.assertRaises(setup_flow.SetupError):
+                    setup_flow.pick_port("127.0.0.1", port)
+
     def test_free_last_port_remains_selectable(self):
         sock = self.listener(65535)
         sock.close()
