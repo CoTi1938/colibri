@@ -17,6 +17,8 @@
 #include "../backend_gpu_compat.h"   /* the runtime's names under HIP too (the planar blocks' host memory) */
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
 #include "../cuda_chain.h"
+#define KV16_INTEGER   /* kv16.h's integer rounding: the reference of ew's CC_EW_F16 */
+#include "../kv16.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -497,6 +499,42 @@ int main(void) {
         CcBuf *xb = up(x), *cb = up(cs, CC_UP);
         ck(T->begin() && T->rope(xb, cb, &p) && T->submit(1) && maxdiff(down(xb, x.size()).data(), ref.data(), x.size()) < 1e-5, "rotate-half from the host's table");
         T->free(xb); T->free(cb);
+    }
+    printf("float16 KV rows\n");
+    {
+        /* ew's CC_EW_F16 against kv16.h, every bit: ordinary values, past +-65504 (clamped), and
+         * small ones down through float16's subnormals to zero */
+        const int n = 4096;
+        std::vector<float> x = rnd(n, 51, 70000.f);
+        for (int i = 0; i < n / 4; i++) x[i] *= 1e-4f;
+        for (int i = n / 4; i < n / 2; i++) x[i] *= 1e-9f;
+        CcEw r = {CC_EW_F16, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        CcBuf *xb = up(x), *yb = up(std::vector<float>(n));
+        int ok = T->begin() && T->ew(yb, xb, NULL, NULL, NULL, &r) && T->submit(1), bad = 0;
+        std::vector<float> y = down(yb, n);
+        for (int i = 0; i < n && ok; i++) {
+            float c = kv16_clamp(x[i]); uint32_t cu, want, got; memcpy(&cu, &c, 4); want = kv16_round_bits(cu); memcpy(&got, &y[i], 4);
+            bad += got != want;
+        }
+        ck(ok && !bad, "ew's float16 rounding: the bits of kv16.h's");
+        T->free(xb); T->free(yb);
+        /* rope_f16: the rope and both rounds in one launch, the bits of the three launches; a
+         * partial rotation (16 of 40 values a head), as Qwen3.6's 64 of 256 */
+        if (T->size >= offsetof(ColiCudaChainOps, rope_f16) + sizeof T->rope_f16 && T->rope_f16) {
+            const int rows = 3, KV = 2, kvd = 40, half = 8;
+            std::vector<float> k = rnd((size_t)rows * KV * kvd, 61, 3.f), v = rnd((size_t)rows * KV * kvd, 62, 3.f), cs((size_t)rows * 2 * half);
+            for (int q = 0; q < rows; q++) for (int j = 0; j < half; j++) { float ang = (q + 7) * powf(10000.f, -2.f * j / (2 * half)); cs[(q * half + j) * 2] = cosf(ang); cs[(q * half + j) * 2 + 1] = sinf(ang); }
+            CcRope p = {rows * KV, KV, 0, KV * kvd, kvd, half, 0, 2 * half};
+            CcEw rr = {CC_EW_F16, rows * KV * kvd, KV * kvd, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+            CcBuf *k3 = up(k), *v3 = up(v), *k1 = up(k), *v1 = up(v), *cb = up(cs, CC_UP);
+            int three = T->begin() && T->rope(k3, cb, &p) && T->ew(k3, k3, NULL, NULL, NULL, &rr) && T->ew(v3, v3, NULL, NULL, NULL, &rr) && T->submit(1);
+            int one = T->begin() && T->rope_f16(k1, v1, cb, &p, kvd) && T->submit(1);
+            std::vector<float> ka = down(k3, k.size()), kb = down(k1, k.size()), va = down(v3, v.size()), vb = down(v1, v.size());
+            ck(three && one && !memcmp(ka.data(), kb.data(), k.size() * 4) && !memcmp(va.data(), vb.data(), v.size() * 4),
+               "rope_f16: K rotated and rounded, V rounded, the bits of rope and two ew");
+            ck(!T->rope_f16(k1, v1, cb, &p, 2 * half - 1), "rope_f16: a segment narrower than the rotation refused");
+            T->free(k3); T->free(v3); T->free(k1); T->free(v1); T->free(cb);
+        } else ck(0, "the backend has rope_f16");
     }
     printf("attn\n");
     {

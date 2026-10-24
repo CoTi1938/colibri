@@ -849,8 +849,13 @@ static int q36cc_attn_qkv(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     if (ok && half) { CcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = cc_rope(ch->q, ch->csd, &p); }
     if (ok && l->kn) { CcNorm p = {n * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->k, ch->prm, ch->k, &p); }
-    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->csd, &p); }
-    if (ok && q36_kv16()) {   /* K and V as the host's cache keeps them (float16): the CPU's numbers, before anything reads them */
+    /* K and V as the host's cache keeps them (float16): the CPU's numbers, before anything
+     * reads them. With a rotation, in the rope's launch (two launches a layer fewer: 0.8% of a
+     * Qwen3.6 GGUF's decode on an RTX PRO 4000) */
+    const int f16 = q36_kv16(), fused = f16 && half && cc_rope_f16_ready();
+    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half};
+                      ok = fused ? cc_rope_f16(ch->k, ch->v, ch->csd, &p, kvd) : cc_rope(ch->k, ch->csd, &p); }
+    if (ok && f16 && !fused) {
         CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
         ok = cc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && cc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
     }

@@ -113,6 +113,30 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
         y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }
+/* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 (ew's CC_EW_F16) */
+__device__ static inline float cc_f16_round(float x) {
+    if (x > 65504.f) x = 65504.f; else if (x < -65504.f) x = -65504.f;
+    unsigned u = __float_as_uint(x), s = u & 0x80000000u, m = u & 0x7fffffffu;
+    if (m > 0x7f800000u) u = u | 0x400000u;
+    else if (m >= 0x38800000u) u = s | ((m + 0xfffu + ((m >> 13) & 1u)) & 0xffffe000u);
+    else {
+        unsigned e = m >> 23, mm = (m & 0x7fffffu) | 0x800000u;
+        if (e < 102u) u = s;
+        else {
+            unsigned sh = 126u - e, n = (mm + (1u << (sh - 1u)) - 1u + ((mm >> sh) & 1u)) >> sh;
+            u = s | __float_as_uint(__fmul_rn((float)n, 5.9604644775390625e-8f));
+        }
+    }
+    return __uint_as_float(u);
+}
+/* one rotate-half pair, its roundings spelled out: a * c - b * s and b * c + a * s leave the
+ * compiler free to fuse either product, and it fused a different one once the pair moved here.
+ * These are the ones nvcc picked for cc_rope_k on sm_120 before, for cc_rope_k and cc_rope_f16_k
+ * alike, so their bits agree on every target and, on sm_120, are the rope's of before */
+__device__ static inline void cc_rope_pair(float a, float b, float c, float s, float *ra, float *rb) {
+    *ra = __fmaf_rn(a, c, -__fmul_rn(b, s));
+    *rb = __fmaf_rn(a, s, __fmul_rn(b, c));
+}
 __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict__ cs, CcRope p) {
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= (long long)p.nseg * p.half_) return;
@@ -120,10 +144,26 @@ __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict_
     int row = seg / p.per_row, hh = seg - row * p.per_row;
     int base = p.x_off + row * p.x_row + hh * p.x_seg;
     int cb = p.cs_off + row * p.cs_row + 2 * j;
-    float c = cs[cb], s = cs[cb + 1];
-    float a = x[base + j], b = x[base + j + p.half_];
-    x[base + j] = a * c - b * s;
-    x[base + j + p.half_] = b * c + a * s;
+    cc_rope_pair(x[base + j], x[base + j + p.half_], cs[cb], cs[cb + 1], &x[base + j], &x[base + j + p.half_]);
+}
+/* cc_rope_k, then each of a segment's seg values rounded to float16 (cc_f16_round), and the
+ * same values of v (at x's offsets) too: a float16 KV cache's new K and V rows in one launch
+ * where the rope and two ew took three. A thread a value: below half_ its pair, from 2 * half_
+ * the values past the rotation. */
+__global__ static void cc_rope_f16_k(float *__restrict__ x, float *__restrict__ v, const float *__restrict__ cs, CcRope p, int seg) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (long long)p.nseg * seg) return;
+    int sg = (int)(gid / seg), j = (int)(gid - (long long)sg * seg);
+    int row = sg / p.per_row, hh = sg - row * p.per_row;
+    int base = p.x_off + row * p.x_row + hh * p.x_seg;
+    if (j < p.half_) {
+        int cb = p.cs_off + row * p.cs_row + 2 * j;
+        float ra, rb;
+        cc_rope_pair(x[base + j], x[base + j + p.half_], cs[cb], cs[cb + 1], &ra, &rb);
+        x[base + j] = cc_f16_round(ra);
+        x[base + j + p.half_] = cc_f16_round(rb);
+    } else if (j >= 2 * p.half_) x[base + j] = cc_f16_round(x[base + j]);
+    v[base + j] = cc_f16_round(v[base + j]);
 }
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
@@ -740,21 +780,8 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
     } else if (p.op == 10) {
         int d = (int)(i % p.D);
         y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
-    } else if (p.op == 11) {   /* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 */
-        float x = a[p.a_off + i];
-        if (x > 65504.f) x = 65504.f; else if (x < -65504.f) x = -65504.f;
-        unsigned u = __float_as_uint(x), s = u & 0x80000000u, m = u & 0x7fffffffu;
-        if (m > 0x7f800000u) u = u | 0x400000u;
-        else if (m >= 0x38800000u) u = s | ((m + 0xfffu + ((m >> 13) & 1u)) & 0xffffe000u);
-        else {
-            unsigned e = m >> 23, mm = (m & 0x7fffffu) | 0x800000u;
-            if (e < 102u) u = s;
-            else {
-                unsigned sh = 126u - e, n = (mm + (1u << (sh - 1u)) - 1u + ((mm >> sh) & 1u)) >> sh;
-                u = s | __float_as_uint(__fmul_rn((float)n, 5.9604644775390625e-8f));
-            }
-        }
-        y[p.y_off + i] = __uint_as_float(u);
+    } else if (p.op == 11) {   /* kv16.h's kv16_round_bits line for line (cc_f16_round) */
+        y[p.y_off + i] = cc_f16_round(a[p.a_off + i]);
     }
 }
 
@@ -1124,6 +1151,12 @@ static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
     if (!c || !x || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1) return 0;
     cc_rope_k<<<grid1((size_t)p->nseg * p->half_, 64), 64, 0, c->stream>>>(fpw(x), fp(cs), *p);
     return launched(c, "rope");
+}
+static int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg) {
+    CcCtx *c = live();
+    if (!c || !x || !v || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1 || seg < 2 * p->half_) return 0;
+    cc_rope_f16_k<<<grid1((size_t)p->nseg * seg, 128), 128, 0, c->stream>>>(fpw(x), fpw(v), fp(cs), *p, seg);
+    return launched(c, "rope_f16");
 }
 /* A decode's attention split over its positions (cc_attn: up to 4 rows, no selection
  * list, from CC_ATTN_DEC_MIN positions; chain_attn_dec.comp's way): cc_attn_k gives a
@@ -1571,5 +1604,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_muse,
     cc_attn_w2,
     cc_kv16,
+    cc_rope_f16,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
