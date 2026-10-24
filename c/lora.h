@@ -84,14 +84,33 @@ static void lora_apply(const LoraTensor *t, const float *x, float *y, int S){
     }
 }
 
+/* Decimal layer index. sscanf %d is not usable here: a digit string that does
+ * not fit in int is undefined, and on this libc 4294967296 wraps to 0 and
+ * would load the tensor onto layer 0. Stop at the layer table instead. */
+static int lora_parse_layer(const char *s, int *n_out, const char **rest){
+    if(*s=='+') s++;                 /* "model.layers.+3" is the same layer as 3 */
+    if(*s<'0' || *s>'9') return -1;
+    int n=0;
+    while(*s>='0' && *s<='9'){
+        int d=*s-'0';
+        if(n > (LORA_MAX_LAYERS - d) / 10) return -1;
+        n=n*10+d;
+        s++;
+    }
+    if(n>=LORA_MAX_LAYERS) return -1;
+    *n_out=n; *rest=s;
+    return 0;
+}
+
 /* parse "model.layers.<n>.<suffix>" -> layer/tgt; -1 if not in the allowlist */
 static int lora_parse_target(const char *name, int *layer, int *tgt){
-    int n=-1, off=-1;
-    if(sscanf(name,"model.layers.%d.%n",&n,&off)!=1 || off<0) return -1;
-    /* the index sizes and addresses lut[]: below zero it writes before it */
-    if(n<0 || n>=LORA_MAX_LAYERS) return -1;
+    static const char prefix[]="model.layers.";
+    if(strncmp(name,prefix,sizeof(prefix)-1)) return -1;
+    int n; const char *rest;
+    if(lora_parse_layer(name+(sizeof(prefix)-1),&n,&rest) || *rest!='.') return -1;
+    rest++;
     for(int k=0;k<LORA_NTGT;k++)
-        if(!strcmp(name+off,lora_tgt_suffix[k])){ *layer=n; *tgt=k; return 0; }
+        if(!strcmp(rest,lora_tgt_suffix[k])){ *layer=n; *tgt=k; return 0; }
     return -1;
 }
 
