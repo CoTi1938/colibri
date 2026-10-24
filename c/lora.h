@@ -14,6 +14,7 @@
  * Reader/writer reuse st.h + json.h; no new dependencies. */
 #ifndef LORA_H
 #define LORA_H
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,8 +135,14 @@ static LoraAdapter *lora_load(const char *dir, uint64_t expect_fp, int unsafe){
         fprintf(stderr,"[LORA] LORA_UNSAFE=1: loading anyway\n");
     }
 
+    /* (float) of a non-finite alpha is inf, and scale = alpha/rank then poisons
+     * every adapted layer. A finite alpha, including 0, is a real scale. */
+    double ad=jalpha->num;
+    float alpha=(float)ad;
+    if(!isfinite(ad) || !isfinite(alpha)){
+        fprintf(stderr,"[LORA] alpha is not finite\n"); return NULL; }
     LoraAdapter *a=calloc(1,sizeof(*a));
-    a->rank=rank; a->alpha=(float)jalpha->num; a->base_fp=fp;
+    a->rank=rank; a->alpha=alpha; a->base_fp=fp;
     if(jbm&&jbm->t==J_STR) snprintf(a->base_model,sizeof(a->base_model),"%s",jbm->str);
     a->n=jtg->len;
     a->t=calloc(a->n,sizeof(LoraTensor));
