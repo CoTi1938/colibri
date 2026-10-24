@@ -14,6 +14,7 @@
  * Reader/writer reuse st.h + json.h; no new dependencies. */
 #ifndef LORA_H
 #define LORA_H
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,8 +124,12 @@ static LoraAdapter *lora_load(const char *dir, uint64_t expect_fp, int unsafe){
         fprintf(stderr,"[LORA] unsupported format (want %s)\n",LORA_FORMAT); return NULL; }
     if(!jrank||jrank->t!=J_NUM||!jalpha||jalpha->t!=J_NUM||!jtg||jtg->t!=J_ARR||jtg->len<1){
         fprintf(stderr,"[LORA] adapter.json: missing rank/alpha/targets\n"); return NULL; }
-    int rank=(int)jrank->num;
-    if(rank<1||rank>LORA_MAX_RANK){ fprintf(stderr,"[LORA] rank %d outside [1,%d]\n",rank,LORA_MAX_RANK); return NULL; }
+    /* Cast only after the range check: (int)4.5 is 4, which then passes
+     * [1, LORA_MAX_RANK] and sizes the A/B reads for the wrong rank. */
+    double rd=jrank->num;
+    if(!isfinite(rd) || rd<1.0 || rd>(double)LORA_MAX_RANK || rd!=floor(rd)){
+        fprintf(stderr,"[LORA] rank must be an integer in [1,%d]\n",LORA_MAX_RANK); return NULL; }
+    int rank=(int)rd;
     uint64_t fp=0;
     if(jfp&&jfp->t==J_STR) fp=strtoull(jfp->str,NULL,16);
     if(fp!=expect_fp){
