@@ -18,16 +18,34 @@ export type Table = {
 /* Split one row into cells. The outer pipes are delimiters when present, so
    they are stripped before splitting rather than left to produce empty edge
    cells — otherwise "| a | b |" and "a | b" would disagree on column count.
-   A backslash-escaped pipe is content. */
+   A pipe is content only when an odd run of backslashes precedes it. An even
+   run is that many literal backslashes, and the pipe is still a delimiter:
+   `\\|` is a path that ends in `\` followed by the next cell. */
 export function splitRow(line: string): string[] {
   let text = line.trim()
   if (text.startsWith("|")) text = text.slice(1)
-  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1)
+  if (text.endsWith("|")) {
+    let slashes = 0
+    for (let i = text.length - 2; i >= 0 && text[i] === "\\"; i--) slashes++
+    if (slashes % 2 === 0) text = text.slice(0, -1)
+  }
 
   const out: string[] = []
   let cell = ""
   for (let at = 0; at < text.length; at++) {
-    if (text[at] === "\\" && text[at + 1] === "|") { cell += "|"; at++; continue }
+    if (text[at] === "\\") {
+      let run = 1
+      while (text[at + run] === "\\") run++
+      cell += "\\".repeat(Math.floor(run / 2))
+      if (run % 2 === 1 && text[at + run] === "|") {
+        cell += "|"
+        at += run
+        continue
+      }
+      if (run % 2 === 1) cell += "\\"
+      at += run - 1
+      continue
+    }
     if (text[at] === "|") { out.push(cell); cell = ""; continue }
     cell += text[at]
   }
