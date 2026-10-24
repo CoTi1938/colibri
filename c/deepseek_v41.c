@@ -1311,7 +1311,7 @@ typedef struct {
     int pause, min_accept, max_verify;
     uint64_t window_prop, window_acc;
     /* How many of a round's drafts to verify, from the head's own confidence in each
-     * (DeepSeek's confidence-scheduled verification, DeepInfer): sigmoid of its score is
+     * (DeepSeek's confidence-scheduled verification): sigmoid of its score is
      * the acceptance it predicts, spec_draft.h's gate maps it through what it measured and
      * against what a verify of that many rows costs here. V41_DSPARK_GATE=0: every draft. */
     SpecGate gate;
@@ -4397,8 +4397,8 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 
-/* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay",
- * DeepInfer, doc/inference_deployment_qa.md). From the first layer with compress_ratio 1 on
+/* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay"
+ * in its deployment notes). From the first layer with compress_ratio 1 on
  * (20 in V4.1, n_prefill_layer there), the layers read the long context only from that
  * layer's caches: its compressed KV and index keys (kv_source, index_owner) and its
  * candidate blocks (candidate_source). What else they keep is a window of their own. So
@@ -4409,7 +4409,7 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
  * The layers after it run on that tail only, with the same bits.
  *
  * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
- * (DEEPINFER_YOCO_PREFILL_KEEP_TOKENS), a window and its backtracking, below the exact tail
+ * (a window and its backtracking), below the exact tail
  * and so approximate; 0 runs every row. Returns the tail, or 0 where every row runs (a
  * verify, the logits of every row, a prompt not past the tail, a model without the
  * layout); *after gets the layer after which the tail starts. */

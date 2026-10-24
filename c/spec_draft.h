@@ -34,7 +34,7 @@
  *                 acceptance the gate measured for drafts given that estimate (SPEC_PBINS
  *                 bins of p, each starting at the bin's own p, worth two verifies). A step
  *                 whose drafts are sure verifies deeper, a doubtful one stops early or takes
- *                 a plain step (DeepSeek's "confidence-scheduled verification", DeepInfer).
+ *                 a plain step (DeepSeek's "confidence-scheduled verification").
  *
  * Neither ever changes a token: every proposal goes through the engine's verify, which
  * keeps exactly what plain decoding produces. They change how many forwards that takes.

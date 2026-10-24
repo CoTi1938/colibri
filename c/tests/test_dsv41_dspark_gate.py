@@ -1,5 +1,5 @@
 """DeepSeek V4.1's DSpark verify depth from the head's confidence (spec_draft.h's
-spec_gate_pick_p, DeepInfer's confidence-scheduled verification): it changes how many drafts
+spec_gate_pick_p, DeepSeek's confidence-scheduled verification): it changes how many drafts
 a round verifies, never a token. The tiny fixture (tools/make_dsv41_tiny.py) carries two
 DSpark stages with random weights; greedy decoding must give the same bytes with the head
 off, with the gate (the default) and without it (V41_DSPARK_GATE=0), and the gate must have

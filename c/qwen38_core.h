@@ -5802,7 +5802,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
             }
             free(hidden);
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
-             * confidence-scheduled verification, DeepInfer): the drafts past it go unverified.
+             * confidence-scheduled verification): the drafts past it go unverified.
              * The first stays (the head pass that made it is a plain step's too). */
             int known=1;
             for(int j=0;j<k;j++)known=known&&sp->ahead_p[j]>=0.0f;
