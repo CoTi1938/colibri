@@ -77,7 +77,7 @@ static int gr__push(Grammar *G, int ri, int ai, const GrSym *sy){
         A->s=ns; A->cap=nc; }
     A->s[A->n++]=*sy; return 0;
 }
-/* Names are kept whole: generated grammars (llama.cpp's schema converter) use
+/* Names are kept whole: generated grammars (JSON-schema converters) use
  * long names that share their first 63 bytes and are still different rules. */
 static int gr__rule(Grammar *G, const char *name, int len){
     for(int i=0;i<G->n;i++)

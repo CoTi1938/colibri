@@ -52,7 +52,7 @@ int main(void){
     gr_free(&G);
 
     /* rule names longer than 63 bytes that share a prefix stay distinct rules:
-     * llama.cpp's schema converter writes names like these for nested objects */
+     * JSON-schema converters write names like these for nested objects */
     {
         static char src[1024];
         const char *pre = "root-properties-shipping-address-properties-street-line-number-kind";
