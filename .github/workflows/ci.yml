@@ -1747,8 +1747,11 @@ jobs:
           cd c
           python3 tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp
           cp ref_glm.json glm_tiny_mtp/
-          for g in COLI_SPEC_GATE=1 COLI_SPEC_GATE=0; do
-            env $g SNAP=./glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 DRAFT=2 ./colibri 64 16 16
+          # MTP_PSTEP=0: the depth from the gate's averages, not each step's drafts' probabilities
+          for g in COLI_SPEC_GATE=1 COLI_SPEC_GATE=0 "COLI_SPEC_GATE=1 MTP_PSTEP=0"; do
+            for d in 1 2; do
+              env $g SNAP=./glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json COLI_TEMP=0 ORACLE_STRICT=1 DRAFT=$d ./colibri 64 16 16
+            done
           done
       - name: Structural efficiency tests
         # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
