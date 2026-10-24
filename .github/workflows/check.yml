@@ -201,6 +201,8 @@ jobs:
             python tools/make_flint_tiny.py --out /tmp/flint_$experts --emit-ref /tmp/flint_$experts/ref.json \
               --gguf /tmp/flint_$experts/model.gguf --gguf-experts $experts
             COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
+            # the KV cache in float16, as a serve keeps it (a .json reference keeps float32 unless Q36_KV says)
+            COLI_CUDA=0 COLI_VULKAN=0 Q36_KV=f16 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
             # the sliding layers' KV in a ring of window + 9 rows (the least spare), shorter than the run
             COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json 2> ring.log
             grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }

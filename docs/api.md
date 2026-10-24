@@ -41,6 +41,13 @@ the end of the context: a reasoning model's turn is its reasoning plus its answe
 Stop sequences are removed from the response and end generation early in both JSON and
 streaming modes.
 
+On the GLM engine, legacy `POST /v1/completions` also accepts a non-empty
+`prompt` array of integer token IDs, for example `[12, 345, 6]`. The IDs go
+directly to the engine's pre-tokenized intake; they must be non-negative and
+within the model's vocabulary. An out-of-vocabulary ID receives a `prompt`
+400. Other engines currently reject token-ID prompts with a named 400, and
+batched prompts (arrays of strings or arrays of arrays) remain unsupported.
+
 A trailing `assistant` message *continues* that turn instead of starting a new
 one: the prompt ends inside it, which is the official template rendered with
 `add_generation_prompt=False`. This is on by default — a message list ending in a
@@ -547,6 +554,16 @@ thinking on that engine. Then select the model with `pi --list-models` or the
 KV configuration actually allows. Tool calling in pi works on the engines in
 the [tool-calling matrix](#tool-calling-support) above; on unsupported engines
 pi's tool calls fail the same way any OpenAI `tools` request does.
+
+The same provider entry serves the other engines — swap the model `id` and
+`name` (`qwen3.6-colibri` for Qwen3.6, `deepseek-v4-flash-colibri` for DeepSeek
+V4 Flash; `coli status` prints the id of the running model). Serve with a
+context that fits pi's preamble plus the working set: pi sends its system
+prompt, tool catalog and project instructions — about 5,000 tokens — before the
+first user word, so start the server with e.g. `coli serve --ctx 32768` and set
+`contextWindow` to the same value. Measured with pi 1.4.0 against
+Qwen3.6-35B-A3B resident in RAM (Vulkan, Ryzen 9 9950X): the ~4,900-token
+preamble prefills in about 30 s, and follow-up turns reuse the cached prefix.
 
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
 URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy

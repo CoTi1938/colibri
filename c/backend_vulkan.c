@@ -7,6 +7,7 @@
 //
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
+#include <math.h>
 #include "backend_vulkan.h"
 #include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
@@ -277,6 +278,7 @@ struct ColiVkTensor {
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
     size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
     size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
+    uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
 };
 
 /* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
@@ -1173,7 +1175,22 @@ int coli_vk_init(const char *spv_path) {
     {
         const char *e = getenv("COLI_VK_COOP");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0')) {
+        /* AMD's own driver (Windows, 32.0.32015.7029) crashed inside its compiler on a
+         * Radeon 780M once the cooperative-matrix features were on, before the engine was
+         * ready, with subgroups of 64 and of 32 alike (#2289): a crash in the driver no
+         * fallback here can catch, so the default leaves them off on that driver.
+         * RADV runs them on the same chip (measured). COLI_VK_COOP=1 tries them. */
+        int amd_own = 0;
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 dp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+            vkGetPhysicalDeviceProperties2(G.phys, &dp2);
+            amd_own = dp.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !(e && *e == '1');
+            if (amd_own && !(e && *e == '0'))
+                fprintf(stderr, "[VK] cooperative matrix off on AMD's own driver (%s %s: it crashed compiling the shader "
+                                "on a Radeon 780M, #2289); COLI_VK_COOP=1 tries it\n", dp.driverName, dp.driverInfo);
+        }
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0') && !amd_own) {
             VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12f};
             vkGetPhysicalDeviceFeatures2(G.phys, &f2);
             VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp = {
@@ -1955,6 +1972,17 @@ static int fmt_uploadable(int fmt, int gs) {
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
+/* The cooperative-matrix GEMMs (qmatmul_coop.comp, chain_gemm.comp) hold the dequantised weights, code
+ * times scale, in f16. A matrix with a scale past 65504 / (the format's largest code) would turn to inf
+ * there and its output column to NaN; GLM-5.3 Flash's layer-0 v_proj has 148 weights of 1e20 to 1e33
+ * (int4 g64 scales to 1e34), which the fp32 GEMMs and the CPU take in stride. Such a matrix stays on them. */
+static int scales_wide(int fmt, const float *scales, size_t n) {
+    if (!scales || !(fmt == 1 || fmt == 2 || fmt == 4 || fmt == 5 || fmt == 7 || fmt == 12)) return 0;
+    /* largest |code|: int8 127, fp8 e4m3 448, int4 8 (also bounds int3 and MXFP4) */
+    float lim = 65504.0f / (fmt == 12 ? 448.0f : fmt == 1 ? 127.0f : 8.0f);
+    for (size_t i = 0; i < n; i++) if (!(fabsf(scales[i]) <= lim)) return 1;   /* also a NaN */
+    return 0;
+}
 static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
@@ -1963,6 +1991,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
     if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
         if (!t) return 0;
+        t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
         static const float one = 1.0f;   /* float weights: no scales */
         UpRows rows = {weights, cpu_row_bytes(fmt, I), (size_t)t->rowWords * 4};
         size_t sb = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -1986,6 +2015,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
     void *wptr, *sptr;
     ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, &wptr, &sptr);
     if (!t) return 0;
+    t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = cpu_row_bytes(fmt, I);
     for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
@@ -2262,8 +2292,8 @@ static void vk_prof_paths(void) {
  * boundaries on its staged steps (one group scale per step). */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
-    return t->fmt == 1 || t->fmt == 2 ||
-           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0);
+    return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0));
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
  * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
@@ -2631,9 +2661,19 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
     return on;
 }
 
+/* #2289: a COLI_VULKAN set in another console left a Vulkan build on the CPU without a
+ * word. The build says the device stays unused, and why, once a process. */
+void coli_vk_say_unused(const char *engine) {
+    static int said;
+    const char *on = getenv("COLI_VULKAN");
+    if (said++) return;
+    fprintf(stderr, "[VK] %s: %s: the Vulkan device stays unused (COLI_VULKAN=1 uses it)\n", engine,
+            on && *on ? "COLI_VULKAN=0" : "COLI_VULKAN is not set");
+}
+
 int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
-    if (!on || !atoi(on)) return 0;
+    if (!on || !atoi(on)) { coli_vk_say_unused(engine); return 0; }
     char buf[1024];
     const char *spv = coli_vk_shader_path(buf, sizeof buf);
     int ok = coli_vk_init(spv) && coli_vk_available();
@@ -6099,7 +6139,7 @@ int coli_vk_core(ColiVkCore *o) {
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
     if (!t || !o || t->dev != 0) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     return 1;
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
@@ -6132,7 +6172,7 @@ int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *
 int coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *o, int *dev) {
     if (!t || !o || t->dev < 0 || t->dev > 1) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     if (dev) *dev = t->dev;
     return 1;
 }

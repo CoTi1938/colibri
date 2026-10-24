@@ -3716,7 +3716,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
          * COLI_VK_DENSE_HOST's host copies of those layers given back, before the expert cache
          * sizes itself from the free memory and before the tier */
         g53c_start(m);
-    }
+    } else coli_vk_say_unused("glm53");   /* #2289 */
 #endif
     /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
      * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non

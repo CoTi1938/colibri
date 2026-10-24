@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -2439,11 +2440,15 @@ class DispatcherTest(unittest.TestCase):
             polls += 1
             return disconnected or polls > 20
 
-        with self.assertRaises(ClientCancelled):
+        log = io.StringIO()
+        with self.assertRaises(ClientCancelled), contextlib.redirect_stderr(log):
             engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: the departure and the freed slot are in the log
+        self.assertIn("the client left while the engine was generating", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_cancels_generation_before_first_frame(self):
         # #908: a client that disconnects while the engine is still prefilling
@@ -2477,17 +2482,22 @@ class DispatcherTest(unittest.TestCase):
                 outcome.append("cancelled")
 
         thread = threading.Thread(target=generate)
-        thread.start()
-        for _ in range(200):
-            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
-                break
-            time.sleep(0.01)
-        flag["cancelled"] = True
-        thread.join(timeout=2)
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            thread.start()
+            for _ in range(200):
+                if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                    break
+                time.sleep(0.01)
+            flag["cancelled"] = True
+            thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         engine.close()
         self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: a client gone while the prompt is read is named as such
+        self.assertIn("the client left while the engine was reading the prompt", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
@@ -2540,7 +2550,8 @@ def _capture_frames(body, path="/v1/completions"):
                           data=data, headers=headers)
         with urlopen(request, timeout=2) as response:
             status = response.status
-            parsed = json.load(response)
+            parsed = (response.read().decode() if body.get("stream")
+                      else json.load(response))
     finally:
         server.scheduler.close()
         server.shutdown()
@@ -2675,6 +2686,56 @@ class SeedWireFrameTest(unittest.TestCase):
         self.assertEqual(status_seeded, 200)
         self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
         self.assertEqual(frames_seeded, frames_plain)
+
+
+class CompletionTokenIdsTest(unittest.TestCase):
+    def test_glm_token_ids_reach_the_engine_without_text_tokenization(self):
+        body = {"model": "test-model", "prompt": [12, 345, 6],
+                "temperature": 0, "max_tokens": 4}
+        status, response, frames = _capture_frames(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["choices"][0]["text"], "Hello")
+        self.assertEqual(frames, [b"SUBMIT 1 0 8 4 0 0.9 0 ids=1\n12 345 6\n"])
+
+    def test_streaming_token_ids_use_the_same_wire(self):
+        status, _, frames = _capture_frames({"model": "test-model", "prompt": [12, 345],
+                                             "stream": True, "max_tokens": 4})
+        self.assertEqual(status, 200)
+        self.assertEqual(frames, [b"SUBMIT 1 0 6 4 0.7 0.9 0 ids=1\n12 345\n"])
+
+    def test_other_engines_refuse_token_ids_before_generation(self):
+        engine = ScriptedEngine(supports_tok_ids=False)
+        base = _spawn_test_server(self, engine)
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": [12, 345]}))
+        self.assertEqual((status, error["param"], error["code"]),
+                         (400, "prompt", "unsupported_parameter"))
+        self.assertEqual(engine.calls, [])
+
+    def test_malformed_token_ids_are_refused_before_generation(self):
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine)
+        for prompt in ([], [True], [1.0], [-1], [2147483648], [1, "2"], [[1, 2]]):
+            with self.subTest(prompt=prompt):
+                status, error = _error_body(self, lambda: _post_completions(base, {
+                    "model": "test-model", "prompt": prompt}))
+                self.assertEqual((status, error["param"]), (400, "prompt"))
+        self.assertEqual(engine.calls, [])
+
+    def test_out_of_vocabulary_id_is_a_named_client_error(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ERROR " + rid + b" BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        base = _spawn_test_server(self, engine)
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": [2147483647]}))
+        self.assertEqual((status, error["param"], error["code"]),
+                         (400, "prompt", "invalid_value"))
 
 
 class CapSentinelShimTest(unittest.TestCase):

@@ -6752,7 +6752,12 @@ class Engine:
                  gbytes_before_ext=False):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
-        payload = prompt.encode("utf-8")
+        # GLM's ids=1 intake consumes decimal token IDs directly, without a
+        # detokenize/re-tokenize round trip. The completion route checks the
+        # list and engine capability before it reaches this wire builder.
+        token_ids = isinstance(prompt, list)
+        payload = (" ".join(map(str, prompt)).encode("ascii") if token_ids
+                   else prompt.encode("utf-8"))
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
         gpayload = grammar.encode("utf-8") if grammar else b""
@@ -6816,11 +6821,13 @@ class Engine:
             ext += f" logprobs={int(logprobs)}"
         if pin:
             ext += " pin=1"
+        if token_ids:
+            ext += " ids=1"
         # `gbytes_before_ext` asks for the 7th numeric field ahead of the extension keys
         # even with no grammar or audio payload to describe. It defaults to False, so
         # every caller that does not ask keeps the wire it had.
         gbytes_field = (f" {len(xpayload)}"
-                        if (xpayload or (ext and gbytes_before_ext)) else "")
+                        if (xpayload or token_ids or (ext and gbytes_before_ext)) else "")
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
                   + (prefix_field if prefix_field else gbytes_field)
@@ -6857,9 +6864,28 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        produced = False   # a DATA or TOOL frame came: the engine is past the prompt
+        cancel_at = 0.0
         # DATA's numeric tail, in emission order. Stays empty when logprobs is 0, because
         # the dispatcher never parses a tail for a request that did not ask for one.
         generated_logprobs = []
+
+        def _cancel():
+            # #2290: the client left mid-turn. The admission (the slot) stays this
+            # request's until the engine stops, so say so: without a line the server
+            # looks healthy and idle while every later request queues behind it.
+            nonlocal cancel_sent, cancel_at
+            cancel_sent = True
+            cancel_at = time.monotonic()
+            sys.stderr.write(f"[api] {request_id}: the client left while the engine was "
+                             f"{'generating' if produced else 'reading the prompt'}; "
+                             "cancelling, the slot frees when the engine stops\n")
+            self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+
+        def _cancelled():
+            sys.stderr.write(f"[api] {request_id}: the engine stopped "
+                             f"{time.monotonic() - cancel_at:.1f} s after the cancel; the slot is free\n")
+            return ClientCancelled()
 
         def _accept(info):
             # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
@@ -6890,8 +6916,7 @@ class Engine:
                 # orphaned generation. Wait for the engine's ERROR CANCELLED /
                 # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                    _cancel()
                 elif not cancel_sent and not stop_sent and pending.failed is not None:
                     # A fault was recorded for this request, so nothing it generates from
                     # here can reach the client. The turn is still the engine's -- the
@@ -6914,6 +6939,7 @@ class Engine:
                 _accept(value)
             elif kind == "data":
                 _accept({"prompt_tokens": None})
+                produced = True
                 # The dispatcher wraps the payload in a tuple only when a logprob record
                 # rides along; bare bytes is the non-opted-in shape.
                 data, record = value if isinstance(value, tuple) else (value, None)
@@ -6928,8 +6954,7 @@ class Engine:
                         # Same admission-holding rule as the idle branch above:
                         # send CANCEL, then keep consuming frames until the
                         # engine acknowledges with ERROR CANCELLED or DONE.
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "echo":
                 # Lettura del prefill: arriva PRIMA di ogni DATA e non e' testo
                 # generato, quindi non passa da decode() e non entra nella
@@ -6939,14 +6964,14 @@ class Engine:
                     on_echo(value)
             elif kind == "tool":
                 _accept({"prompt_tokens": None})
+                produced = True
                 if not cancel_sent and not stop_sent:
                     decode_tool(value)
                     if stopped and stopped():
                         stop_sent = True
                         self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
                     elif cancelled and cancelled():
-                        cancel_sent = True
-                        self._write_frame(request_id, f"CANCEL {request_id}\n".encode(), "CANCEL")
+                        _cancel()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -6954,7 +6979,7 @@ class Engine:
                     # (or honored it at a token boundary and still framed a
                     # DONE). Either way the client is gone: the ack is what
                     # mattered, the output is not deliverable.
-                    raise ClientCancelled()
+                    raise _cancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -6974,8 +6999,12 @@ class Engine:
                 # scheduler's outcome, and tries to write a 500 to a socket that is already
                 # closed. An ERROR carrying any other text is the engine's own account of
                 # why the turn ended; that is news, and it is still reported as a failure.
-                raise ClientCancelled()
+                raise _cancelled()
             else:
+                if token_ids and isinstance(value, RuntimeError) and str(value) == "BAD_REQUEST":
+                    raise APIError(400, "The engine rejected this token-ID `prompt` "
+                                   "(check IDs against the model vocabulary).",
+                                   "prompt", "invalid_value") from value
                 raise value
 
     def close(self):
@@ -9471,6 +9500,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
+        if isinstance(prompt, list):
+            if not getattr(self.server.engine, "supports_tok_ids", False):
+                raise APIError(400, "Token-ID `prompt` is not supported by this engine.",
+                               "prompt", "unsupported_parameter")
+            if not prompt or any(isinstance(token, bool) or not isinstance(token, int) or
+                                 not 0 <= token <= 2147483647 for token in prompt):
+                raise APIError(400, "`prompt` must be a non-empty array of non-negative "
+                               "32-bit token IDs.", "prompt", "invalid_value")
+            self.generation(body, prompt, request_id, False)
+            return
         if not isinstance(prompt, str):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:

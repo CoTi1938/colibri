@@ -49,8 +49,16 @@ struct CcCtx {
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
+    /* the scratch a resize retired: freed once a later frame has been waited for (a stream
+     * sync here could wait on a cc_wait_host kernel whose host side comes after this frame) */
+    float *adec_old[4]; int adec_n_old;
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
+/* the retired attention scratches, after the stream was seen to pass the frames that read them */
+static void cc_adec_reap(CcCtx *c) {
+    for (int i = 0; i < c->adec_n_old; i++) cudaFree(c->adec_old[i]);
+    c->adec_n_old = 0;
+}
 int g_ncc, g_cur = -1;   /* g_cur: index into g_cc of the current context */
 CcStats g_st;
 
@@ -732,6 +740,21 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
     } else if (p.op == 10) {
         int d = (int)(i % p.D);
         y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
+    } else if (p.op == 11) {   /* kv16.h's kv16_round_bits line for line: clamped, the nearest float16 */
+        float x = a[p.a_off + i];
+        if (x > 65504.f) x = 65504.f; else if (x < -65504.f) x = -65504.f;
+        unsigned u = __float_as_uint(x), s = u & 0x80000000u, m = u & 0x7fffffffu;
+        if (m > 0x7f800000u) u = u | 0x400000u;
+        else if (m >= 0x38800000u) u = s | ((m + 0xfffu + ((m >> 13) & 1u)) & 0xffffe000u);
+        else {
+            unsigned e = m >> 23, mm = (m & 0x7fffffu) | 0x800000u;
+            if (e < 102u) u = s;
+            else {
+                unsigned sh = 126u - e, n = (mm + (1u << (sh - 1u)) - 1u + ((mm >> sh) & 1u)) >> sh;
+                u = s | __float_as_uint(__fmul_rn((float)n, 5.9604644775390625e-8f));
+            }
+        }
+        y[p.y_off + i] = __uint_as_float(u);
     }
 }
 
@@ -885,6 +908,7 @@ static void cc_shutdown(void) {
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
             c->up_made = 0; c->up_seq = 0;
             if (c->adec) cudaFree(c->adec);
+            cc_adec_reap(c);
         }
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
@@ -974,6 +998,7 @@ static int cc_submit(int wait) {
     int ok = cc_ok(c, cudaEventSynchronize(c->ev), "frame wait");
     g_st.waits++; g_st.wait_ms += cc_now_ms() - t0;
     c->ev_pending = 0;
+    if (ok) cc_adec_reap(c);
     return ok;
 }
 static int cc_finish(void) {
@@ -984,6 +1009,7 @@ static int cc_finish(void) {
     if (ok && c->cs_ok) ok = cc_ok(c, cudaStreamSynchronize(c->cs), "finish copies");
     g_st.waits++; g_st.wait_ms += cc_now_ms() - t0;
     c->ev_pending = 0;
+    if (ok) cc_adec_reap(c);
     return ok;
 }
 
@@ -1235,7 +1261,10 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* rare: the context past what it was; the frames before done first */
-            if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
+            if (c->adec) {   /* retired, not freed: the frames before may still read it, and a sync here can deadlock a hybrid layer */
+                if (c->adec_n_old == 4) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cc_adec_reap(c); }
+                c->adec_old[c->adec_n_old++] = c->adec;
+            }
             c->adec = nullptr; c->adec_bytes = 0;
             size_t want = need + need / 2;
             if (cudaMalloc((void **)&c->adec, want) == cudaSuccess) c->adec_bytes = want;
@@ -1300,9 +1329,14 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_ADD: case CC_EW_SWIGLU: if (!a || !b) return 0; break;
     case CC_EW_COMBINE: if (!(p->flags & 8) && !a) return 0; if ((p->flags & 1) && !b) return 0;
                         if ((p->flags & 2) && !cb) return 0; if ((p->flags & 4) && !e) return 0; if (p->D < 1) return 0; break;
-    case CC_EW_HC_LOW: case CC_EW_HC_INJ: case CC_EW_SCALE: if (!a) return 0; break;
+    case CC_EW_HC_LOW: case CC_EW_HC_INJ: case CC_EW_SCALE: case CC_EW_F16: if (!a) return 0; break;
     case CC_EW_HC_MIX: case CC_EW_HC_APPLY: if (!a || !b || p->D < 1 || p->C < 1) return 0; break;
     case CC_EW_GATE_ADD: if (!a || !b || !e || p->D < 1) return 0; break;
+    /* Muse Spark's attention gate and residual gate: the kernel has had them since the
+     * chain took Muse (cc_muse), but this switch refused them, so its every forward fell
+     * back to the host's step (tests/test_cuda_ew_ops_source.py) */
+    case CC_EW_SIGMUL: if (!a || !b) return 0; break;
+    case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
     default: return 0;
     }
     cc_ew_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
@@ -1493,7 +1527,10 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* the frames before done first, as in cc_attn */
-            if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
+            if (c->adec) {   /* retired, not freed: the frames before may still read it, and a sync here can deadlock a hybrid layer */
+                if (c->adec_n_old == 4) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cc_adec_reap(c); }
+                c->adec_old[c->adec_n_old++] = c->adec;
+            }
             c->adec = nullptr; c->adec_bytes = 0;
             size_t want = need + need / 2;
             if (cudaMalloc((void **)&c->adec, want) == cudaSuccess) c->adec_bytes = want;
@@ -1517,6 +1554,7 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 }
 
 static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
+static int cc_kv16(void) { return 1; }   /* ew's F16 */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1532,5 +1570,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_w,
     cc_muse,
     cc_attn_w2,
+    cc_kv16,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

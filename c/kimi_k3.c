@@ -302,7 +302,8 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
 
 /* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
  * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
- * MemAvailable, Windows ullAvailPhys, macOS free+inactive+purgeable. #855. */
+ * MemAvailable, Windows ullAvailPhys bounded by the commit still grantable
+ * (compat_meminfo), macOS free+inactive+purgeable. #855. */
 static double k3_mem_avail(void){
 #ifdef _WIN32
     double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
@@ -1365,7 +1366,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
 #endif
         g_k3_vk=coli_vk_init_env_tier("kimi_k3",vkt_wanted()&&any_sparse&&!cuda_on);
         k3_dho_decide(m,vkt_wanted()&&any_sparse&&!cuda_on,cuda_on);   /* COLI_VK_DENSE_HOST, before the cache is sized */
-    }
+    } else if(!(getenv("K3_VK")&&*getenv("K3_VK"))) coli_vk_say_unused("kimi_k3");   /* #2289 (K3_VK=0 closes it on purpose) */
 #endif
 #ifdef COLI_METAL
     { const char *ev=getenv("K3_METAL");

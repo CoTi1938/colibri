@@ -1162,13 +1162,19 @@ typedef struct {
  * Q36Row. mpos and rope_delta are an image turn's rope positions: the decode rows of
  * that turn sit past them. */
 typedef struct {
-    float **K, **V, **DN_rec, **DN_conv;
+    void **K, **V;   /* q36_kv_es() bytes an element */
+    float **DN_rec, **DN_conv;
     int kv_len;
     kv_prefix kvp;
     int *mpos, mpos_len, rope_delta;
     int *ring_pos;
 } Q36Seq;
 typedef struct { Q36Seq *seq; int pos; } Q36Row;
+/* serve_mux's conversations (defined with it, below), for the chains that keep each
+ * conversation's state on the device (qwen36_chain.h, q36c_conv_*) */
+static int g_q36_mux_slots;
+static Q36Seq *g_q36_mux_seq;
+static int g_q36_mux_cur;
 
 typedef struct {
     Cfg c;
@@ -1199,7 +1205,7 @@ typedef struct {
      * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
     double t_disk;
     uint8_t **ehit;
-    float **K, **V; int kv_len, max_t, kv_cap;
+    void **K, **V; int kv_len, max_t, kv_cap;   /* K, V: q36_kv_es() bytes an element (float16 or float) */
     int kv_ring, *ring_pos;   /* a sliding-window layer's KV ring (q36_kv_rows): its rows, the position each holds */
     /* What the current attention and DeltaNet state was built from, so a
      * turn that resends the transcript prefills only the new tail. The ids
@@ -1278,7 +1284,7 @@ static int q36_ring_for(const Cfg *c, int max_t) {
 static inline int q36_kv_rows(const Model *m, int layer) {
     return m->kv_ring && m->c.win_layer && m->c.win_layer[layer] ? m->kv_ring : m->max_t;
 }
-/* where position t of KV head h starts in layer `layer`'s K or V, in floats */
+/* where position t of KV head h starts in layer `layer`'s K or V, in elements (q36_kv_es) */
 static inline int64_t q36_kv_at(const Model *m, int layer, int h, int t) {
     int R = q36_kv_rows(m, layer);
     return ((int64_t)h * R + t % R) * m->c.k_head_dim;
@@ -1473,6 +1479,35 @@ static void tm_report(void){
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+#include "kv16.h"
+
+/* ---- the KV cache's numbers (kv16.h) ------------------------------------------------
+ * K and V are kept as float16: half the RAM of float32, each value clamped to +-65504 and
+ * rounded to the nearest float16 (kv16.h says why float16 and not bf16). A step's rows
+ * are rounded in its scratch before anything reads them (attention), so every read sees
+ * the same numbers: a key from the cache or from the scratch, the CPU's or a chain's,
+ * which rounds its rows alike before it writes them. Q36_KV=f32 keeps float32 (an A/B,
+ * the float32 references of the tiny oracles). The arrays are void *: their elements are
+ * q36_kv_es() bytes, and these helpers read and write them as floats. */
+static int g_q36_kv16 = -1;
+static inline int q36_kv16(void) {
+    if (g_q36_kv16 < 0) { const char *e = getenv("Q36_KV"); g_q36_kv16 = !(e && !strcmp(e, "f32")); }
+    return g_q36_kv16;
+}
+static inline size_t q36_kv_es(void) { return q36_kv16() ? sizeof(uint16_t) : sizeof(float); }
+static inline void *q36_kv_ptr(void *base, int64_t idx) { return (char *)base + idx * (int64_t)q36_kv_es(); }
+static inline void q36_kv_put(void *base, int64_t idx, const float *src, int64_t n) {
+    if (q36_kv16()) kv16_pack((uint16_t *)base + idx, src, n);
+    else memcpy((float *)base + idx, src, (size_t)n * sizeof(float));
+}
+static inline float q36_kv_dot(const float *q, const void *base, int64_t idx, int n) {
+    return q36_kv16() ? kv16_dot_lanes(q, (const uint16_t *)base + idx, n) : dot_f32_lanes(q, (const float *)base + idx, n);
+}
+static inline void q36_kv_axpy(float *y, float a, const void *base, int64_t idx, int n) {
+    if (q36_kv16()) { kv16_axpy(y, a, (const uint16_t *)base + idx, n); return; }
+    const float *v = (const float *)base + idx;
+    for (int i = 0; i < n; i++) y[i] += a * v[i];
+}
 
 /* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
  * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
@@ -4519,6 +4554,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
     }
+    /* the step's K and V as the cache keeps them (float16, q36_kv16), before anything reads them:
+     * a row reads the same numbers from here as from the cache */
+    if (q36_kv16()) { kv16_round(k, (int64_t)S*KV*kvd); kv16_round(vv, (int64_t)S*KV*kvd); }
     float scale = 1.f / sqrtf((float)hd);
     const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     /* A sliding layer's ring (q36_kv_rows): the step's own rows are read from k/vv, where
@@ -4528,9 +4566,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (!ring)
         for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
             int t = mr ? mr[s].pos : pos_base + s;
-            float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
-            memcpy(Kl + q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-            memcpy(Vl + q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+            void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            q36_kv_put(Kl, q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd);
+            q36_kv_put(Vl, q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd);
         }
     else
         for (int s = 0; s < (mr ? S : 1); s++) {   /* the rows before the step's: still in the ring */
@@ -4547,7 +4585,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int s = 0; s < S; s++) {
             int kvh = hh / q_per_kv;
             int qpos = mr ? mr[s].pos : pos_base + s;
-            const float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            const void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
             const float *qv = query + ((int64_t)s*H + hh)*hd;
             int tid = 0;
 #ifdef _OPENMP
@@ -4561,8 +4599,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int sp0 = mr ? qpos : pos_base, tb = ring ? (sp0 > t0 ? sp0 : t0) : qpos + 1;
             const float *Kb = k + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd, *Vb = vv + (int64_t)(mr ? s : 0)*KV*kvd + kvh*kvd;
             for (int t = t0; t <= qpos; t++) {
-                const float *kv = t < tb ? Kl + q36_kv_at(m, layer, kvh, t) : Kb + (int64_t)(t - sp0)*KV*kvd;
-                float acc = dot_f32_lanes(qv, kv, kvd);
+                float acc = t < tb ? q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd)
+                                   : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*KV*kvd, kvd);
                 sc[t] = acc * scale;
             }
             if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
@@ -4576,18 +4614,20 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             float *cx = ctx + ((int64_t)s*H + hh)*hd;
             for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
             for (int t = t0; t <= qpos; t++) {
-                const float *vrow = t < tb ? Vl + q36_kv_at(m, layer, kvh, t) : Vb + (int64_t)(t - sp0)*KV*kvd;
-                float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
+                float a = sc[t];
+                if (t < tb) { q36_kv_axpy(cx, a, Vl, q36_kv_at(m, layer, kvh, t), kvd); continue; }
+                const float *vrow = Vb + (int64_t)(t - sp0)*KV*kvd;
+                for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
             }
         }
     }
     if (ring)   /* the step's rows into the ring: its last `ring` (an earlier one would be overwritten here) */
         for (int s = !mr && S > ring ? S - ring : 0; s < S; s++) {
             int t = mr ? mr[s].pos : pos_base + s;
-            float *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
+            void *Kl = mr ? mr[s].seq->K[layer] : m->K[layer], *Vl = mr ? mr[s].seq->V[layer] : m->V[layer];
             for (int kvh = 0; kvh < KV; kvh++) {
-                memcpy(Kl + q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-                memcpy(Vl + q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+                q36_kv_put(Kl, q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd);
+                q36_kv_put(Vl, q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd);
             }
             int *rp = mr ? mr[s].seq->ring_pos : m->ring_pos;
             if (rp) rp[t % ring] = t;
@@ -5951,13 +5991,22 @@ static int trunk_probe_gpu_wins(Model *m){
     return wins;
 }
 
-/* Only single-slot CPU serve prefill supplies a control callback. Other
+/* Only single-slot serve prefill supplies a control callback. Other
  * forwards, including decode, speculation and Segment, never read stdin. */
 typedef struct {
     int (*poll)(void *ctx);
     void *ctx;
     int result;
 } Q36StepControl;
+
+/* The prompt's control for the chains (qwen36_chain.h, qwen36_cuda_chain.h): set by
+ * step_ex_control around their forward, polled between two prompt chunks. A chain that
+ * sees a STOP or CANCEL there returns 0 with control->result set: the chunks before it
+ * stand on the device, and step_ex_control drops the whole prompt (q36_prefill_abort). */
+static Q36StepControl *g_q36_ctl;
+static inline int q36_chunk_control(void) {
+    return g_q36_ctl && (g_q36_ctl->result = g_q36_ctl->poll(g_q36_ctl->ctx)) != 0;
+}
 
 static int layers_forward_control(Model *m, float *x, int S, int pos_base,
                                   int layer_begin, int layer_end,
@@ -6053,6 +6102,7 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
  * DECIDE path sets it around its one prefill and nothing else ever does. */
 static float *g_hidden_sink = NULL;
 
+static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conversation in to rebuild it */
 #ifdef COLI_VULKAN
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
@@ -6152,7 +6202,8 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
-    (void)chain_logit;
+    int stopped = 0;   /* a chain saw the prompt's control between two chunks */
+    (void)chain_logit; (void)stopped;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row. A partial chain
@@ -6164,8 +6215,12 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #endif
         if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
+        g_q36_ctl = control;
         chain_n = q36c_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        if (!chain_n) {
+        g_q36_ctl = NULL;
+        if (!chain_n && control && control->result) {   /* stopped between two prompt chunks */
+            free(chain_logit); chain_logit = NULL; stopped = 1;
+        } else if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36c_cpu_step(m, pos_base);
             /* Earlier chunks may have returned their final rows for Clef or
@@ -6177,15 +6232,19 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #endif
 #ifdef COLI_CUDA
     /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen36_cuda_chain.h), every layer */
-    if (g_cuda_chain && !chain_logit) {
+    if (g_cuda_chain && !chain_logit && !stopped) {
         int echo = 0, rows_only = 0;
 #ifndef QWEN36_NO_MAIN
         echo = g_echo_k > 0 && g_echo_id && S > 1;
 #endif
         if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
+        g_q36_ctl = control;
         chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        if (!chain_n) {
+        g_q36_ctl = NULL;
+        if (!chain_n && control && control->result) {
+            free(chain_logit); chain_logit = NULL; stopped = 1;
+        } else if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36cc_cpu_step(m, pos_base);
             for (int s = 0; s < S; s++)
@@ -6193,10 +6252,10 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
-    if (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
-                                               c->n_layers, 1, lf, control)) {
-        /* Some layers may have advanced, others not. Neither the previous
-         * prefix nor a partially processed prompt describes this state. */
+    if (stopped || (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
+                                                           c->n_layers, 1, lf, control))) {
+        /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
+         * the previous prefix nor a partially processed prompt describes this state. */
         q36_prefill_abort(m);
         free(x);
         if (lf) fclose(lf);
@@ -6294,7 +6353,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
  * step parks them all and runs one forward over a row of each (q36_step_rows). */
 static void q36_seq_swap(Model *m, Q36Seq *q) {
 #define Q36_SEQ_SWAP(T,a,b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
-    Q36_SEQ_SWAP(float **, m->K, q->K); Q36_SEQ_SWAP(float **, m->V, q->V);
+    Q36_SEQ_SWAP(void **, m->K, q->K); Q36_SEQ_SWAP(void **, m->V, q->V);
     Q36_SEQ_SWAP(float **, m->DN_rec, q->DN_rec); Q36_SEQ_SWAP(float **, m->DN_conv, q->DN_conv);
     Q36_SEQ_SWAP(int, m->kv_len, q->kv_len); Q36_SEQ_SWAP(kv_prefix, m->kvp, q->kvp);
     Q36_SEQ_SWAP(int *, m->mpos, q->mpos); Q36_SEQ_SWAP(int, m->mpos_len, q->mpos_len);
@@ -6317,7 +6376,7 @@ static void q36_seq_free(Model *m, Q36Seq *q) {
 static int q36_seq_alloc(Model *m, Q36Seq *q) {
     Cfg *c = &m->c; memset(q, 0, sizeof *q);
     int n = c->n_layers;
-    q->K = calloc((size_t)n, sizeof(float *)); q->V = calloc((size_t)n, sizeof(float *));
+    q->K = calloc((size_t)n, sizeof(void *)); q->V = calloc((size_t)n, sizeof(void *));
     q->DN_rec = calloc((size_t)n, sizeof(float *)); q->DN_conv = calloc((size_t)n, sizeof(float *));
     int ok = q->K && q->V && q->DN_rec && q->DN_conv && kv_prefix_alloc(&q->kvp, m->kv_cap);
     if (ok && m->kv_ring) {   /* the Model's layout: its sliding layers' rings */
@@ -6327,7 +6386,7 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
     for (int i = 0; ok && i < n; i++) {
         if (c->is_attn[i]) {
             size_t kv = (size_t)c->kv_heads * q36_kv_rows(m, i) * c->k_head_dim;
-            q->K[i] = malloc(kv * sizeof(float)); q->V[i] = malloc(kv * sizeof(float));
+            q->K[i] = malloc(kv * q36_kv_es()); q->V[i] = malloc(kv * q36_kv_es());
             ok = q->K[i] && q->V[i];
         } else if (m->DN_rec[i]) {
             q->DN_rec[i] = calloc((size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, sizeof(float));
@@ -6361,9 +6420,32 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
         q36_embed_row(m, ids[s], INT_MAX, x + (int64_t)s*D);   /* never an image's row */
     }
     tier_rebuild_evicted(m);
-    m->mux_rows = rows;
-    layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
-    m->mux_rows = NULL;
+    float *chain_logit = NULL;
+#ifdef COLI_VULKAN
+    /* the Vulkan chain, each row's attention and DeltaNet on its conversation's state on the
+     * device (q36c_mux_step); else the host's path, every row's state on the host first */
+    if (g_vk_chain) {
+        chain_logit = falloc((int64_t)S * c->vocab);
+        if (!q36c_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36c_mux_host(m, rows, S, 0); }
+    }
+#endif
+#ifdef COLI_CUDA
+    if (!chain_logit && g_cuda_chain) {   /* the same on the CUDA chain */
+        chain_logit = falloc((int64_t)S * c->vocab);
+        if (!q36cc_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36cc_mux_host(m, rows, S, 0); }
+    }
+#endif
+    if (!chain_logit) {
+        m->mux_rows = rows;
+        layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
+        m->mux_rows = NULL;
+#ifdef COLI_VULKAN
+        if (g_vk_chain) q36c_mux_host(m, rows, S, 1);
+#endif
+#ifdef COLI_CUDA
+        if (m->cchain) q36cc_mux_host(m, rows, S, 1);
+#endif
+    }
     for (int s = 0; s < S; s++) {
         Q36Seq *q = rows[s].seq;
         kv_prefix_record(&q->kvp, ids + s, rows[s].pos, 1);
@@ -6371,6 +6453,11 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
     }
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
+    if (chain_logit) {   /* the chain ran the final norm and lm_head */
+        q36_logits_out(c, chain_logit, (int64_t)S * c->vocab);
+        free(x);
+        return chain_logit;
+    }
     float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
     double _th = tm_now();
     for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
@@ -6677,7 +6764,7 @@ static void ensure_kv(Model *m){
      * per head -- one flat memcpy would land every head but the first at the
      * wrong offset, and that reads as a plausible answer from another
      * conversation rather than as a crash. */
-    float **oldK = m->K, **oldV = m->V;
+    void **oldK = m->K, **oldV = m->V;
     int old_stride = m->kv_cap, keep = m->K ? m->kvp.len : 0;
     if (keep > old_stride) keep = old_stride;
     if (keep > m->max_t)   keep = m->max_t;
@@ -6694,7 +6781,8 @@ static void ensure_kv(Model *m){
         }
     }
     if (!ring) { free(m->ring_pos); m->ring_pos = NULL; }
-    m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
+    m->K = calloc((size_t)c->n_layers, sizeof(void *)); m->V = calloc((size_t)c->n_layers, sizeof(void *));
+    const size_t es = q36_kv_es();
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
@@ -6704,26 +6792,34 @@ static void ensure_kv(Model *m){
                 continue;
             }
             int rows = win ? ring : m->max_t, ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
-            m->K[i] = falloc((int64_t)c->kv_heads * rows * kvd);
-            m->V[i] = falloc((int64_t)c->kv_heads * rows * kvd);
+            m->K[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
+            m->V[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
+            if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM KV cache, layer %d\n", i); exit(1); }
             if (keep > 0 && oldK && oldK[i] && oldV[i])
                 for (int h = 0; h < c->kv_heads; h++){
-                    memcpy(m->K[i] + (int64_t)h*rows*kvd,
-                           oldK[i] + (int64_t)h*ostride*kvd, (size_t)keep*kvd*sizeof(float));
-                    memcpy(m->V[i] + (int64_t)h*rows*kvd,
-                           oldV[i] + (int64_t)h*ostride*kvd, (size_t)keep*kvd*sizeof(float));
+                    memcpy(q36_kv_ptr(m->K[i], (int64_t)h*rows*kvd),
+                           q36_kv_ptr(oldK[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
+                    memcpy(q36_kv_ptr(m->V[i], (int64_t)h*rows*kvd),
+                           q36_kv_ptr(oldV[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
                 }
         } else { m->K[i] = NULL; m->V[i] = NULL; }
     }
     if (ring && ring != old_ring) {
         int nw = 0;
         for (int i = 0; i < c->n_layers; i++) nw += c->is_attn[i] && c->win_layer[i];
-        double row = 2.0 * c->kv_heads * c->k_head_dim * sizeof(float) / 1073741824.0;
+        double row = 2.0 * c->kv_heads * c->k_head_dim * (double)es / 1073741824.0;
         fprintf(stderr, "[qwen36] KV: %d sliding-window layers keep a ring of %d rows (window %d, %d spare), not %d: "
                         "%.2f GiB of their cache instead of %.2f\n", nw, ring, c->window, ring - c->window, m->max_t,
                 nw * row * ring, nw * row * m->max_t);
     }
     m->kv_ring = ring;
+    if (!oldK) {   /* the first cache: its numbers, said once */
+        double gib = 0;
+        for (int i = 0; i < c->n_layers; i++)
+            if (c->is_attn[i]) gib += 2.0 * c->kv_heads * q36_kv_rows(m, i) * c->k_head_dim * (double)es / 1073741824.0;
+        fprintf(stderr, "[qwen36] KV cache: %s, %.2f GiB at %d positions%s\n", q36_kv16() ? "float16" : "float32", gib, m->max_t,
+                q36_kv16() ? " (half of float32; Q36_KV=f32 keeps float32)" : "");
+    }
     if (oldK){
         for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
         free(oldK); free(oldV);
@@ -7514,17 +7610,14 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * the KV rows are position-indexed, so this has to be the real offset. */
     /* Keep all fresh rows in one pass through each layer, without adding
      * row-chunk traversals over streamed experts when the cache is small.
-     * Poll only the CPU text path; the other backends keep their own state and
-     * the multiplexed loop exclusively owns its command stream. */
+     * The CPU's layers poll between two layers (the device's matrices and the
+     * expert tier hold no state of the prompt), the Vulkan and CUDA chains
+     * between two prompt chunks (#2290: a client gone mid-prompt freed its slot
+     * only once the whole prompt was read). The multiplexed loop exclusively
+     * owns its command stream. */
     int interruptible = g_q36_mux_slots == 1 && q->logprobs == 0
                        && !getenv("DUMP_LAYERS") && !m->vis_rows
-                       && !qt_ready() && !qq_active();
-#ifdef COLI_VULKAN
-    if (g_vk_ready || vkt_ready()) interruptible = 0;
-#endif
-#ifdef COLI_CUDA
-    if (g_cuda_chain) interruptible = 0;
-#endif
+                       && !qq_active();
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
     int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
@@ -7978,9 +8071,23 @@ typedef struct {
 
 static void q36_mux_bind(Model *m, int slot){
     if (g_q36_mux_cur == slot) return;
+    /* the chains' device state is the held conversation's: its DeltaNet state to the
+     * host before it leaves, nothing on the device the next one's */
+#ifdef COLI_VULKAN
+    if (g_vk_chain && g_q36_mux_cur >= 0) q36c_mux_leave(m);
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain && g_q36_mux_cur >= 0) q36cc_mux_leave(m);
+#endif
     if (g_q36_mux_cur >= 0) q36_seq_swap(m, &g_q36_mux_seq[g_q36_mux_cur]);   /* the held one back */
     if (slot >= 0) q36_seq_swap(m, &g_q36_mux_seq[slot]);
     g_q36_mux_cur = slot;
+#ifdef COLI_VULKAN
+    if (g_vk_chain) q36c_mux_enter(m, slot);
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q36cc_mux_enter(m, slot);
+#endif
 }
 
 /* The whole context's KV for every slot, before READY: slot 0 is the Model's own. */
@@ -8047,6 +8154,12 @@ static void serve_mux(Model *m){
     int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
+#ifdef COLI_VULKAN
+    if (g_vk_chain) q36c_mux_init(m);   /* each conversation's state on the device while there is room */
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q36cc_mux_init(m);
+#endif
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
@@ -8103,8 +8216,12 @@ static void serve_mux(Model *m){
             free(lo);
         }
         if (ended) {
+#ifdef COLI_CUDA
+            q36cc_report(m);
+#endif
 #ifdef COLI_VULKAN
             vk_report();
+            q36c_report(m);   /* the prompts the chain ran */
             vk_tier_turn(m, "turn");
 #endif
             emap_emit(m);
@@ -8378,7 +8495,7 @@ static void vk_release(void *ctx, void *h) { (void)ctx; slot_release((Slot *)h);
  * before them took their room and the KV cache's allocation failed). */
 static size_t q36_kv_later(Model *m) {
     Cfg *c = &m->c; int ctx = qwen36_max_ctx(), R = q36_ring_for(c, ctx);
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), b = 0;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * q36_kv_es(), b = 0;
     for (int i = 0; i < c->n_layers; i++)
         if (c->is_attn[i]) b += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     int thr = 1;
@@ -8591,6 +8708,14 @@ int main(int argc, char **argv) {
     if (cap < 0) { fprintf(stderr, "cache/layer must be >= 0 (0 = auto; got %d)\n", cap); return 1; }
     if (bits < 2 || bits > 8) { fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits); return 1; }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+    /* An argv reference (.json: the tiny oracles' tokens, PPL's text) was written by float32
+     * arithmetic: its run keeps a float32 KV cache unless Q36_KV says otherwise, so a token
+     * compares against the numbers that chose it (a tiny random model's near ties flip on a
+     * rounding of K and V: Muse Spark's oracle, 3 of 16 in bf16). A serve, a chat, a prompt: float16. */
+    if (argc > 3 && !getenv("Q36_KV") && !(getenv("SERVE") && getenv("SERVE")[0] == '1')) {
+        size_t n = strlen(refpath);
+        if (n >= 5 && !strcmp(refpath + n - 5, ".json")) g_q36_kv16 = 0;
+    }
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
@@ -8692,11 +8817,10 @@ int main(int argc, char **argv) {
     /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
-    if (g_vk_chain && g_q36_mux_slots > 1) {
-        g_vk_chain = 0;
-        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
-                        "the expert tier runs every conversation's experts\n", g_q36_mux_slots);
-    }
+    if (g_vk_chain && g_q36_mux_slots > 1)
+        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain keeps each conversation's state on the device while there "
+                        "is room, and runs its prompts and every conversation's decode rows (COLI_VK_CHAIN_MUX caps the places)\n",
+                g_q36_mux_slots);
     if (g_vk_ready) {
         /* COLI_VK_IMPORT: 1 the device reads the dense rows in place, 0 it copies them.
          * Unset: in place for a model without routed experts (Qwen3.8-27B, Clef) on a
@@ -9043,7 +9167,7 @@ int main(int argc, char **argv) {
         int scored = tf_nll(&m, full, nfull, np, &nll);
         double dt = now_s() - t;
         double tot = m.hits + m.miss;
-        printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
+        printf("TF-NLL: %.6f nats/token over %d tokens | ppl = %.4f\n", nll, scored, exp(nll));
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
@@ -9170,7 +9294,8 @@ typedef struct {
 
 typedef struct {
     Qwen36SegmentEngine *engine;
-    float **K, **V, **DN_rec, **DN_conv;
+    void **K, **V;   /* q36_kv_es() bytes an element */
+    float **DN_rec, **DN_conv;
     uint32_t context_tokens, position;
 } Qwen36SegmentSession;
 
@@ -9361,8 +9486,8 @@ static int qwen36_segment_session_create(
                                       options->context_tokens, &cells) ||
                 coli_segment_size_mul(cells, (size_t)config->k_head_dim,
                                       &cells)) goto oom;
-            session->K[layer] = calloc(cells, sizeof(float));
-            session->V[layer] = calloc(cells, sizeof(float));
+            session->K[layer] = calloc(cells, q36_kv_es());
+            session->V[layer] = calloc(cells, q36_kv_es());
             if (!session->K[layer] || !session->V[layer]) goto oom;
         } else {
             if (coli_segment_size_mul((size_t)config->dn_vheads,
@@ -9455,14 +9580,14 @@ static int qwen36_segment_spans(
          layer < session->engine->layer_end; layer++) {
         if (config->is_attn[layer]) {
             size_t row_bytes = (size_t)position * config->k_head_dim *
-                               sizeof(float);
+                               q36_kv_es();
             size_t stride = (size_t)session->context_tokens *
                             config->k_head_dim;
             for (int kv = 0; kv < 2; kv++) {
-                float *state = kv ? session->V[layer] : session->K[layer];
+                void *state = kv ? session->V[layer] : session->K[layer];
                 for (int head = 0; head < config->kv_heads; head++)
                     spans[count++] = (ColiSegmentStateSpan){
-                        state + head * stride, row_bytes};
+                        q36_kv_ptr(state, (int64_t)(head * stride)), row_bytes};
             }
         } else {
             size_t rec_cells, conv_cells;
