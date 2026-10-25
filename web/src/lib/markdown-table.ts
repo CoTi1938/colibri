@@ -85,8 +85,10 @@ export function parseTableAt(lines: string[], from: number): Table | null {
   const align = rowAlignments(lines[from + 1])
   if (!align) return null
 
+  /* GFM: the header and the delimiter row have the same number of cells, or this
+     is not a table. A line with a pipe followed by a "---" rule is prose and a rule. */
   const head = splitRow(header)
-  if (!head.length || head.every((cell) => !cell)) return null
+  if (!head.length || head.every((cell) => !cell) || head.length !== align.length) return null
 
   const rows: string[][] = []
   let at = from + 2
