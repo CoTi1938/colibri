@@ -110,6 +110,25 @@ int main(void){
         free(js);
     }
 
+    /* 4c) a non-finite alpha becomes scale inf and is applied to every layer. */
+    {
+        char jpath[1100]; snprintf(jpath,sizeof(jpath),"%s/adapter.json",adir);
+        FILE *jf=fopen(jpath,"rb"); CHECK(jf);
+        fseek(jf,0,SEEK_END); long jn=ftell(jf); fseek(jf,0,SEEK_SET);
+        char *js=malloc((size_t)jn+1);
+        CHECK(js && fread(js,1,(size_t)jn,jf)==(size_t)jn);
+        fclose(jf); js[jn]=0;
+        char *at=strstr(js,"\"alpha\":8,");
+        CHECK(at);
+        jf=fopen(jpath,"wb"); CHECK(jf);
+        CHECK(fwrite(js,1,(size_t)(at-js),jf)==(size_t)(at-js));
+        fputs("\"alpha\":1e9999,",jf);
+        fputs(at+10,jf);
+        CHECK(fclose(jf)==0);
+        CHECK(lora_load(adir,0xabcdef12345678ULL,0)==NULL);
+        free(js);
+    }
+
     /* 5) a target's layer index sizes and indexes the lookup table: a negative
      * index, or one no model has, is refused instead of written out of bounds */
     const int bad_layers[2]={-1,1<<20};
