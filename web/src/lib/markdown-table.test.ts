@@ -68,6 +68,11 @@ describe("parsing a table out of a line array", () => {
     expect(parseTableAt(["a | b", "c | d"], 0)).toBeNull()
   })
 
+  it("is null when the delimiter row has a different number of cells than the header", () => {
+    expect(parseTableAt(["Run `cat log | grep error` to filter.", "---"], 0)).toBeNull()
+    expect(parseTableAt(["| a | b |", "|---|---|---|"], 0)).toBeNull()
+  })
+
   it("is null for a line with no pipe, and past the end", () => {
     expect(parseTableAt(["plain", "|---|"], 0)).toBeNull()
     expect(parseTableAt(["| a |", "|---|"], 9)).toBeNull()
