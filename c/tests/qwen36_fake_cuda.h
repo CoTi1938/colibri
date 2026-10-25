@@ -662,6 +662,27 @@ static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
     out->d[1] = z > 0.f ? 1.f / z : 0.f;
     return 1;
 }
+static int fcc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
+    if (!fcc_ready() || !t || !ids || !x || !y || n < 1 || !t->w || (t->fmt != 0 && t->fmt != 1)) return 0;
+    if ((size_t)t->I * 4 > x->bytes || (size_t)n * 4 > ids->bytes || (size_t)n * 4 > y->bytes) return 0;
+    fake_chain_ops++;
+    const int *id = (const int *)ids->d;
+    for (int j = 0; j < n; j++) {
+        int o = id[j];
+        if (o < 0 || o >= t->O) { y->d[j] = -INFINITY; continue; }
+        float a = 0.f;
+        if (t->fmt == 1 && t->sc) {
+            const int8_t *w = (const int8_t *)t->w + (size_t)o * t->I;
+            for (int i = 0; i < t->I; i++) a += x->d[i] * (float)w[i];
+            y->d[j] = a * t->sc[o];
+        } else if (t->fmt == 0) {
+            const float *w = (const float *)t->w + (size_t)o * t->I;
+            for (int i = 0; i < t->I; i++) a += x->d[i] * w[i];
+            y->d[j] = a;
+        } else return 0;
+    }
+    return 1;
+}
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static ColiCudaChainOps fake_chain_table = {
     CC_OPS_BASE_SIZE /* no routed experts in the frame by default: the engines' host step */, fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
@@ -671,7 +692,7 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_qsa, fcc_ple,
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    fcc_pick,
+    fcc_pick, fcc_matmul_rows,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

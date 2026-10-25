@@ -929,6 +929,57 @@ __global__ static void __launch_bounds__(256) cc_pick_k(const float *__restrict_
         ((float *)out)[1] = tot > 0.f ? 1.f / tot : 0.f;
     }
 }
+/* backend_cuda.cu's gx4_idx: every 8 float4s padded by 1 so the 8 warps' 4-way shared loads
+ * land in distinct banks. cc_matmul_rows_i8_k has gemv_i8_rows<1, 1>'s layout for a row list
+ * ids[0..n), but sums 16 products before adding them: its bits can differ (drafts only). */
+__device__ static inline int cc_gx4(int k) { return k + (k >> 3); }
+template <int PAD>
+__global__ static void __launch_bounds__(256) cc_matmul_rows_i8_k(float *__restrict__ y, const float *__restrict__ x,
+        const int8_t *__restrict__ w, const float *__restrict__ sc, const int *__restrict__ ids, int I, int O, int n) {
+    extern __shared__ float4 sx[];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, I4 = I >> 2, I16 = I >> 4;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    for (int i = tid; i < I4; i += 256) sx[PAD ? cc_gx4(i) : i] = x4[i];
+    __syncthreads();
+    int j = (int)blockIdx.x * 8 + warp;
+    if (j >= n) return;
+    int o = ids[j];
+    if (o < 0 || o >= O) { if (lane == 0) y[j] = -INFINITY; return; }
+    const int4 *wr = reinterpret_cast<const int4 *>(w + (size_t)o * I);
+    float acc = 0.f;
+    for (int i = lane; i < I16; i += 32) {
+        int4 v = wr[i];
+        const int8_t *q = reinterpret_cast<const int8_t *>(&v);
+        int k = i * 4;
+        float4 x0 = sx[PAD ? cc_gx4(k) : k], x1 = sx[PAD ? cc_gx4(k + 1) : k + 1];
+        float4 x2 = sx[PAD ? cc_gx4(k + 2) : k + 2], x3 = sx[PAD ? cc_gx4(k + 3) : k + 3];
+        acc += (float)q[0] * x0.x + (float)q[1] * x0.y + (float)q[2] * x0.z + (float)q[3] * x0.w
+             + (float)q[4] * x1.x + (float)q[5] * x1.y + (float)q[6] * x1.z + (float)q[7] * x1.w
+             + (float)q[8] * x2.x + (float)q[9] * x2.y + (float)q[10] * x2.z + (float)q[11] * x2.w
+             + (float)q[12] * x3.x + (float)q[13] * x3.y + (float)q[14] * x3.z + (float)q[15] * x3.w;
+    }
+    acc = cc_wsum(acc);
+    if (lane == 0) y[j] = acc * sc[o];
+}
+__global__ static void __launch_bounds__(256) cc_matmul_rows_k(float *__restrict__ y, const float *__restrict__ x,
+        const void *__restrict__ w, const float *__restrict__ sc, const int *__restrict__ ids, int fmt, int I, int O, int n) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = (int)blockIdx.x * 8 + warp;
+    if (j >= n) return;
+    int o = ids[j];
+    if (o < 0 || o >= O) { if (lane == 0) y[j] = -INFINITY; return; }
+    float acc = 0.f;
+    if (fmt == 1) {
+        const int8_t *wr = (const int8_t *)w + (size_t)o * I;
+        for (int i = lane; i < I; i += 32) acc += x[i] * (float)wr[i];
+        acc = cc_wsum(acc);
+        if (lane == 0) y[j] = acc * sc[o];
+    } else {
+        const float *wr = (const float *)w + (size_t)o * I;
+        for (int i = lane; i < I; i += 32) acc += x[i] * wr[i];
+        acc = cc_wsum(acc);
+        if (lane == 0) y[j] = acc;
+    }
+}
 
 /* ---- contexts ------------------------------------------------------------------- */
 static int cc_init(int device) {
@@ -1631,6 +1682,26 @@ static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     cc_pick_k<<<1, 256, 0, c->stream>>>(fp(logits), out->d, n);
     return launched(c, "pick");
 }
+static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
+    CcCtx *c = live();
+    if (!c || !t || !ids || !x || !y || n < 1) return 0;
+    int fmt, I, O; const void *w = nullptr; const float *sc = nullptr;
+    if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device || (fmt != 0 && fmt != 1)) return 0;
+    if (!coli_cuda_tensor_dev(t, &w, &sc, nullptr) || (fmt == 1 && !sc)) return 0;
+    if ((size_t)I * 4 > x->bytes || (size_t)n * 4 > ids->bytes || (size_t)n * 4 > y->bytes) return 0;
+    g_st.matmuls++;
+    unsigned grid = grid1((size_t)n, 8);
+    if (fmt == 1 && I % 16 == 0 && I <= 12288) {
+        size_t smem = (size_t)(I / 4 + I / 32 + 1) * sizeof(float4);
+        if (smem <= 48 * 1024)
+            cc_matmul_rows_i8_k<1><<<grid, 256, smem, c->stream>>>(fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
+        else
+            cc_matmul_rows_i8_k<0><<<grid, 256, (size_t)I * sizeof(float), c->stream>>>(fpw(y), fp(x), (const int8_t *)w, sc, (const int *)ids->d, I, O, n);
+    } else {
+        cc_matmul_rows_k<<<grid, 256, 0, c->stream>>>(fpw(y), fp(x), w, sc, (const int *)ids->d, fmt, I, O, n);
+    }
+    return launched(c, "matmul_rows");
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1649,5 +1720,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_kv16,
     cc_rope_f16,
     cc_pick,
+    cc_matmul_rows,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
