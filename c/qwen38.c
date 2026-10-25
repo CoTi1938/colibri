@@ -940,7 +940,7 @@ static char *q38_state_path(const char *snap, const char *env, const char *name)
  * process-global route_trace owner in the CLI/serve model only; segment
  * adapters can coexist in one process and intentionally leave telemetry
  * detached, just like the other range-native engines. */
-static void q38_telemetry_init(const char *snap, const Model *m) {
+static int64_t q38_telemetry_init(const char *snap, const Model *m) {
     rt_init("qwen38", m->c.layers, m->c.experts);
     if (!m->mtp) rt_drop_row(m->c.layers);
     char *usage = q38_state_path(snap, "COLI_USAGE", ".coli_usage");
@@ -950,6 +950,7 @@ static void q38_telemetry_init(const char *snap, const Model *m) {
     if (h > 0)
         fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n",
                 (long long)h, g_q38_usage);
+    return h;   /* 0: no history (no file, or no record for this model) */
 }
 
 /* Creates the draft list (draft_vocab.h) when the head can use one: Q38_MTP_VOCAB is above 0,
@@ -2679,8 +2680,8 @@ int main(int argc, char **argv) {
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
-    q38_telemetry_init(snap, &m);
-    if (g_q38_gguf_tier) q38_tier_warm(&m);   /* the CUDA tier's warm start, the history's most used experts first */
+    int64_t hist = q38_telemetry_init(snap, &m);
+    if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
 #ifdef COLI_CUDA
     if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
 #endif
