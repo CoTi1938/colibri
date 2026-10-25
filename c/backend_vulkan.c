@@ -502,7 +502,11 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
  * shaders size their work by gl_SubgroupSize and gl_SubgroupID; an Intel Iris Xe
  * (8 to 32) ran chain_gemv and chain_gemv2 at another width than the one they read,
  * and every decode GEMV of the chain came out wrong. 0: a device with one size (NVIDIA,
- * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before). */
+ * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before).
+ * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
+ * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
+ * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
+ * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
 static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
 #ifdef VK_EXT_subgroup_size_control
     const char *e = getenv("COLI_VK_SUBGROUP");
@@ -519,6 +523,14 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(phys, &p2);
     uint32_t n = sg.subgroupSize;
+    if (e && *e) {
+        long want = strtol(e, NULL, 10);
+        if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
+            n = (uint32_t)want;
+        else
+            fprintf(stderr, "[VK] COLI_VK_SUBGROUP=%s: not a size this device allows (%u to %u); pinning %u\n",
+                    e, sp.minSubgroupSize, sp.maxSubgroupSize, n);
+    }
     if (!f.subgroupSizeControl || !(sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
         sp.minSubgroupSize >= sp.maxSubgroupSize || n < sp.minSubgroupSize || n > sp.maxSubgroupSize || (n & (n - 1)))
         return 0;
