@@ -38,9 +38,11 @@ function segments(source: string): Segment[] {
   return out
 }
 
-/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars. */
+/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars.
+    A link's URL may hold one level of balanced parentheses, as CommonMark allows:
+    Wikipedia's ".../Python_(programming_language)". */
 function inline(text: string, key = "i"): React.ReactNode[] {
-  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^)\s]+\))/
+  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))/
   const nodes: React.ReactNode[] = []
   let rest = text
   let index = 0
