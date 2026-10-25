@@ -2564,8 +2564,10 @@ def _muse_unattr(text):
 def _muse_value(raw, schema):
     """A parameter's text as its schema types it: strings as written, JSON for the rest."""
     kind = schema.get("type") if isinstance(schema, dict) else None
-    if kind == "string" or (isinstance(kind, list) and "string" in kind and len(kind) == 1):
-        return raw
+    kinds = kind if isinstance(kind, list) else [kind]
+    if "string" in kinds:
+        # the template writes None as `null`, and every string as is
+        return None if raw == "null" and "null" in kinds else raw
     try:
         return json.loads(raw)
     except ValueError:
