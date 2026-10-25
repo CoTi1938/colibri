@@ -1107,7 +1107,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
     spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
-    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", 1);
+    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", 0);   /* opt-in: measured 1-5% slower on the Vulkan chain at depth 2 */
     if (sp.lookup && prompt && np > 0) {
         sp.hist_cap = np + 256;
         sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));

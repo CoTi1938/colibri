@@ -5798,7 +5798,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
                 sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
                 /* this draft is not worth its row: a deeper one, no likelier, is not written */
-                if(sp->pstep&&!sp->force&&j+1<k&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j+1,sp->ahead_p)){k=j+1;break;}
+                if(sp->pstep&&sp->depth&&!sp->force&&j+1<k&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j+1,sp->ahead_p)){k=j+1;break;}
             }
             free(hidden);
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
@@ -5806,7 +5806,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
              * The first stays (the head pass that made it is a plain step's too). */
             int known=1;
             for(int j=0;j<k;j++)known=known&&sp->ahead_p[j]>=0.0f;
-            if(sp->pstep&&known&&!sp->force&&k>1){
+            if(sp->pstep&&sp->depth&&known&&!sp->force&&k>1){   /* a fixed depth: see qwen36.c */
                 int kp=spec_gate_pick_p(&sp->gate,SPEC_SRC_MTP,k,sp->ahead_p,NULL);
                 k=kp<1?1:kp;
             }

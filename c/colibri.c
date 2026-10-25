@@ -1537,8 +1537,9 @@ static int g_lookup=0; static SpecGate g_lookup_gate;
  * mtp_absorb) rather than attend a row that holds nothing of this text. */
 static int g_mtp_gap;
 static float g_mtp_pd[64]; static unsigned long long g_mtp_pdeclined;
-static int g_mtp_pstep=1; /* MTP_PSTEP=0: the verify's depth from the averages only, not from each
-                           * step's drafts' probabilities under the head (spec_gate_pick_p) */
+static int g_mtp_pstep=0; /* MTP_PSTEP=1: the verify's depth from each step's drafts' probabilities
+                           * under the head too (spec_gate_pick_p), not the averages only; opt-in,
+                           * not measured on a real checkpoint */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
@@ -13692,7 +13693,7 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
-    g_mtp_pstep = !(getenv("MTP_PSTEP") && getenv("MTP_PSTEP")[0]=='0');
+    g_mtp_pstep = getenv("MTP_PSTEP") && getenv("MTP_PSTEP")[0]=='1';
     g_lookup = !(getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='0');   /* on by default, gated */
     spec_gate_init(&g_lookup_gate, getenv("COLI_SPEC_GATE") && getenv("COLI_SPEC_GATE")[0]=='0');
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */

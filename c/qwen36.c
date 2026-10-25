@@ -6938,7 +6938,7 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->mtp_depth = !e || !*e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
     if (sp->mtp_depth < 0 || sp->mtp_depth > Q36_SPEC_ROWS - 1) { fprintf(stderr, "Q36_MTP_DRAFTS must be 0 (auto) or 1..%d\n", Q36_SPEC_ROWS - 1); exit(1); }
     /* the depth a verify carries, from each step's drafts' probabilities (spec_gate_pick_p),
-     * within the one above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
+     * within a fixed depth above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
     e = getenv("Q36_MTP_PSTEP");
     sp->mtp_pstep = !(e && *e == '0');
     if (sp->lookup && prompt && np > 0) {
@@ -7087,13 +7087,15 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
                 sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
                 /* this draft is not worth its row: a deeper one, no likelier, is not written */
-                if (sp->mtp_pstep && !sp->mtp_force && j + 1 < k &&
+                if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && j + 1 < k &&
                     !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j + 1, sp->ahead_p)) { k = j + 1; break; }
             }
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
              * confidence-scheduled verification): the drafts past it go unverified. The first
-             * stays (the head pass that made it is a plain step's too). */
-            if (sp->mtp_pstep && !sp->mtp_force && k > 1) {
+             * stays (the head pass that made it is a plain step's too). Within a fixed depth
+             * only: under auto the averages would learn from the drafts it kept, the sure
+             * ones, and pick deeper (measured: 392 head rows against 303, a prompt 8% slower). */
+            if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && k > 1) {
                 int kp = spec_gate_pick_p(&sp->gate, SPEC_SRC_MTP, k, sp->ahead_p, NULL);
                 k = kp < 1 ? 1 : kp;
             }
