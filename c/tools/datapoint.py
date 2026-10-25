@@ -17,8 +17,9 @@ cache is empty again.  Keeping the two modes explicit prevents those different
 states from being compared as if they were the same benchmark.
 
 Before either campaign, the page cache is evicted when possible (macOS:
-``purge``; Linux: ``posix_fadvise(DONTNEED)`` over the model shards).  iobench
-runs only with ``--shard PATH``; ``--iobench`` alone selects its executable.
+``purge``; Linux: ``posix_fadvise(DONTNEED)`` over the model shards).  With
+``--shard PATH``, iobench runs immediately after eviction, before model loading
+can re-warm the files; ``--iobench`` alone only selects its executable.
 
 Usage:
   python tools/datapoint.py --snap models/olmoe_merged
