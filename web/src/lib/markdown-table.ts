@@ -18,9 +18,10 @@ export type Table = {
 /* Split one row into cells. The outer pipes are delimiters when present, so
    they are stripped before splitting rather than left to produce empty edge
    cells — otherwise "| a | b |" and "a | b" would disagree on column count.
-   A pipe is content only when an odd run of backslashes precedes it. An even
-   run is that many literal backslashes, and the pipe is still a delimiter:
-   `\\|` is a path that ends in `\` followed by the next cell. */
+   A pipe is content only when an odd run of backslashes precedes it, and only
+   the backslash right before it goes. After an even run (`a \\| b`) the pipe is
+   still a delimiter. Other backslashes stay as written, because the inline
+   marks never unescape: a cell's `"\\d+"` is a code span that keeps both. */
 export function splitRow(line: string): string[] {
   let text = line.trim()
   if (text.startsWith("|")) text = text.slice(1)
@@ -36,13 +37,12 @@ export function splitRow(line: string): string[] {
     if (text[at] === "\\") {
       let run = 1
       while (text[at + run] === "\\") run++
-      cell += "\\".repeat(Math.floor(run / 2))
       if (run % 2 === 1 && text[at + run] === "|") {
-        cell += "|"
+        cell += "\\".repeat(run - 1) + "|"
         at += run
         continue
       }
-      if (run % 2 === 1) cell += "\\"
+      cell += "\\".repeat(run)
       at += run - 1
       continue
     }

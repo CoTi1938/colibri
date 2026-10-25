@@ -20,9 +20,15 @@ describe("splitting a row into cells", () => {
     expect(splitRow("| a | b \\|")).toEqual(["a", "b |"])
   })
 
-  it("keeps a literal backslash and still splits on the following pipe", () => {
-    expect(splitRow("| a \\\\| b |")).toEqual(["a \\", "b"])
-    expect(splitRow("| a | b \\\\|")).toEqual(["a", "b \\"])
+  it("splits on a pipe after an even run of backslashes, keeping them", () => {
+    expect(splitRow("| a \\\\| b |")).toEqual(["a \\\\", "b"])
+    expect(splitRow("| a | b \\\\|")).toEqual(["a", "b \\\\"])
+    expect(splitRow("| a \\\\\\| b |")).toEqual(["a \\\\| b"])
+  })
+
+  it("leaves backslashes that escape no pipe as written", () => {
+    expect(splitRow("| `\"\\\\d+\"` | digits |")).toEqual(["`\"\\\\d+\"`", "digits"])
+    expect(splitRow("| C:\\temp | x |")).toEqual(["C:\\temp", "x"])
   })
 })
 
