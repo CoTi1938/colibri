@@ -1228,10 +1228,8 @@ static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
             !cc_tensor_dev(q->tg, &wg, &sg, NULL) || !cc_tensor_dev(q->tu, &wu, &su, NULL) || !cc_tensor_dev(q->td, &wd, &sd, NULL)) {
             qt_chain_promote_done(q->ci, q->vi, 0); continue;
         }
-        char *st = (char *)cc_ptr(ch->pr_buf) + (size_t)slot * ch->pr_stride;
-        memcpy(st, q->g, q->mb); memcpy(st + q->mb, q->u, q->mb); memcpy(st + 2 * q->mb, q->d, q->mb);
-        char *sc = st + 3 * q->mb;
-        memcpy(sc, q->gs, q->sb_gu); memcpy(sc + q->sb_gu, q->us, q->sb_gu); memcpy(sc + 2 * q->sb_gu, q->ds, q->sb_d);
+        char *st = (char *)cc_ptr(ch->pr_buf) + (size_t)slot * ch->pr_stride, *sc = st + 3 * q->mb;
+        qt_chain_promote_stage(st, q);
         unsigned tk = 0;
         if (!cc_host_up((void *)wg, st, q->mb, &tk) || !cc_host_up((void *)wu, st + q->mb, q->mb, &tk) || !cc_host_up((void *)wd, st + 2 * q->mb, q->mb, &tk) ||
             !cc_host_up((void *)sg, sc, q->sb_gu, &tk) || !cc_host_up((void *)su, sc + q->sb_gu, q->sb_gu, &tk) || !cc_host_up((void *)sd, sc + 2 * q->sb_gu, q->sb_d, &tk)) {

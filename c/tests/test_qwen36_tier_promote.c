@@ -159,8 +159,62 @@ int main(void) {
     check(qt_chain_promote(8, pr) == 0, "the braked step's misses were dropped: the next step begins empty");
     step(0, 0, 1);
     check(qt_chain_promote(8, pr) == 1 && pr[0].ci == 0, "the step after routes 0 again: 0 (four routes, a score of 8) takes the coldest of 4..7");
+    {
+        unsigned char stg[3 * (D * IH / 2) + (2 * IH + D) * sizeof(float)];
+        qt_chain_promote_stage(stg, &pr[0]);
+        check(memcmp(stg, g4[0][0], sizeof g4[0][0]) == 0 &&
+              memcmp(stg + sizeof g4[0][0], u4[0][0], sizeof u4[0][0]) == 0 &&
+              memcmp(stg + 2 * sizeof g4[0][0], d4[0][0], sizeof d4[0][0]) == 0 &&
+              memcmp(stg + 3 * sizeof g4[0][0], sc[0][0], sizeof sc[0][0]) == 0,
+              "pair-ordered int4: qt_chain_promote_stage copies weights and scales as they are");
+    }
     qt_chain_promote_done(pr[0].ci, pr[0].vi, 1);
 
+    qt_shutdown();
+
+    /* planar int4 per group of 64 (qt_source_planar(1)): promoted and converted to signed pairs */
+    enum { D64 = 64, IH64 = 64, MB64 = D64 * IH64 / 2, NSC64 = 2 * IH64 * (D64 / 64) + D64 * (IH64 / 64) };
+    exp_bytes = 3 * dev_alloc_footprint(MB64) + 3 * dev_alloc_footprint((NSC64 / 3) * sizeof(float));
+    snprintf(gb, sizeof gb, "%.15f", (double)(8 * exp_bytes + exp_bytes / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D64, IH64, NE, TOPK, 64, 1), "tier starts (int4 gs=64, planar source)");
+    static unsigned char raw[NL][NE][3 * MB64], pw[NL][NE][3 * MB64];
+    static float sc64[NL][NE][NSC64];
+    for (int e = 0; e < NE; e++) for (int l = 0; l < NL; l++) {
+        for (size_t i = 0; i < sizeof raw[l][e]; i++)
+            raw[l][e][i] = (unsigned char)((i * 37u + (unsigned)l * 13u + (unsigned)e * 7u) & 0xFFu);
+        for (size_t b = 0; b < sizeof raw[l][e]; b += 32) {
+            const unsigned char *s = raw[l][e] + b;
+            unsigned char *d = pw[l][e] + b;
+            for (int k = 0; k < 32; k++) {
+                unsigned lo = (unsigned)(s[k >> 1] >> ((k & 1) * 4)) & 0xFu;
+                unsigned hi = (unsigned)(s[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xFu;
+                d[k] = (unsigned char)((lo ^ 8u) | ((hi ^ 8u) << 4));
+            }
+        }
+        for (int i = 0; i < NSC64; i++) sc64[l][e][i] = 0.25f * (float)(i + e + 1);
+        qt_note_block(l, e, pw[l][e], pw[l][e] + MB64, pw[l][e] + 2 * MB64,
+                      sc64[l][e], sc64[l][e] + IH64, sc64[l][e] + 2 * IH64);
+    }
+    qt_fill_wait();
+    for (int t = 0; t < 3; t++) {
+        int ids[2] = {4, -1};
+        qt_chain_count(0, ids, 2);
+        qt_note(0, 4, pw[0][4], pw[0][4] + MB64, pw[0][4] + 2 * MB64,
+                sc64[0][4], sc64[0][4] + IH64, sc64[0][4] + 2 * IH64);
+    }
+    np = qt_chain_promote(8, pr);
+    check(np == 1 && pr[0].ci == 4 && pr[0].mb == MB64, "planar int4 gs=64: expert 4 promoted");
+    if (np == 1) {
+        unsigned char stg[3 * MB64 + NSC64 * sizeof(float)];
+        qt_chain_promote_stage(stg, &pr[0]);
+        check(memcmp(stg, raw[0][4], sizeof raw[0][4]) == 0 &&
+              memcmp(stg + sizeof raw[0][4], sc64[0][4], sizeof sc64[0][4]) == 0,
+              "planar int4 gs=64: qt_chain_promote_stage converts planar blocks back to exact signed pairs and copies scales");
+        qt_chain_promote_done(pr[0].ci, pr[0].vi, 1);
+    }
+    qt_source_planar(0);
     qt_shutdown();
     if (fails) { printf("test_qwen36_tier_promote: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_tier_promote: the chain's promotions follow the conversation's routes; the pairs, the changes and the counts are right\n");

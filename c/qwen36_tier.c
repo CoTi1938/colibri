@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "qwen36_tier.h"
 #include "backend_cuda.h"
 #include "tier.h"
@@ -168,12 +171,50 @@ void qt_source_planar(int on){ G_src_planar = on ? 1 : 0; }
  * over 2 GB and 150 s to compile this file (0.76 s and 68 MB without). */
 __attribute__((noinline))
 static void planar_to_pairs(uint8_t *dst, const uint8_t *src, size_t bytes){
-    for(size_t b=0; b<bytes; b+=32){
+    size_t b=0;
+#if defined(__AVX2__)
+    const __m256i m0f=_mm256_set1_epi16(0x000F), mf0=_mm256_set1_epi16(0x00F0);
+    for(; b+32<=bytes; b+=32){
+        __m256i v=_mm256_loadu_si256((const __m256i*)(src+b)), v4=_mm256_srli_epi16(v,4);
+        __m256i lo=_mm256_or_si256(_mm256_and_si256(v,m0f), _mm256_and_si256(v4,mf0));
+        __m256i hi=_mm256_or_si256(_mm256_and_si256(v4,m0f), _mm256_and_si256(_mm256_srli_epi16(v,8),mf0));
+        _mm256_storeu_si256((__m256i*)(dst+b), _mm256_permute4x64_epi64(_mm256_packus_epi16(lo,hi),0xD8));
+    }
+#endif
+    for(; b<bytes; b+=32){
         const uint8_t *p=src+b; uint8_t *q=dst+b;
         for(int j=0;j<16;j++){
             q[j]    = (uint8_t)((p[2*j]&0x0F) | (p[2*j+1]<<4));
             q[16+j] = (uint8_t)((p[2*j]>>4)   | (p[2*j+1]&0xF0));
         }
+    }
+}
+
+/* The same 32-byte planar blocks as the device's signed pairs: XOR 0x88 is the
+ * offset-to-signed step the upload otherwise runs on the device after its copy
+ * (offset_to_signed_s4), done here because the chain copies straight into the
+ * victim's buffers. bytes is whole blocks: a matrix of int4 groups of 64. */
+__attribute__((noinline))
+static void planar_to_pairs_signed(uint8_t *dst, const uint8_t *src, size_t bytes){
+    size_t b=0;
+#if defined(__AVX2__)
+    const __m256i m0f=_mm256_set1_epi16(0x000F), mf0=_mm256_set1_epi16(0x00F0), x88=_mm256_set1_epi8((char)0x88);
+    for(; b+32<=bytes; b+=32){
+        __m256i v=_mm256_loadu_si256((const __m256i*)(src+b)), v4=_mm256_srli_epi16(v,4);
+        __m256i lo=_mm256_or_si256(_mm256_and_si256(v,m0f), _mm256_and_si256(v4,mf0));
+        __m256i hi=_mm256_or_si256(_mm256_and_si256(v4,m0f), _mm256_and_si256(_mm256_srli_epi16(v,8),mf0));
+        __m256i pk=_mm256_permute4x64_epi64(_mm256_packus_epi16(lo,hi),0xD8);
+        _mm256_storeu_si256((__m256i*)(dst+b), _mm256_xor_si256(pk,x88));
+    }
+#endif
+    for(; b<bytes; b+=32){
+        const uint8_t *p=src+b;
+        uint8_t tmp[32];
+        for(int j=0;j<16;j++){
+            tmp[j]    = (uint8_t)(((p[2*j]&0x0F) | (p[2*j+1]<<4)) ^ 0x88);
+            tmp[16+j] = (uint8_t)(((p[2*j]>>4)   | (p[2*j+1]&0xF0)) ^ 0x88);
+        }
+        memcpy(dst+b, tmp, 32);
     }
 }
 
@@ -1378,12 +1419,13 @@ void qt_chain_count(int layer,const int *eids,int K){
  * residents drawn at random on its device (none queued, swap_ok), where the newcomer clears
  * the tier's admission margin (tier_should_promote). The victim computes on the CPU from now
  * on (its flag cleared, the epoch moved, its int8 copy rebuilt by tier_rebuild_evicted before
- * the next forward) and both slots are marked queued until qt_chain_promote_done: the chain
+ * the next forward where QWEN_EXPERT_KERNEL=0 needs one, planar int4 keeping its RAM blocks)
+ * and both slots are marked queued until qt_chain_promote_done: the chain
  * copies the newcomer's RAM bytes into the victim's device buffers itself, on its copy stream
  * (the tier's uploader would take the device's lock from another thread while the chain's
  * frame waits for the host: a deadlock inside the driver, seen on an RTX 3070). The bytes go
- * as the RAM holds them, which the device's int8 and int4 rows are (the upload's XOR and the
- * device's undo it); int4 per group from planar blocks needs the conversion and is refused.
+ * into the chain's staging slot through qt_chain_promote_stage: as the RAM holds them for
+ * int8 and pair-ordered int4 rows, or converted from planar blocks into signed pairs.
  * Returns how many pairs out holds. max 0 (the chain's brake held, or its rate is 0) drops the
  * step's misses: the list is a step's, the next step's begins empty. */
 /* an expert's worth: its heat (the history's routes, decayed, plus this conversation's: the
@@ -1404,7 +1446,7 @@ int qt_chain_promote(int max,QtPromo *out){
     if(max<=0 || !out){ pthread_mutex_lock(&G.mx); G.pm_n=0; pthread_mutex_unlock(&G.mx); return 0; }
     if(G_chain_own || G_trunk_only || G_stream) return 0;
     if(G_promo_min<0){ const char *e=getenv("COLI_CUDA_CHAIN_PROMOTE_MIN"); G_promo_min = e && *e ? atoi(e) : 2; if(G_promo_min<1) G_promo_min=1; }
-    if(G.wfmt==QT_GGUF || (G.wfmt==4 && G_src_planar)) { G.pm_n=0; return 0; }   /* the bytes need the stage's conversion */
+    if(G.wfmt==QT_GGUF) { G.pm_n=0; return 0; }
     pthread_mutex_lock(&G.mx);
     int done=0;
     if(G.pm_n>0 && !G.th_stop){
@@ -1429,7 +1471,7 @@ int qt_chain_promote(int max,QtPromo *out){
             /* the tier's admission margin (tier.h): a quarter and four over the victim, no ping-pong */
             if(v<0 || !tier_should_promote((uint32_t)(pm_score(cs)>0xFFFFFFFFu?0xFFFFFFFFu:pm_score(cs)), (uint32_t)(vsc>0xFFFFFFFFu?0xFFFFFFFFu:vsc))) continue;
             QSlot *vs=&G.slot[v];
-            res_set(vs,0); evict_note_locked(v);               /* CPU fallback from now on; its int8 copy rebuilt before the next forward */
+            res_set(vs,0); evict_note_locked(v);               /* CPU fallback from now on, from its RAM copy (see above) */
             vs->queued=1; cs->queued=1;                        /* neither moves until qt_chain_promote_done */
             QtPromo *o=&out[done++];
             o->ci=ci; o->vi=v; o->g=cs->g4; o->u=cs->u4; o->d=cs->d4; o->gs=cs->gs; o->us=cs->us; o->ds=cs->ds;
@@ -1441,6 +1483,27 @@ int qt_chain_promote(int max,QtPromo *out){
     G.pm_n=0;
     pthread_mutex_unlock(&G.mx);
     return done;
+}
+/* Fill a page-locked staging slot with the newcomer's three matrices (3 * p->mb bytes)
+ * followed by its three scale arrays (2 * p->sb_gu + p->sb_d bytes), in the layout the
+ * victim's device tensors hold: planar int4 blocks become signed pairs, int8 and pair-ordered
+ * int4 rows are copied as they are. */
+void qt_chain_promote_stage(void *dst,const QtPromo *p){
+    if(!dst || !p) return;
+    uint8_t *dw=(uint8_t*)dst;
+    if(G.wfmt==4 && G_src_planar){
+        planar_to_pairs_signed(dw,         p->g, p->mb);
+        planar_to_pairs_signed(dw+p->mb,   p->u, p->mb);
+        planar_to_pairs_signed(dw+2*p->mb, p->d, p->mb);
+    } else {
+        memcpy(dw,         p->g, p->mb);
+        memcpy(dw+p->mb,   p->u, p->mb);
+        memcpy(dw+2*p->mb, p->d, p->mb);
+    }
+    char *sc=(char*)dst + 3*p->mb;
+    memcpy(sc,            p->gs, p->sb_gu);
+    memcpy(sc+p->sb_gu,   p->us, p->sb_gu);
+    memcpy(sc+2*p->sb_gu, p->ds, p->sb_d);
 }
 /* the copy of a pair qt_chain_promote gave landed (ok) or failed: the newcomer takes the
  * victim's tensors and is resident; on a failure the victim's buffers hold neither expert
