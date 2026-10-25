@@ -231,7 +231,9 @@ jobs:
     runs-on: macos-latest
     # `make check` here now takes about 14.5 minutes; at 15 the job was cut
     # off inside the Python suite with no test failed, and showed as red.
-    timeout-minutes: 25
+    # 2026-10-24 it took 24 minutes, and on the next run the suite printed
+    # OK at 25:00, the moment the job was cut off: 35 leaves the room again.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: install libomp

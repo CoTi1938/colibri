@@ -305,6 +305,7 @@ typedef struct {
     int mtp_len, mtp_pend_n, mtp_pend_tok[Q38_SPEC_ROWS];
     float *mtp_pend;                  /* Q38_SPEC_ROWS rows of hc_width */
     DraftVocab *draft_vocab;          /* the tokens the head scores for a draft; NULL = the whole vocabulary */
+    float mtp_p;                      /* the last draft's probability under the head (q38_draft_p) */
     /* A verify forward copies the DeltaNet and PLE state as it stands after
      * each of its first snap_rows rows, row r into slot r (0 = no copy), so a
      * draft rejected after row r+1 rolls back by swapping slot r in instead
@@ -5403,6 +5404,14 @@ static void q38_head_scores(float *y,const float *x,const Q38Weight *head,const 
  * q38_argmax), or the best token of the logits of the whole vocabulary (q38_draft_logits) when
  * there is no list. A token missing from the list costs a rejected draft at most, because the
  * verify step checks every token. */
+/* The probability the head gives its pick: softmax over the scores it had, the ones within
+ * 20 of the best (the rest add under 2e-9 each) -- the per-draft estimate the verify's
+ * depth is picked from (spec_gate_pick_p) */
+static float q38_draft_p(const float *l,int n,int best) {
+    float mx=l[best];double s=0.0;
+    for(int i=0;i<n;i++){float d=l[i]-mx;if(d>-20.0f)s+=exp((double)d);}
+    return s>0.0?(float)(1.0/s):0.0f;
+}
 static int q38_mtp_best_token(Model *m,const float *mixed) {
     Cfg *c=&m->c;DraftVocab *v=m->draft_vocab;
 #ifdef COLI_VULKAN
@@ -5412,15 +5421,17 @@ static int q38_mtp_best_token(Model *m,const float *mixed) {
     if(v){
         float *score=falloc(v->list_n);
         q38_head_scores(score,mixed,&m->lm_head,v->list,v->list_n);
-        pick=v->list[0];float best=score[0];
+        pick=v->list[0];float best=score[0];int at=0;
         for(int j=1;j<v->list_n;j++)
-            if(score[j]>best||(score[j]==best&&v->list[j]<pick)){best=score[j];pick=v->list[j];}
+            if(score[j]>best||(score[j]==best&&v->list[j]<pick)){best=score[j];pick=v->list[j];at=j;}
+        m->mtp_p=q38_draft_p(score,v->list_n,at);
         free(score);
         return pick;
     }
     float *logit=falloc(c->vocab);
     q38_draft_logits(m,logit,mixed);
     pick=q38_argmax(logit,c->vocab);
+    m->mtp_p=q38_draft_p(logit,c->vocab,pick);
     free(logit);
     return pick;
 }
@@ -5460,6 +5471,7 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
     int ran=q38c_mtp_rows(m,streams,next,S,pos_base,logit,hidden,1);   /* the dense chain runs the head's layer */
     if(ran&&draft){
         *draft=q38_argmax(logit,c->vocab);
+        m->mtp_p=q38_draft_p(logit,c->vocab,*draft);
         if(g_q38_mtp_dump)q38_mtp_dump_record(m,logit,(Q38MtpDumpRow){pos_base+S-1,next[S-1]});
     }
     free(logit);
@@ -5537,7 +5549,7 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
 #ifdef COLI_VULKAN
     {   /* the dense chain runs the head's layer: its tail row at `row`, hidden in and out */
         float *lo=falloc(c->vocab);
-        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);free(lo);return d;}
+        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);m->mtp_p=q38_draft_p(lo,c->vocab,d);free(lo);return d;}
         free(lo);
         q38c_mtp_host(m,row);
     }
@@ -5607,6 +5619,8 @@ typedef struct {
      * 0..ahead_n-1 at ahead_pos.., ids[] their tokens, ahead_i the next row to
      * hand out (its draft ids[ahead_i] must be the caller's pick) */
     int ahead_n, ahead_i, ahead_pos, ahead_src, head_ok;
+    int pstep;                   /* Q38_MTP_PSTEP: the verify's depth from the drafts' own probabilities */
+    float ahead_p[Q38_SPEC_ROWS];/* those probabilities, for the gate once the verify is judged */
     int ids[Q38_SPEC_ROWS];
     float *ahead_logit, *ahead_streams;
     uint64_t drafts, accepted, forwards, tokens;   /* the MTP head's drafts (the report's counts) */
@@ -5685,7 +5699,9 @@ static void q38_spec_settle(Model *m,Q38Spec *sp,int keep,int rejected) {
         m->mtp_pend_n=keep;
         for(int j=0;j+1<keep;j++)m->mtp_pend_tok[j]=sp->ids[j+1];
     }
-    spec_gate_result(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1);
+    if(sp->ahead_src==SPEC_SRC_MTP&&sp->pstep)
+        spec_gate_result_p(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1,sp->ahead_p);
+    else spec_gate_result(&sp->gate,sp->ahead_src,keep-1+(rejected?1:0),keep-1);
     free(sp->ahead_logit);free(sp->ahead_streams);
     sp->ahead_logit=sp->ahead_streams=NULL;sp->ahead_n=sp->ahead_i=0;
 }
@@ -5771,14 +5787,29 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         if(k>0&&src==SPEC_SRC_MTP){
             float *hidden=falloc(c->hc_width);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
+            m->mtp_p=-1.0f;
             d[0]=q38_mtp_draft(m,tok,pos,hidden);
+            sp->ahead_p[0]=m->mtp_p;
             double t_first=now_s();
             for(int j=1;j<k;j++){
                 double t0=now_s();
+                m->mtp_p=-1.0f;
                 d[j]=q38_mtp_draft_more(m,hidden,d[j-1],pos+j-1);
+                sp->ahead_p[j]=m->mtp_p;
                 spec_gate_draft_cost(&sp->gate,SPEC_SRC_MTP,now_s()-t0);
+                /* this draft is not worth its row: a deeper one, no likelier, is not written */
+                if(sp->pstep&&sp->depth&&!sp->force&&j+1<k&&!spec_gate_deeper_p(&sp->gate,SPEC_SRC_MTP,j+1,sp->ahead_p)){k=j+1;break;}
             }
             free(hidden);
+            /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
+             * confidence-scheduled verification): the drafts past it go unverified.
+             * The first stays (the head pass that made it is a plain step's too). */
+            int known=1;
+            for(int j=0;j<k;j++)known=known&&sp->ahead_p[j]>=0.0f;
+            if(sp->pstep&&sp->depth&&known&&!sp->force&&k>1){   /* a fixed depth: see qwen36.c */
+                int kp=spec_gate_pick_p(&sp->gate,SPEC_SRC_MTP,k,sp->ahead_p,NULL);
+                k=kp<1?1:kp;
+            }
             t_verify+=now_s()-t_first;   /* the deeper drafts are the gate's d, not the verify's */
             if(sp->force)for(int j=1;j<=k;j++){
                 int t=q38_spec_forced(sp->force,sp->force_row,(int)sp->verifies,k,j,pos,V);

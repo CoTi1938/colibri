@@ -83,6 +83,7 @@
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
+#include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1309,6 +1310,13 @@ typedef struct {
      * they pause for a while and the guard re-measures. */
     int pause, min_accept, max_verify;
     uint64_t window_prop, window_acc;
+    /* How many of a round's drafts to verify, from the head's own confidence in each
+     * (DeepSeek's confidence-scheduled verification): sigmoid of its score is
+     * the acceptance it predicts, spec_draft.h's gate maps it through what it measured and
+     * against what a verify of that many rows costs here. V41_DSPARK_GATE=0: every draft. */
+    SpecGate gate;
+    int gated;
+    uint64_t written;           /* drafts the stages wrote, verified or not (the guard's count) */
 } Spec;
 
 typedef struct {
@@ -1381,6 +1389,9 @@ typedef struct {
      * speculative step keeps only the prefix that verified, and the next draft has to
      * seed the stages with exactly the positions that were committed */
     int last_start, last_rows;
+    int last_from;                          /* where the last forward's rows began: last_start but for a prompt's tail */
+    int ptail_after, ptail_rows;            /* this forward's tail (v41_prefill_tail), for the chain: 0 rows = none */
+    unsigned long long prefill_tail_rows;   /* prompt rows the layers after the cross-layer source did not run (v41_prefill_tail) */
     /* Whether THIS forward's rows may be rolled back, i.e. whether it is the
      * speculative verify batch. The per-layer undo buffers (ring_save,
      * cstate_save_*) are sized for one draft block and nothing else, because
@@ -4001,6 +4012,8 @@ static void spec_load(Model *m, int ecap) {
      * writes its whole block; verifying fewer of them trades acceptance for a smaller
      * bill when a round is rejected early. */
     sp->max_verify = getenv("V41_DSPARK_MAX") ? atoi(getenv("V41_DSPARK_MAX")) : 0;
+    sp->gated = !(getenv("V41_DSPARK_GATE") && *getenv("V41_DSPARK_GATE") == '0');
+    spec_gate_init(&sp->gate, 0);
     if (sp->min_accept < 0) sp->min_accept = 0;
     if (sp->min_accept > 100) sp->min_accept = 100;
     /* The released config.json carries every dspark_* key and NOT n_mtp_layers:
@@ -4216,7 +4229,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
      * a cold conversation starts drafting; a resumed one starts immediately,
      * which costs a draft round's reads and can only change the acceptance
      * rate, never a token -- every draft is verified before it is emitted. */
-    if (start_pos == 0) { free(main_x); free(scratch); return 0; }
+    if (start_pos == 0 || (start_pos == m->last_start && m->last_from == 0)) {   /* a prompt's tail began at 0 too */
+        free(main_x); free(scratch); return 0;
+    }
 
     float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
     for (int i = 0; i < block; i++) {
@@ -4382,12 +4397,71 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
 
+/* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay"
+ * in its deployment notes). From the first layer with compress_ratio 1 on
+ * (20 in V4.1, n_prefill_layer there), the layers read the long context only from that
+ * layer's caches: its compressed KV and index keys (kv_source, index_owner) and its
+ * candidate blocks (candidate_source). What else they keep is a window of their own. So
+ * once that layer has run on every row of a prompt, a row's output in the layers after it
+ * reaches the answer only through those windows, W - 1 rows back a layer: with D layers
+ * after it, the last D * (W - 1) + 1 rows give the last row and every window the next step
+ * reads exactly as all the rows do (2414 of a prompt in V4.1: 19 layers, a window of 128).
+ * The layers after it run on that tail only, with the same bits.
+ *
+ * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
+ * (a window and its backtracking), below the exact tail
+ * and so approximate; 0 runs every row. Returns the tail, or 0 where every row runs (a
+ * verify, the logits of every row, a prompt not past the tail, a model without the
+ * layout); *after gets the layer after which the tail starts. */
+static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, int *after) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("V41_PREFILL_TAIL"); env = e && *e ? atoi(e) : -1; }
+    *after = -1;
+    if (spec_batch || keep_rows || env == 0 || c->window < 1) return 0;
+    int P = -1;
+    for (int i = 0; i < c->n_layers; i++) if (c->compress_ratio[i] == 1) { P = i; break; }
+    if (P < 0 || P >= c->n_layers - 1 || !c->kv_source[P]) return 0;
+    for (int i = P + 1; i < c->n_layers; i++)       /* every later layer reads P's caches and owns none */
+        if (c->kv_source[i] || (c->compress_ratio[i] > 0 && c->index_owner[i] != P)) return 0;
+    if (c->candidate_source >= 0 && c->candidate_source != P) return 0;
+    int D = c->n_layers - 1 - P;
+    long exact = (long)D * (c->window - 1) + 1, tail = env > 0 ? env : exact;
+    if (tail < 1 || n - tail < 64) return 0;        /* not worth a copy */
+    *after = P;
+    return (int)tail;
+}
+
+/* Past the source layer: the rows of the tail to the front of every per-row buffer the
+ * later layers read (the streams and their mix, the DSpark input a target layer at or
+ * before the source wrote, the candidate mask), the forward's rows and start the tail's. */
+static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
+    const Cfg *c = &m->c;
+    int dim = c->dim, hc = c->hc_mult, r0 = *n - tail;
+    memmove(h, h + (size_t)r0 * hc * dim, (size_t)tail * hc * dim * sizeof(float));
+    memmove(pre_mix, pre_mix + (size_t)r0 * hc, (size_t)tail * hc * sizeof(float));
+    if (targets && m->main_hidden)
+        memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
+    if (m->candidates && m->candidate_rows == *n) {
+        memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
+        m->candidate_rows = tail;
+    }
+    *n = tail; *start_pos += r0;
+    if (*trace_row >= tail) *trace_row = tail - 1;
+    m->prefill_tail_rows += (unsigned long long)r0;
+    static int said;
+    if (!said++) fprintf(stderr, "[v41] prefill: the layers after layer %d run on a prompt's last %d rows "
+                                 "(%s; V41_PREFILL_TAIL=0 runs them all)\n", m->ptail_after, tail,
+                         getenv("V41_PREFILL_TAIL") && *getenv("V41_PREFILL_TAIL") ? "V41_PREFILL_TAIL" : "the same bits");
+}
+
 static void forward_full(Model *m, const int *ids, int n, float *logits, int spec_batch,
                          const float *image_rows, int image_at, int image_h, int image_w,
                          const uint8_t *image_mask, int keep_rows) {
     Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult;
     int start_pos = m->pos;
+    const int n_all = n, start_all = start_pos;   /* the prompt's rows, whatever the tail does */
+    int tail_after = -1, tail = v41_prefill_tail(c, n, spec_batch, keep_rows, &tail_after);
     /* The index-key schedule for a batched step: which layer publishes at each of its
      * sub-steps. It has to be known before the layers run, because a layer that comes
      * later in the stack still publishes before this layer's later rows read. */
@@ -4482,6 +4556,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     }
 
     int rows_out = spec_batch || keep_rows;
+    m->ptail_after = tail_after; m->ptail_rows = tail;
 #ifdef COLI_VULKAN
     /* the dense chain runs its layers on the device (every layer, or a partial chain's
      * first N, the streams of every row then back here); 0: the CPU runs them all */
@@ -4490,6 +4565,8 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
 #else
     int chained = 0;
 #endif
+    if (tail > 0 && tail < n && chained > tail_after)   /* the chain took the tail past the source: its rows from here on */
+        v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     for (int layer = chained; layer < c->n_layers; layer++) {
         Layer *l = &m->L[layer];
         if (l->engram_index >= 0) engram_run(m, layer, h, n, start_pos);
@@ -4560,6 +4637,8 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
                          residual + (size_t)t * hc * dim, post + (size_t)t * hc,
                          comb + (size_t)t * hc * hc, hc, dim);
         memcpy(pre_mix, pre, (size_t)n * hc * sizeof(float));   /* the FFN's, for the next block */
+        if (layer == tail_after && tail > 0 && tail < n)   /* v41_prefill_tail: the prompt's tail from here on */
+            v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
     }
 
     /* the last block's FFN mix collapses the stream one final time */
@@ -4576,22 +4655,23 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
         mvb(logits + (size_t)(rows_out ? t : 0) * c->vocab, &m->head, branch_in);
     }
     trace("logits", -1, logits + (size_t)(rows_out ? n - 1 : 0) * c->vocab, c->vocab);
-#ifdef COLI_VULKAN
-    {   /* DUMP=<path>: every logits row this forward computed, for the Vulkan gates */
+    {   /* DUMP=<path>: every logits row this forward computed, for the gates that compare bits */
         static FILE *dump; static int dump_init;
         if (!dump_init) { const char *d = getenv("DUMP"); dump_init = 1; if (d && *d) dump = fopen(d, "wb"); }
         if (dump) { fwrite(logits, sizeof(float), (size_t)(rows_out ? n : 1) * c->vocab, dump); fflush(dump); }
     }
-#endif
 
-    m->pos += n;
+    m->pos += n_all;
     /* Recorded where the tokens entered the state, and only for the MAIN stream:
      * the draft stages read this window and never write it, so a speculative
      * round adds nothing here until spec_verify commits through forward_batch. */
     if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
-    kv_prefix_record(&m->kvp, ids, start_pos, n);
+    kv_prefix_record(&m->kvp, ids, start_all, n_all);
+    /* the rows main_hidden holds, which DSpark's stages are seeded from: the tail when the
+     * prompt took one (their window is within it) */
     m->last_start = start_pos;
     m->last_rows = n;
+    m->last_from = start_all;
     m->forwards++;
     free(collapsed); free(comb); free(post); free(pre);
     free(residual); free(branch_out); free(branch_in); free(pre_mix); free(h);
@@ -4768,7 +4848,7 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
         v41_mux_bind(m, slots[t]);
         kv_prefix_record(&m->kvp, ids + t, pos[t], 1);
         m->pos = pos[t] + 1;
-        m->last_start = pos[t]; m->last_rows = 1;
+        m->last_start = m->last_from = pos[t]; m->last_rows = 1;
     }
     m->forwards++;
     free(pos); free(collapsed); free(comb); free(post); free(pre);
@@ -5467,7 +5547,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         int block = m->spec.active ? c->spec_block : 0;
         int *batch = block ? xmalloc((size_t)(block + 1) * sizeof(int), "draft batch") : NULL;
         float *confidence = block ? xmalloc((size_t)block * sizeof(float), "draft confidence") : NULL;
-        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted;
+        uint64_t proposed0 = m->spec.proposed, accepted0 = m->spec.accepted, written0 = m->spec.written;
         /* the prompt seeds the draft head's windows; nothing is drafted from it */
         if (m->spec.active) spec_step(m, 0, m->last_start, m->last_rows, NULL, NULL);
         while (emitted < budget && !cancelled && !done_early) {
@@ -5512,13 +5592,32 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
                         ? spec_step(m, token, m->last_start, m->last_rows, batch, confidence) : 0;
             if (m->spec.max_verify > 0 && drafted > m->spec.max_verify) drafted = m->spec.max_verify;
             if (drafted > budget - emitted) drafted = budget - emitted;
-            if (drafted <= 0) { forward(m, &token, 1, logits); continue; }
+            float pconf[SPEC_MAX_DRAFTS];
+            /* the guard counts every draft written: the stages' experts were read for each, and
+             * one the gate leaves unverified is a draft that bought nothing */
+            int wrote = drafted > 0 ? drafted : 0;
+            if (drafted > 0 && m->spec.gated) {   /* the depth this round's drafts are worth */
+                if (drafted > SPEC_MAX_DRAFTS) drafted = SPEC_MAX_DRAFTS;
+                for (int i = 0; i < drafted; i++) pconf[i] = 1.0f / (1.0f + expf(-confidence[i]));
+                drafted = spec_gate_pick_p(&m->spec.gate, SPEC_SRC_MTP, drafted, pconf, NULL);
+            }
+            double step_t0 = now_s();
+            m->spec.written += (uint64_t)wrote;
+            m->spec.window_prop += (uint64_t)wrote;
+            if (drafted <= 0) {
+                forward(m, &token, 1, logits);
+                if (m->spec.active) spec_gate_forward(&m->spec.gate, 1, now_s() - step_t0);
+                continue;
+            }
             batch[0] = token;
             int accepted = spec_verify(m, batch, drafted + 1, logits,
                                        command.temperature, command.top_p);
+            if (m->spec.gated) {
+                spec_gate_forward(&m->spec.gate, drafted + 1, now_s() - step_t0);
+                spec_gate_result_p(&m->spec.gate, SPEC_SRC_MTP, accepted < drafted ? accepted + 1 : drafted, accepted, pconf);
+            }
             m->spec.proposed += (uint64_t)drafted;
             m->spec.accepted += (uint64_t)accepted;
-            m->spec.window_prop += (uint64_t)drafted;
             m->spec.window_acc += (uint64_t)accepted;
             for (int i = 0; i < accepted; i++) {
                 int drafted_token = batch[1 + i];
@@ -5578,10 +5677,18 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
              * every number except the one that matters. */
             if (turn_bytes) mirror_report(mir_bytes0, mir_reads0);
         }
-        if (stats && m->spec.active && m->spec.proposed > proposed0)
-            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn\n",
+        if (stats && m->spec.active && m->spec.written > written0) {
+            fprintf(stderr, "[v41] DSpark: %llu of %llu drafts accepted this turn (%llu written)\n",
                     (unsigned long long)(m->spec.accepted - accepted0),
-                    (unsigned long long)(m->spec.proposed - proposed0));
+                    (unsigned long long)(m->spec.proposed - proposed0),
+                    (unsigned long long)(m->spec.written - written0));
+            if (m->spec.gated) {
+                char gd[512];
+                spec_gate_describe(&m->spec.gate, SPEC_SRC_MTP, gd, sizeof gd);
+                fprintf(stderr, "[v41] DSpark gate: %s; %llu rounds took a plain step\n", gd,
+                        (unsigned long long)m->spec.gate.declined[SPEC_SRC_MTP]);
+            }
+        }
         if (cancelled) {
             coli_serve_write_error(stdout, command.id, "CANCELLED");
             coli_serve_command_dispose(&command);

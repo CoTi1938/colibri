@@ -1536,6 +1536,10 @@ static int g_lookup=0; static SpecGate g_lookup_gate;
  * left the head's KV row at kv-1 unwritten: the head's window restarts after it (mtp_draft,
  * mtp_absorb) rather than attend a row that holds nothing of this text. */
 static int g_mtp_gap;
+static float g_mtp_pd[64]; static unsigned long long g_mtp_pdeclined;
+static int g_mtp_pstep=0; /* MTP_PSTEP=1: the verify's depth from each step's drafts' probabilities
+                           * under the head too (spec_gate_pick_p), not the averages only; opt-in,
+                           * not measured on a real checkpoint */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
@@ -8598,7 +8602,7 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
 static int mtp_argmax(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
 }
-static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
+static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft, float *pdraft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     int p=kv-1; if(p<0||G<1) return 0;
     if(g_mtp_gap){ m->kv_start[li]=p; g_mtp_gap=0; }   /* rows before p hold a gap */
@@ -8630,6 +8634,11 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
+        if(pdraft){   /* the draft's probability under the head: scores 20 below the best add under 2e-9 */
+            float mx=logit[t2]; double z=0;
+            for(int i=0;i<c->vocab;i++){ float d=logit[i]-mx; if(d>-20.f) z+=exp((double)d); }
+            pdraft[n]=z>0?(float)(1.0/z):0.f;
+        }
         draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
     }
     m->ld_ctx=0;
@@ -8910,7 +8919,16 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                  * measured times and acceptance (spec_draft.h): on a model read from the disk a
                  * verify's second row brings its own experts, and drafting can cost more than it returns */
                 int want=spec_gate_pick(&g_lookup_gate,SPEC_SRC_MTP,g_draft,NULL);
-                if(want>0){ double td0=now_s(); g=mtp_draft(m,next,kv,want,draft); tdraft=now_s()-td0;
+                if(want>0){ double td0=now_s(); float pd[64];
+                            g=mtp_draft(m,next,kv,want,draft,g_mtp_pstep?pd:NULL); tdraft=now_s()-td0;
+                            /* the depth these drafts are worth, from their probabilities (DeepSeek's
+                             * confidence-scheduled verification): a doubtful draft goes unverified and its
+                             * verify row's experts unread. Its head row at kv-1 holds the right pair. */
+                            if(g>0 && g_mtp_pstep){
+                                gsrc=2; g=spec_gate_pick_p(&g_lookup_gate,SPEC_SRC_MTP,g,pd,NULL);
+                                memcpy(g_mtp_pd,pd,sizeof pd);
+                                if(!g){ g_mtp_pdeclined++; tdraft=0; }   /* T(1) is a plain step's */
+                            }
                             m->mtp_prop+=g; if(g)gsrc=2; }
             }
             else if(g_lookup){
@@ -8948,7 +8966,8 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==4) spec_gate_result(&g_lookup_gate,SPEC_SRC_LOOKUP,k<g&&emitted<n_new&&!done?k+1:k,k);
         else if(gsrc==2 && m->has_mtp){ m->mtp_acc+=k;
-            spec_gate_result(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k); }
+            if(g_mtp_pstep) spec_gate_result_p(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k,g_mtp_pd);
+            else spec_gate_result(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k); }
         else if(gsrc==3) g_corp_acc+=(uint64_t)k;
         double tab0=mt&&k>=1?now_s():0;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
@@ -8963,8 +8982,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     g_spec_live = 0;                     /* prefill/decode successivi: gate normali / next prefill: normal gates */
     if(m->has_mtp && g_draft>0 && !g_lookup_gate.off && !logit_out){
         char gd[384]; spec_gate_describe(&g_lookup_gate,SPEC_SRC_MTP,gd,sizeof gd);
-        fprintf(stderr,"[MTP] gate: %llu verifies, %llu plain steps chosen, %llu probes, acceptance %.0f%% (%llu/%llu) | %s\n",
+        fprintf(stderr,"[MTP] gate: %llu verifies, %llu plain steps chosen (%llu after the drafts' probabilities), %llu probes, acceptance %.0f%% (%llu/%llu) | %s\n",
                 (unsigned long long)g_lookup_gate.verifies[SPEC_SRC_MTP],(unsigned long long)g_lookup_gate.declined[SPEC_SRC_MTP],
+                (unsigned long long)g_mtp_pdeclined,
                 (unsigned long long)g_lookup_gate.probes[SPEC_SRC_MTP],
                 m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,(unsigned long long)m->mtp_acc,(unsigned long long)m->mtp_prop,gd);
     }
@@ -13673,6 +13693,7 @@ int main(int argc, char **argv){
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;
+    g_mtp_pstep = getenv("MTP_PSTEP") && getenv("MTP_PSTEP")[0]=='1';
     g_lookup = !(getenv("COLI_LOOKUP") && getenv("COLI_LOOKUP")[0]=='0');   /* on by default, gated */
     spec_gate_init(&g_lookup_gate, getenv("COLI_SPEC_GATE") && getenv("COLI_SPEC_GATE")[0]=='0');
     g_no_fused_pair = getenv("COLI_NO_FUSED_PAIR")?atoi(getenv("COLI_NO_FUSED_PAIR")):0;   /* -1 = auto: 3 se MTP, 0 senza */

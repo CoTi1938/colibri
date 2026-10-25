@@ -3332,6 +3332,11 @@ family_deepseek_chain() {
   v41_gate "chain deepseek_v41 the per-row GEMV" SNAP=dsv41_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_tiny/ref.json
   v41_gate "chain deepseek_v41 V41_INDEX_OWNER=1" SNAP=dsv41_long V41_INDEX_OWNER=1 -- 8 dsv41_long/ref.json
   FAULT_BACK=5 v41_gate "chain deepseek_v41 device lost mid-decode" SNAP=dsv41_long -- 8 dsv41_long/ref.json
+  # a 200-row prompt past the tail (v41_prefill_tail): the chain's chunks before it stop at the
+  # source layer, and every forward's logits are the bytes of the run with every row
+  DSV41_CHAIN=1 DSV41_TINY=dsv41_tiny $PY -m unittest tests.test_dsv41_prefill_tail.PrefillTailChainTest ||
+    fail "chain deepseek_v41: the prompt's tail"
+  echo "OK chain deepseek_v41 the prompt's tail: the logits of every row's run, fewer ops"
   FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
   FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
   # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them

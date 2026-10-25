@@ -1764,6 +1764,8 @@ spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/tes
 	./tests/test_spec_draft$(EXE)
 	./tests/test_qwen38_spec_alloc$(EXE)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp \
+		--env Q38_MTP_PSTEP=1 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_fp8_mtp --mtp \
 		--env Q38_PREFILL_BATCH=0 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_int4_mtp \
