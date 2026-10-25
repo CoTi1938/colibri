@@ -40,9 +40,11 @@ function segments(source: string): Segment[] {
 
 /** Inline marks, innermost first so `**a *b* **` does not swallow its own stars.
     A link's URL may hold one level of balanced parentheses, as CommonMark allows:
-    Wikipedia's ".../Python_(programming_language)". */
+    Wikipedia's ".../Python_(programming_language)". Emphasis neither opens before
+    nor closes after a space, as in CommonMark, so "w * h * d" and "2 ** 3 ** 2"
+    stay arithmetic. */
 function inline(text: string, key = "i"): React.ReactNode[] {
-  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))/
+  const pattern = /(`[^`\n]+`)|(\*\*[^*\s](?:[^*\n]*[^*\s])?\*\*)|(\*[^*\s](?:[^*\n]*[^*\s])?\*)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))/
   const nodes: React.ReactNode[] = []
   let rest = text
   let index = 0
