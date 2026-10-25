@@ -3257,8 +3257,15 @@ def cmd_serve(a):
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
+    pidfile=serve_pidfile(a.port)
+    # A serve already on this port gets its pidfile back when this one ends (at once,
+    # the port being taken), or coli stop and coli status lose track of it.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        with open(pidfile) as f: owner=f.read()
+        if not _pid_alive(int(owner.split()[0])): owner=None
+    except (OSError,ValueError,IndexError): owner=None
+    try:
+        with open(pidfile,"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
     # and the stop request `coli stop` leaves when it cannot end this process itself.
     # The watcher ends with the serve: left running in a process that goes on (a test
@@ -3293,7 +3300,11 @@ def cmd_serve(a):
               family=family)
     finally:
         served.set()
-        try: os.unlink(serve_pidfile(a.port))
+        try:
+            with open(pidfile) as f: ours=f.read().split()[:1]==[str(os.getpid())]
+            if ours and owner:
+                with open(pidfile,"w") as f: f.write(owner)
+            elif ours: os.unlink(pidfile)
         except OSError: pass
 
 def _proc_state(pid):
