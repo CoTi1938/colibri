@@ -38,9 +38,11 @@ function segments(source: string): Segment[] {
   return out
 }
 
-/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars. */
+/** Inline marks, innermost first so `**a *b* **` does not swallow its own stars.
+    Emphasis neither opens before nor closes after a space, as in CommonMark, so
+    "w * h * d" and "2 ** 3 ** 2" stay arithmetic. */
 function inline(text: string, key = "i"): React.ReactNode[] {
-  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^)\s]+\))/
+  const pattern = /(`[^`\n]+`)|(\*\*[^*\s](?:[^*\n]*[^*\s])?\*\*)|(\*[^*\s](?:[^*\n]*[^*\s])?\*)|(\[[^\]\n]+\]\([^)\s]+\))/
   const nodes: React.ReactNode[] = []
   let rest = text
   let index = 0

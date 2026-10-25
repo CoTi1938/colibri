@@ -69,6 +69,14 @@ describe("the rest of the subset still renders", () => {
     expect(html).toContain("make")
   })
 
+  it("keeps asterisks with spaces around them as text, not emphasis", () => {
+    const html = render("The area is w * h, and the volume is w * h * d.")
+    expect(html).not.toContain("<em>")
+    expect(html).toContain("w * h * d.")
+    expect(render("2 ** 3 ** 2")).not.toContain("<strong>")
+    expect(render("*one* and **two**")).toContain("<em>one</em> and <strong>two</strong>")
+  })
+
   it("escapes model-written markup instead of injecting it", () => {
     const html = render("| x |\n|---|\n| <img src=x onerror=alert(1)> |")
     expect(html).not.toContain("<img")
