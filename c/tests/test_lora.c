@@ -92,6 +92,21 @@ int main(void){
     }
     t.layer=2;
 
+    /* 6) a digit string that does not fit in int must not wrap onto a real layer.
+     * sscanf %d of 4294967296 is 0 here, which is a legal index. */
+    {
+        int layer=-1, tgt=-1;
+        CHECK(lora_parse_target("model.layers.4294967296.self_attn.o_proj",&layer,&tgt)!=0);
+        CHECK(lora_parse_target("model.layers.4294967297.self_attn.o_proj",&layer,&tgt)!=0);
+        CHECK(lora_parse_target("model.layers.65536.self_attn.o_proj",&layer,&tgt)!=0);
+        CHECK(lora_parse_target("model.layers.65535.self_attn.o_proj",&layer,&tgt)==0);
+        CHECK(layer==65535 && tgt==LORA_T_O);
+        CHECK(lora_parse_target("model.layers.+3.self_attn.o_proj",&layer,&tgt)==0);
+        CHECK(layer==3);
+        CHECK(lora_parse_target("model.layers.03.self_attn.o_proj",&layer,&tgt)==0);
+        CHECK(layer==3);
+    }
+
     /* cleanup */
     char cmd[1200]; snprintf(cmd,sizeof(cmd),"rm -rf %s",adir); system(cmd);
 
