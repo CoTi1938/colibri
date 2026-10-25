@@ -1393,6 +1393,11 @@ def port_free(host, port):
 
 
 def pick_port(host, preferred, tries=20):
+    # 0 is "any port" to bind() and a negative value makes connect_ex raise
+    # OverflowError. Neither is a port setup can advertise.
+    if preferred < 1:
+        raise SetupError("port must be from 1 to 65535; "
+                         "rerun `coli setup --port PORT`")
     if preferred > 65535:
         raise SetupError("no higher port is available (maximum 65535); "
                          "rerun `coli setup --port PORT` with a lower port")
