@@ -919,6 +919,44 @@ int main(void) {
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
     }
+    printf("pick\n");
+    {
+        const int V = 248320;
+        std::vector<float> lg = rnd((size_t)V, 91, 10.f);
+        lg[173421] = 22.f;   /* a realistic peak above the bulk */
+        int best = 0;
+        for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
+        double z = 0.0; float mx = lg[best];
+        for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+        float p_ref = z > 0.0 ? (float)(1.0 / z) : 0.f;
+
+        CcBuf *lb = up(lg), *pb = T->buf(8, CC_DOWN), *small = T->buf(4, CC_DOWN);
+        int ok = T->pick && T->begin() && T->pick(lb, pb, V) && T->submit(1);
+        const void *pk = T->ptr(pb);
+        int got_id = pk ? ((const int *)pk)[0] : -1;
+        float got_p = pk ? ((const float *)pk)[1] : 0.f;
+        ck(ok && got_id == best && fabsf(got_p - p_ref) <= 1e-5f * p_ref,
+           "248320 logits: argmax id and softmax probability (within 20 of max) into an 8-byte DOWN buffer");
+
+        /* equal maxima across warps, within a warp and on the same thread: the lowest id wins */
+        int ties[3][2] = {{137, 190000}, {137, 138}, {137, 137 + 256 * 50}};
+        int tie_ok = 1;
+        for (int c = 0; c < 3; c++) {
+            std::vector<float> lt = lg;
+            lt[ties[c][0]] = 35.f;
+            lt[ties[c][1]] = 35.f;
+            double zt = 0.0;
+            for (int i = 0; i < V; i++) if (lt[i] - 35.f > -20.f) zt += expf(lt[i] - 35.f);
+            float pt = (float)(1.0 / zt);
+            int okc = T->begin() && T->write(lb, 0, lt.data(), (size_t)V * 4) && T->pick(lb, pb, V) && T->submit(1);
+            int idc = ((const int *)pk)[0];
+            float pc = ((const float *)pk)[1];
+            tie_ok &= okc && idc == ties[c][0] && fabsf(pc - pt) <= 1e-5f * pt;
+        }
+        ck(tie_ok, "equal maxima (across warps, within a warp, same thread): lowest index wins");
+        ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
+        T->free(lb); T->free(pb); T->free(small);
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);

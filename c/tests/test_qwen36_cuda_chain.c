@@ -22,7 +22,10 @@
  *   - speculative steps (prompt lookup, the MTP head) run under the tier only when it holds
  *     every routed expert and the chain runs them (q36_cuda_tier_drafts).
  *   - routed experts in the frame, all on the device or one layer's served by the host, give
- *     the CPU path's logits and route books, with one copy of the route ids a frame.
+ *     the CPU path's logits and route books, with one copy of the route ids a frame;
+ *   - the MTP head on the chain picks its drafts on the device (cc_pick): the CPU head's ids,
+ *     and its probabilities to 1e-5; a listed vocabulary, Q36_MTP_DUMP or a backend without the
+ *     op keep bringing the scores down.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -331,6 +334,82 @@ int main(void) {
                  "decode steps: one route-ids download across all layers");
         ck(books, "route books (seen and freq) equal the CPU path's after the prompt and every step");
         if (hyb) { fake_wait_hook = NULL; res_set(qs(1, 3), 1); unsetenv("COLI_CUDA_CHAIN_PROMOTE"); }
+        g_cuda_chain = 0;
+    }
+    fake_chain_table.size = CC_OPS_BASE_SIZE;
+
+    printf(" H. the MTP head on the CUDA chain: its drafts picked on the device\n");
+    /* the whole vocabulary: picked on the device; a listed vocabulary, or a backend without the
+     * op: the scores come down and the host picks, as before. Each against the CPU head. */
+    for (int hc = 0; hc < 3; hc++) {
+        static const char *what[3] = {"the whole vocabulary", "a listed vocabulary", "a backend without the op"};
+        fake_chain_table.size = hc == 2 ? offsetof(ColiCudaChainOps, pick) : sizeof(ColiCudaChainOps);
+        uint32_t ms = 99;
+        Q36Mtp *p = &g_q36_mtp;
+        memset(p, 0, sizeof *p);
+        p->on = 1; p->E = E; p->K = TOPK; p->I = INTER; p->ish = SI;
+        if (hc == 1) {   /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] */
+            p->nvoc = 16; p->vid = malloc(16 * sizeof(int));
+            for (int j = 0; j < 16; j++) p->vid[j] = 3 + 2 * j;
+            mk_qw(&p->dvoc, D, 16, &ms);
+        }
+        p->enorm = fvec(D, &ms, 0.1f, 0.f); p->hnorm = fvec(D, &ms, 0.1f, 0.f); p->head_norm = fvec(D, &ms, 0.1f, 0.f);
+        p->L.in_ln = fvec(D, &ms, 0.1f, 0.f); p->L.post_ln = fvec(D, &ms, 0.1f, 0.f);
+        p->L.qn = fvec(HD, &ms, 0.1f, 0.f); p->L.kn = fvec(HD, &ms, 0.1f, 0.f);
+        mk_qw(&p->eh, 2 * D, D, &ms);
+        mk_qw(&p->L.q, D, H * QDIM, &ms); mk_qw(&p->L.k, D, KV * HD, &ms);
+        mk_qw(&p->L.v, D, KV * HD, &ms); mk_qw(&p->L.o, H * HD, D, &ms);
+        mk_qw(&p->sh_g, D, SI, &ms); mk_qw(&p->sh_u, D, SI, &ms); mk_qw(&p->sh_d, SI, D, &ms);
+        p->router = fvec(E * D, &ms, 0.2f, 0.f); p->sh_gate = fvec(D, &ms, 0.1f, 0.f);
+        p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
+        for (int e = 0; e < E; e++) { mk_qw(&p->eg[e], D, INTER, &ms); mk_qw(&p->eu[e], D, INTER, &ms); mk_qw(&p->ed[e], INTER, D, &ms); }
+        p->pend = falloc(D);
+        Model r3, m3; build_model(&r3, &w); build_model(&m3, &w);
+        for (int i = 0; i < NL; i++) {
+            r3.L[i].qth_dnout = m3.L[i].qth_dnout = ref.L[i].qth_dnout;
+            r3.L[i].qth_q = m3.L[i].qth_q = ref.L[i].qth_q; r3.L[i].qth_k = m3.L[i].qth_k = ref.L[i].qth_k;
+            r3.L[i].qth_v = m3.L[i].qth_v = ref.L[i].qth_v; r3.L[i].qth_o = m3.L[i].qth_o = ref.L[i].qth_o;
+            r3.L[i].qth_shg = m3.L[i].qth_shg = ref.L[i].qth_shg; r3.L[i].qth_shu = m3.L[i].qth_shu = ref.L[i].qth_shu;
+            r3.L[i].qth_shd = m3.L[i].qth_shd = ref.L[i].qth_shd;
+        }
+        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        ck(c3 != NULL && c3->ok, "chain model ready for the MTP head");
+
+        float *hid_in = fvec(3 * D, &ms, 0.3f, 0.f), h_cpu[D], h_gpu[D];
+        memset(&g_q36_mc, 0, sizeof g_q36_mc);   /* the reference on the CPU, not the last case's head */
+        g_cuda_chain = 0;
+        q36_mtp_feed_rows(&r3, ids, 3, 0, hid_in);
+        int d1_cpu = q36_mtp_draft(&r3, ids[3], 3, h_cpu);
+        float p1_cpu = p->last_p;
+        int d2_cpu = q36_mtp_draft_more(&r3, h_cpu, d1_cpu, 4);
+        float p2_cpu = p->last_p;
+
+        g_cuda_chain = 1;
+        memset(&g_q36_mc, 0, sizeof g_q36_mc);
+        p->on = 1;
+        q36_mtp_feed_rows(&m3, ids, 3, 0, hid_in);
+        int d1_gpu = q36_mtp_draft(&m3, ids[3], 3, h_gpu);
+        float p1_gpu = p->last_p;
+        int d2_gpu = q36_mtp_draft_more(&m3, h_gpu, d1_gpu, 4);
+        float p2_gpu = p->last_p;
+
+        int dev = hc == 0;
+        char msg[160];
+        snprintf(msg, sizeof msg, "%s: %s", what[hc], dev ? "the logits stay in device memory, an 8-byte pick comes down" :
+                                                            "the logits come down to the host, as before");
+        ck(g_q36_mc.on && g_q36_mc.pick_dev == dev && g_q36_mc.outd->kind == (dev ? CC_DEV : CC_DOWN) &&
+           (!dev || (g_q36_mc.pick->kind == CC_DOWN && g_q36_mc.pick->bytes == 8)), msg);
+        snprintf(msg, sizeof msg, "%s: draft 1 and draft 2 equal the CPU head's, their probabilities to 1e-5", what[hc]);
+        ck(d1_gpu == d1_cpu && d2_gpu == d2_cpu && fabsf(p1_gpu - p1_cpu) <= 1e-5f * p1_cpu && fabsf(p2_gpu - p2_cpu) <= 1e-5f * p2_cpu,
+           msg);
+        if (dev) {
+            setenv("Q36_MTP_DUMP", "/tmp/unused", 1);
+            memset(&g_q36_mc, 0, sizeof g_q36_mc);
+            ck(q36_mc_init(&m3) && !g_q36_mc.pick_dev && g_q36_mc.outd->kind == CC_DOWN,
+               "Q36_MTP_DUMP set when the head is set up: the logits buffer on the host, as before");
+            unsetenv("Q36_MTP_DUMP");
+        }
+        free(hid_in);
         g_cuda_chain = 0;
     }
     fake_chain_table.size = CC_OPS_BASE_SIZE;
