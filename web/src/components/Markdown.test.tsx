@@ -74,4 +74,10 @@ describe("the rest of the subset still renders", () => {
     expect(html).not.toContain("<img")
     expect(html).toContain("&lt;img")
   })
+
+  it("keeps the step number of a list resumed after a code block", () => {
+    const html = render("1. Install:\n\n```sh\nmake\n```\n\n2. Run it\n3. Done")
+    expect(html).toContain('<ol start="2"><li>Run it</li><li>Done</li></ol>')
+    expect(render("1. a\n2. b")).toContain("<ol><li>a</li>")
+  })
 })
