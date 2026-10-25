@@ -26,6 +26,7 @@
  */
 #ifndef SCHEMA_GBNF_H
 #define SCHEMA_GBNF_H
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +88,8 @@ static void sgb_put_json_string_lit(SgbCtx *C, const char *raw){
 
 /* emit a number the way a model would print it: shortest round-trip via %g */
 static void sgb_put_number_lit(SgbCtx *C, double d){
+    /* 1e9999 parses as inf. %.17g then writes the literal inf, which is not JSON. */
+    if (!isfinite(d)){ sgb_fail(C, "non-finite number"); return; }
     char b[64]; snprintf(b, sizeof b, "\"%.17g\"", d);
     /* %.17g writes 0.1 as 0.10000000000000001: a fraction takes the fewest
      * digits that read back as the same double, the text a model writes. */
@@ -186,8 +189,16 @@ static void sgb_item(SgbCtx *C, jval *items, int depth, const char *rule){
 static void sgb_array(SgbCtx *C, jval *sc, int depth){
     jval *items = json_get(sc, "items");
     jval *mi    = json_get(sc, "minItems");
-    int min1 = mi && mi->t == J_NUM && mi->num >= 1;
-    if (mi && mi->t == J_NUM && mi->num > 1){ sgb_fail(C, "minItems > 1"); return; }
+    /* Only the integers 0 and 1 are implemented. 0.5 and -1 used to fall
+     * through as "zero or more", and true is a bool that is not a number. */
+    int min1 = 0;
+    if (mi){
+        if (mi->t != J_NUM || !isfinite(mi->num) || mi->num != floor(mi->num) ||
+            mi->num < 0.0 || mi->num > 1.0){
+            sgb_fail(C, "minItems must be 0 or 1"); return;
+        }
+        min1 = mi->num == 1.0;
+    }
     if (!items){ sgb_fail(C, "array without items"); return; }
     char rule[32] = "";
     if (sgb_has_array(items, depth + 1)){

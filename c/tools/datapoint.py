@@ -17,8 +17,9 @@ cache is empty again.  Keeping the two modes explicit prevents those different
 states from being compared as if they were the same benchmark.
 
 Before either campaign, the page cache is evicted when possible (macOS:
-``purge``; Linux: ``posix_fadvise(DONTNEED)`` over the model shards).  iobench
-runs immediately after eviction, before model loading can re-warm the files.
+``purge``; Linux: ``posix_fadvise(DONTNEED)`` over the model shards).  With
+``--shard PATH``, iobench runs immediately after eviction, before model loading
+can re-warm the files; ``--iobench`` alone only selects its executable.
 
 Usage:
   python tools/datapoint.py --snap models/olmoe_merged
@@ -524,8 +525,8 @@ def build_parser():
     ap.add_argument("--engine", default=None,
                     help="engine binary (default: select from model config.json)")
     ap.add_argument("--snap", required=True, help="model snapshot directory")
-    ap.add_argument("--iobench", default="./iobench", help="iobench binary")
-    ap.add_argument("--shard", default=None, help="shard file for iobench")
+    ap.add_argument("--iobench", default="./iobench", help="iobench binary (used only with --shard)")
+    ap.add_argument("--shard", default=None, help="shard file to benchmark; enables iobench disk results")
     ap.add_argument("--prompt", default="Continue this story: The lighthouse keeper climbed the stairs and saw something impossible in the fog. ",
                     help="prompt used for cold and warm-identical requests")
     ap.add_argument("--rotate-prompt", action="append", dest="rotating_prompts",

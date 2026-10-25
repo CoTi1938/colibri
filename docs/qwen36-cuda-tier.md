@@ -27,7 +27,9 @@ more GPUs and computed there through the existing shared CUDA backend
 - **Decode:** per (token, layer) the resident experts are issued as async
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
   fall back to the CPU and overlap with the in-flight groups, as does the
-  shared expert. Placement never changes routing or precision.
+  shared expert. Placement never changes routing. With planar int4 in RAM it
+  decides which kernel computes an expert, and so its last digits (see "The
+  residents follow the conversation").
 - **Memory:** on an **int4 gs64 container** the experts stay planar int4 in
   RAM (`expert_ffn.h`, the CPU's kernel for the misses), one copy at the size
   on disk; the tier converts the planar bytes to its pairs when it stages an
@@ -534,17 +536,18 @@ the history's routes, decayed, plus this conversation's (`qt_chain_count` for th
 away from the history overtakes within tens of tokens. Each takes the device buffers of the
 coldest of 64 residents drawn at random on its device, where it clears the tier's admission
 margin (`tier_should_promote`: a quarter and four over the victim; the same rule as the LFRU
-tick, which keeps running once in 16 tokens). The chain copies the newcomer's RAM bytes --
-as the RAM holds them: the device's int8 and int4 rows are the same bytes, the upload's XOR
-and the device's undo it; int4 per group from planar blocks is refused -- into a page-locked
-staging slot and from there into the victim's buffers on its copy stream (`cc_host_up`, six
-copies an expert), while the next steps run. The tier's uploader thread does not take part:
+tick, which keeps running once in 16 tokens). The chain stages the newcomer's RAM bytes
+into a page-locked slot (`qt_chain_promote_stage`: as the RAM holds them for int8 and
+pair-ordered int4 rows, or converted from planar int4 blocks into the device's signed pairs)
+and from there into the victim's buffers on its copy stream (`cc_host_up`, six copies an
+expert), while the next steps run. The tier's uploader thread does not take part:
 its synchronous copies take the driver's lock from another thread while the chain's frame
 waits for the host (`cc_wait_host`), and that deadlocked inside the driver on the 3070.
 Once the copies landed (`cc_host_up_done`, checked after the next steps) the tier hands the
 buffers to the newcomer (`qt_chain_promote_done`) and it is resident; the victim computes on
 the CPU from the step after its eviction on (its int8 copy rebuilt by `tier_rebuild_evicted`
-before that forward, in parallel). The chain's table takes the changes entry by entry
+before that forward, in parallel, where `QWEN_EXPERT_KERNEL=0` needs one; planar int4 keeps
+its RAM blocks). The chain's table takes the changes entry by entry
 (`qt_chain_changes`: the tier records every change of residency; the whole table is read
 again only where the tier lost count), and the staged table of a prompt chunk follows when
 a chunk needs it.
@@ -570,9 +573,52 @@ the set keeps adapting until the brake takes over near the end; on the very prom
 history was trained on (80-82 % hits here) the brake holds from the first steps and nothing is
 lost, where at 80 % it was marginal and let 79-158 swaps through. Eight a step instead of four
 moved the same experts in 200 tokens (the margin limits, not the rate) and measured the same
-within noise; `0` keeps the warm start's set. The greedy text with and without is the same. A
-promotion costs the engine thread about 0.15 ms (the staging memcpy) and the victim's int8
-rebuild about 0.85 ms of one CPU thread before the next forward.
+within noise; `0` keeps the warm start's set. With rows in RAM (an int8 container, or
+`QWEN_EXPERT_KERNEL=0`) the greedy text with and without is the same. A promotion costs the
+engine thread about 0.15 ms (the staging memcpy) and the victim's int8 rebuild about 0.85 ms
+of one CPU thread before the next forward.
+
+With planar int4 in RAM (`QWEN_EXPERT_KERNEL=1`, an int4 container's default) the staging
+converts the newcomer's blocks into the card's signed pairs (`planar_to_pairs_signed`, an AVX2
+path or a scalar loop). A promoted expert then runs `cc_moe` on the card instead of
+`expert_ffn.h` on the CPU, which rounds its input to int8 (`QWEN_EXPERT_ACT`): its result moves
+in the last digits, and the greedy text can part where two tokens are close. Measured on a
+Google Colab L4 (Xeon, 6 cores / 12 threads, 52 GiB) with the int4-g64 container at
+`CUDA_EXPERT_GB=5` (1823 of 10240 experts in VRAM after the warm start), OMP 6 threads, 200
+tokens and the heat file of one origin/dev run at `auto` on a 652-token question about MoE
+offloading, frozen (every run starts from a copy): origin/dev 561966ec (planar int4 refused)
+against the promotion, after one warm-up run, in A B B A order on one VM; the last two rows on
+another, both engines built without AVX2 (`ARCH=x86-64-v2`). tok/s is the engine's `Speed`
+line, ms a token the `COLI_TIMERS` step() total
+([raw](experiments/qwen36-cuda-promote-planar-2026-10-25-raw.txt)):
+
+| prompt, engine | decode VRAM hits | promoted | ms a token | tok/s |
+|---|---|---|---|---|
+| 41 tokens, origin/dev (4 runs) | 20.8 % | 0 | 33.0-33.1 | 24.99-25.05 |
+| 41 tokens, the promotion (4 runs) | 52.6 % | 591 | 26.3-26.4 | 29.96-30.05 |
+| 664 tokens, origin/dev (2 runs) | 19.6 % | 0 | 33.2-33.3 | 24.42-24.46 |
+| 664 tokens, the promotion (2 runs) | 53.9 % | 715 | 26.0 | 29.62-29.65 |
+| 41 tokens, no AVX2, origin/dev (4 runs) | 19.7 % | 0 | 305.1-305.6 | 3.21-3.22 |
+| 41 tokens, no AVX2, the promotion (4 runs) | 50.9 % | 598 | 202.5-203.0 | 4.78-4.79 |
+
+Choosing and staging take the engine thread 0.46-0.58 ms a promotion with AVX2 (332-342 ms for
+591, 332-333 ms for 715), about what rows take on the same L4 (0.50-0.51 ms: 354-359 ms for
+709, origin/dev with `QWEN_EXPERT_KERNEL=0`), and 0.59-0.60 ms without AVX2 (355-359 ms for
+598: GCC vectorizes the loop with SSE2). Without AVX2 the CPU's kernel for the misses is far
+slower, so both engines are. RSS is 19.2 GB on both sides (`QWEN_EXPERT_KERNEL=0` keeps int8
+copies: 44.0 GB, 46.1 GB with its promotions). With every expert in VRAM (`auto`, the L4's
+default) nothing is promoted, the text is origin/dev's and the speed the same within 0.5 %; the
+warm start converts with the same AVX2 block (`planar_to_pairs`): 14.4 to 8.8 s there, 7.6-7.7
+to 6.4-6.5 s at `CUDA_EXPERT_GB=5` (warm runs; origin/dev's first runs on those VMs took 15.7
+and 10.9 s).
+
+The greedy text parted from origin/dev's on both story prompts (at character 204 of 864 and 350
+of 863); with `COLI_CUDA_CHAIN_PROMOTE=0` it is origin/dev's (checked on the 41-token one). The
+teacher-forced loss does not get worse (`PPL=1`, `CUDA_EXPERT_GB=5`, the heat file of one
+32-token run on the story prompt, frozen): 3.0719 nats a token with promotions (508) against
+3.0774 without, 3.0725 with every expert in VRAM (`auto`) and 3.0728 with
+`QWEN_EXPERT_KERNEL=0`, on 250 tokens of prose after 600; 0.2984 (462) against 0.2998, 0.2960
+and 0.2953 on 200 tokens of the story after its 41-token prompt.
 
 ### A prompt's experts past VRAM: the host pool (`COLI_CUDA_HOST_POOL`, on by default)
 

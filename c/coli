@@ -2270,8 +2270,8 @@ IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
 # un apostrofo -- cioe' su una frase italiana su due.
 _ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
 # a drive with either slash (Python on MSYS2 and many Windows tools write C:/...), never a
-# letter inside a word ("Nota:/tmp/x.png" is /tmp/x.png)
-_IMAGE_PATH_START = r"(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/]|~?/|\./)"
+# letter or slash inside a word ("Nota:/tmp/x.png" is /tmp/x.png, "WebP/AVIF" is prose)
+_IMAGE_PATH_START = r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|~?/|\./)"
 IMAGE_PATH = re.compile(
     r'"' + _IMAGE_PATH_START + r'[^"\n]*\.(?:' + _ESTENSIONI + r')"'
     + r"|'" + _IMAGE_PATH_START + r"[^'\n]*\.(?:" + _ESTENSIONI + r")'"

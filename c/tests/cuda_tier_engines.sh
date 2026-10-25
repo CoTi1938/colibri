@@ -13,7 +13,7 @@ make -j"$(nproc)" glm53 deepseek_v41 mimo kimi_k3 CUDA=1 > cuda_tier_build.log 2
 [ -d glm53_stream-i4 ] || { $PY tools/make_glm53_tiny.py --output glm53_tiny --force > /dev/null &&
                              $PY tools/make_glm53_streaming_pair.py --fixture glm53_tiny --output glm53_stream > /dev/null; } || exit 1
 [ -d dsv41_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null || exit 1
-[ -d mimo_tiny ] || $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision > /dev/null || exit 1
+[ -f mimo_tiny/model-00001-of-00002.safetensors ] || $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision > /dev/null || exit 1
 if [ ! -d k3_gguf_tiny ]; then
   $PY - <<'PY' || exit 1
 import sys

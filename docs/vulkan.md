@@ -54,6 +54,28 @@ The compiled shaders are found via `COLI_VK_SHADERS` (either the
 engine looks in `shaders/` next to the binary (Linux, Windows and macOS),
 then relative to the CWD.
 
+### NVIDIA in a container
+
+In a CUDA container (seen with `nvidia/cuda:12.8.1-devel-ubuntu24.04`, driver
+580) the driver's Vulkan file, `/etc/vulkan/icd.d/nvidia_icd.json`, names the
+GLX library, `libGLX_nvidia.so.0`. The loader skips it (`libXext.so.6: cannot
+open shared object file`), and with `libxext6` installed it still cannot start
+it (`Could not get 'vkCreateInstance' via 'vk_icdGetInstanceProcAddr' for ICD
+libGLX_nvidia.so.0`): `vulkaninfo` shows `llvmpipe`, the CPU, not the card.
+The driver's EGL library starts with no display: a file like it naming
+`libEGL_nvidia.so.0`, given with `VK_DRIVER_FILES` (`VK_ICD_FILENAMES` for an
+older loader), shows the card. The `api_version` below is driver 580's; take
+yours from the original. Set the variable for every command that opens Vulkan,
+`coli plan` included.
+
+```bash
+cat > nvidia_icd_egl.json <<'EOF'
+{ "file_format_version" : "1.0.1",
+  "ICD": { "library_path": "libEGL_nvidia.so.0", "api_version" : "1.4.312" } }
+EOF
+VK_DRIVER_FILES=$PWD/nvidia_icd_egl.json vulkaninfo --summary   # lists the card
+```
+
 ### Windows (MSYS2)
 
 The release's `windows-x86_64.zip` has the engines built this way. To build

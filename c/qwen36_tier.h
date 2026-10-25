@@ -268,6 +268,7 @@ typedef struct {
     size_t mb, sb_gu, sb_d;                       /* a matrix's bytes; the gate/up and down scales' bytes */
 } QtPromo;
 int  qt_chain_promote(int max, QtPromo *out);
+void qt_chain_promote_stage(void *dst, const QtPromo *p);
 void qt_chain_promote_done(int ci, int vi, int ok);
 int  qt_chain_changes(int *idx, int max, int *overflow);
 uint64_t qt_chain_promoted(void);
@@ -331,6 +332,7 @@ static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
 static inline int  qt_chain_devices(void){return 0;}
 typedef struct { int ci, vi; const uint8_t *g, *u, *d; const float *gs, *us, *ds; struct ColiCudaTensor *tg, *tu, *td; size_t mb, sb_gu, sb_d; } QtPromo;
 static inline int  qt_chain_promote(int a,QtPromo*b){(void)a;(void)b;return 0;}
+static inline void qt_chain_promote_stage(void*a,const QtPromo*b){(void)a;(void)b;}
 static inline void qt_chain_promote_done(int a,int b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_chain_changes(int*a,int b,int*c){(void)a;(void)b;*c=0;return 0;}
 static inline uint64_t qt_chain_promoted(void){return 0;}

@@ -14,6 +14,7 @@
  * Reader/writer reuse st.h + json.h; no new dependencies. */
 #ifndef LORA_H
 #define LORA_H
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,14 +85,33 @@ static void lora_apply(const LoraTensor *t, const float *x, float *y, int S){
     }
 }
 
+/* Decimal layer index. sscanf %d is not usable here: a digit string that does
+ * not fit in int is undefined, and on this libc 4294967296 wraps to 0 and
+ * would load the tensor onto layer 0. Stop at the layer table instead. */
+static int lora_parse_layer(const char *s, int *n_out, const char **rest){
+    if(*s=='+') s++;                 /* "model.layers.+3" is the same layer as 3 */
+    if(*s<'0' || *s>'9') return -1;
+    int n=0;
+    while(*s>='0' && *s<='9'){
+        int d=*s-'0';
+        if(n > (LORA_MAX_LAYERS - d) / 10) return -1;
+        n=n*10+d;
+        s++;
+    }
+    if(n>=LORA_MAX_LAYERS) return -1;
+    *n_out=n; *rest=s;
+    return 0;
+}
+
 /* parse "model.layers.<n>.<suffix>" -> layer/tgt; -1 if not in the allowlist */
 static int lora_parse_target(const char *name, int *layer, int *tgt){
-    int n=-1, off=-1;
-    if(sscanf(name,"model.layers.%d.%n",&n,&off)!=1 || off<0) return -1;
-    /* the index sizes and addresses lut[]: below zero it writes before it */
-    if(n<0 || n>=LORA_MAX_LAYERS) return -1;
+    static const char prefix[]="model.layers.";
+    if(strncmp(name,prefix,sizeof(prefix)-1)) return -1;
+    int n; const char *rest;
+    if(lora_parse_layer(name+(sizeof(prefix)-1),&n,&rest) || *rest!='.') return -1;
+    rest++;
     for(int k=0;k<LORA_NTGT;k++)
-        if(!strcmp(name+off,lora_tgt_suffix[k])){ *layer=n; *tgt=k; return 0; }
+        if(!strcmp(rest,lora_tgt_suffix[k])){ *layer=n; *tgt=k; return 0; }
     return -1;
 }
 
@@ -123,8 +143,12 @@ static LoraAdapter *lora_load(const char *dir, uint64_t expect_fp, int unsafe){
         fprintf(stderr,"[LORA] unsupported format (want %s)\n",LORA_FORMAT); return NULL; }
     if(!jrank||jrank->t!=J_NUM||!jalpha||jalpha->t!=J_NUM||!jtg||jtg->t!=J_ARR||jtg->len<1){
         fprintf(stderr,"[LORA] adapter.json: missing rank/alpha/targets\n"); return NULL; }
-    int rank=(int)jrank->num;
-    if(rank<1||rank>LORA_MAX_RANK){ fprintf(stderr,"[LORA] rank %d outside [1,%d]\n",rank,LORA_MAX_RANK); return NULL; }
+    /* Cast only after the range check: (int)4.5 is 4, which then passes
+     * [1, LORA_MAX_RANK] and sizes the A/B reads for the wrong rank. */
+    double rd=jrank->num;
+    if(!isfinite(rd) || rd<1.0 || rd>(double)LORA_MAX_RANK || rd!=floor(rd)){
+        fprintf(stderr,"[LORA] rank must be an integer in [1,%d]\n",LORA_MAX_RANK); return NULL; }
+    int rank=(int)rd;
     uint64_t fp=0;
     if(jfp&&jfp->t==J_STR) fp=strtoull(jfp->str,NULL,16);
     if(fp!=expect_fp){
@@ -134,8 +158,14 @@ static LoraAdapter *lora_load(const char *dir, uint64_t expect_fp, int unsafe){
         fprintf(stderr,"[LORA] LORA_UNSAFE=1: loading anyway\n");
     }
 
+    /* (float) of a non-finite alpha is inf, and scale = alpha/rank then poisons
+     * every adapted layer. A finite alpha, including 0, is a real scale. */
+    double ad=jalpha->num;
+    float alpha=(float)ad;
+    if(!isfinite(ad) || !isfinite(alpha)){
+        fprintf(stderr,"[LORA] alpha is not finite\n"); return NULL; }
     LoraAdapter *a=calloc(1,sizeof(*a));
-    a->rank=rank; a->alpha=(float)jalpha->num; a->base_fp=fp;
+    a->rank=rank; a->alpha=alpha; a->base_fp=fp;
     if(jbm&&jbm->t==J_STR) snprintf(a->base_model,sizeof(a->base_model),"%s",jbm->str);
     a->n=jtg->len;
     a->t=calloc(a->n,sizeof(LoraTensor));
