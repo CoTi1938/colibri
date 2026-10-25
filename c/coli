@@ -3212,7 +3212,8 @@ def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
     try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
     except StopIteration: return False
-    if coli_i+1>=len(argv) or argv[coli_i+1]!="serve":
+    # `coli web` is a serve too, and the one `coli start` runs
+    if coli_i+1>=len(argv) or argv[coli_i+1] not in ("serve","web"):
         return False
     configured=8000
     for i,arg in enumerate(argv[coli_i+2:], start=coli_i+2):
