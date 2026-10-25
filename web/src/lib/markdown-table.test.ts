@@ -19,6 +19,11 @@ describe("splitting a row into cells", () => {
   it("does not strip a trailing escaped pipe as a delimiter", () => {
     expect(splitRow("| a | b \\|")).toEqual(["a", "b |"])
   })
+
+  it("keeps a literal backslash and still splits on the following pipe", () => {
+    expect(splitRow("| a \\\\| b |")).toEqual(["a \\", "b"])
+    expect(splitRow("| a | b \\\\|")).toEqual(["a", "b \\"])
+  })
 })
 
 describe("recognising the delimiter row", () => {
