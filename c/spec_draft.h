@@ -35,12 +35,17 @@
  *                 bins of p, each starting at the bin's own p, worth two verifies). A step
  *                 whose drafts are sure verifies deeper, a doubtful one stops early or takes
  *                 a plain step (DeepSeek's "confidence-scheduled verification").
+ *                 spec_gate_deeper_p says, while a source drafts one at a time, whether
+ *                 the newest draft is worth its verify row: when it is not, a deeper draft
+ *                 (no likelier) is not worth writing.
  *
  * Neither ever changes a token: every proposal goes through the engine's verify, which
  * keeps exactly what plain decoding produces. They change how many forwards that takes.
  *
- * Callers: qwen38_core.h (MTP drafts and prompt lookup, combined) and qwen36.c (prompt
- * lookup). docs/speculative.md describes how another engine with a verify path wires it. */
+ * Callers: qwen38_core.h (MTP drafts and prompt lookup, combined), qwen36.c (prompt lookup
+ * and the MTP head), colibri.c (GLM's MTP head, its n-gram drafts) and deepseek_v41.c
+ * (DSpark's depth). docs/speculative.md describes how another engine with a verify path
+ * wires it. */
 #ifndef COLI_SPEC_DRAFT_H
 #define COLI_SPEC_DRAFT_H
 
