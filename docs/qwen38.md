@@ -440,18 +440,28 @@ native FP8 routed experts (`Q38_NATIVE_FP8=1`, the default) with every layer's
 block-scale bank resident; a checkpoint that falls back to the per-matrix
 scale loader stays on the CPU and says so.
 
+**The card's allowance.** `CUDA_EXPERT_GB` is what each card gives the tier,
+the dense trunk and, with the CUDA chain, the chain's own buffers, in GB. Unset,
+`0` or `auto`, it is the card's free memory less 1 GB; the start prints both,
+`[qtier] dev 0: <free> GB free, allowance <GB> GB`. `coli chat --vram <GB>`
+passes its number as `CUDA_EXPERT_GB`; `--gpu` alone leaves it to the engine.
+`COLI_VK_TIER_GB` is the Vulkan tier's and does not size this one.
+
 **What a VRAM budget buys.** The routing of Qwen3.8-Flash-Next has no hot set
 that carries over between prompts: the 1,400 experts (5.8 % of the model) that
 were hottest in one 100-token run covered a different prompt's routes at
 chance level (4.7 %; two cards, 2,800 experts: 9.3 % against 11.5 % chance;
 rank correlation of expert frequency per layer between the two runs -0.2). A
 heat file from an earlier run therefore does not help, and the engine does no
-warmstart. Inside a run the locality is strong -- on the route trace of a
-315-token prompt plus 100 generated tokens, an LRU of 32 slots per layer
-serves 55 % of decode routes, 64 serve 79 %, 128 serve 90 % -- so the tier
-earns its VRAM by promotion at touch time: with the RAM LRU at cap 128, one
-8 GB card served 45 % of decode routes from VRAM on the real checkpoint, two
-cards 59 %.
+warmstart of the fp8 tier. (A GGUF is another case: the tier holds its experts
+as the file has them and fills the card at the start, the history's most used
+first, `.coli_usage`; `COLI_CUDA_TIER_WARM=0` turns that off. See
+[gguf.md](gguf.md#what-the-engines-do-with-the-blocks).) Inside a run the
+locality is strong -- on the route trace of a 315-token prompt plus 100
+generated tokens, an LRU of 32 slots per layer serves 55 % of decode routes,
+64 serve 79 %, 128 serve 90 % -- so the tier earns its VRAM by promotion at
+touch time: with the RAM LRU at cap 128, one 8 GB card served 45 % of decode
+routes from VRAM on the real checkpoint, two cards 59 %.
 
 **VRAM per expert.** The tier charges what `cudaMalloc` takes, not the payload:
 an allocation above 1 MiB rounds up to a multiple of 2 MiB, so each 1.56 MiB
