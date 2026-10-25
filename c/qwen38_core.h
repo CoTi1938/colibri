@@ -3837,12 +3837,13 @@ static void q38_trunk_place_all(Model *m) {
  * (.coli_usage, qt_heat_order), each read as the file has it (the three matrices' rows)
  * in parallel and handed over (the tier copies them), until the budget is full. Before,
  * the tier started empty and filled as the CPU's experts passed, converting each. */
-static void q38_tier_warm(Model *m) {
+static void q38_tier_warm(Model *m,int hist) {
     Cfg *c=&m->c; const int L=c->layers,E=c->experts,all=L*E;
     const char *w=getenv("COLI_CUDA_TIER_WARM");   /* 0: the tier fills as experts pass */
     if(w&&w[0]=='0')return;
-    uint32_t **hist=rt_counts_all();
-    if(hist)qt_heat_order(hist,L,E);
+    /* hist: rt_load read selections. rt_init makes the counters with or without a history, and
+     * their zeros would only replace the tier's order (HEAT_FILE's, or none) with a sort of ties. */
+    if(hist)qt_heat_order(rt_counts_all(),L,E);
     int *pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
     int n=qt_plan_fill(pl,pe,all);
