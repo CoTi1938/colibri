@@ -69,6 +69,18 @@ describe("the rest of the subset still renders", () => {
     expect(html).toContain("make")
   })
 
+  it("keeps balanced parentheses inside a link's URL", () => {
+    const html = render("See [Python](https://en.wikipedia.org/wiki/Python_(programming_language)) here.")
+    expect(html).toContain('href="https://en.wikipedia.org/wiki/Python_(programming_language)"')
+    expect(html).toContain("</a> here.")
+  })
+
+  it("still ends a link at its own parenthesis inside parenthesized prose", () => {
+    const html = render("(see [docs](https://example.com/docs))")
+    expect(html).toContain('href="https://example.com/docs"')
+    expect(html).toContain("</a>)")
+  })
+
   it("escapes model-written markup instead of injecting it", () => {
     const html = render("| x |\n|---|\n| <img src=x onerror=alert(1)> |")
     expect(html).not.toContain("<img")
