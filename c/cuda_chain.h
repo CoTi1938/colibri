@@ -268,6 +268,12 @@ typedef struct ColiCudaChainOps {
     /* matmul_rows: y[0..n) = the rows ids[0..n) of a resident tensor (fmt 0 or 1, one input
      * row x[I]); an MTP head's adaptive draft vocabulary scored from the model's lm_head */
     int  (*matmul_rows)(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n);
+    /* fetch_at, fetch_wait_at, fetch_done_at: fetch, fetch_wait and fetch_done for place `slot`
+     * (0 or 1), each place with its own pair of events: a second staging place is filled while
+     * the first is read. fetch, fetch_wait and fetch_done are place 0's. */
+    int  (*fetch_at)(CcBuf *dst, const CcFetch *r, int n, int slot);
+    int  (*fetch_wait_at)(int slot);
+    int  (*fetch_done_at)(int slot);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -367,6 +373,13 @@ static inline int cc_matmul_rows_ready(void) {
 static inline int cc_matmul_rows(ColiCudaTensor *w, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
     return cc_matmul_rows_ready() ? cc_ops()->matmul_rows(w, ids, x, y, n) : 0;
 }
+static inline int cc_fetch_at_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, fetch_done_at) + sizeof t->fetch_done_at && t->fetch_at && t->fetch_wait_at && t->fetch_done_at;
+}
+static inline int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int slot) { return cc_fetch_at_ready() ? cc_ops()->fetch_at(dst, r, n, slot) : 0; }
+static inline int cc_fetch_wait_at(int slot) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(slot) : 0; }
+static inline int cc_fetch_done_at(int slot) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(slot) : 0; }
 #endif
 
 #ifdef __cplusplus

@@ -696,7 +696,7 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_qsa, fcc_ple,
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    fcc_pick, fcc_matmul_rows,
+    fcc_pick, fcc_matmul_rows, NULL, NULL, NULL,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

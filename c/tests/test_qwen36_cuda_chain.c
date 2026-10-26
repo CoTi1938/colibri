@@ -179,6 +179,11 @@ int main(void) {
     const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
     ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up");
+    /* the staging's second place: only where both fit in the 256 experts q36cc_rows_max sets aside for it
+     * (a T4 with the residents spread, 91 a layer: two; whole layers, 256: one; an RTX 3070's ~190: one) */
+    ck(q36cc_stage_slots(91, 256) == 2 && q36cc_stage_slots(128, 256) == 2 && q36cc_stage_slots(129, 256) == 1 &&
+       q36cc_stage_slots(190, 256) == 1 && q36cc_stage_slots(256, 256) == 1 && q36cc_stage_slots(0, 256) == 1,
+       "the staging has two places where two layers' worth fit in a layer's, else one");
     Model ref; build_model(&ref, &w);
     place_trunk(&ref, &w);        /* the reference uses the same resident copies, matrix by matrix */
     Model m; build_model(&m, &w);
