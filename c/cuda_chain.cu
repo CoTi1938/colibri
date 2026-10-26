@@ -1061,9 +1061,11 @@ static int cc_zero(CcBuf *dst, size_t off, size_t n) {
     return cc_ok(c, cudaMemsetAsync(dst->d + off, 0, n * 4, c->stream), "zero");
 }
 /* Regions on a grid (vk_chain.c's cp2_grid): region i = (q, h) = (i / per, i % per) copies len
- * floats from src[s0 + q*sq + h*sh ..] to dst[d0 + q*dq + h*dh ..]. A prompt chunk's K and V rows
- * into the head-major cache are such a grid, a region per row and head: a copy each was 41366
- * cudaMemcpyAsync calls and 521 ms of the host's time on a 1024-token prompt (Qwen3.6-35B). */
+ * floats from src[s0 + q*sq + h*sh ..] to dst[d0 + q*dq + h*dh ..]. A step's K and V rows into
+ * the head-major cache are such a grid, a region per row and head: unlike vkCmdCopyBuffer, the
+ * fallback below issues a cudaMemcpyAsync per region (41366 calls and 521 ms of host time on a
+ * 1024-token prompt, 40 calls a decode token on Qwen3.6-35B), so any grid of two or more regions
+ * takes one kernel launch. */
 struct CcGrid { long long d0, s0, dh, sh, dq, sq; int len, per, n; };
 __global__ static void cc_copy_grid_k(float *__restrict__ d, const float *__restrict__ s, CcGrid g) {
     long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1072,7 +1074,7 @@ __global__ static void cc_copy_grid_k(float *__restrict__ d, const float *__rest
     d[g.d0 + q * g.dq + h * g.dh + j] = s[g.s0 + q * g.sq + h * g.sh + j];
 }
 static int cc_grid_of(const CcRegion *r, int n, CcGrid *g) {
-    if (n < 64 || !r[0].n || r[0].n > 0x7fffffff) return 0;
+    if (n < 2 || !r[0].n || r[0].n > 0x7fffffff) return 0;
     long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
     long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
     int per = 1;

@@ -445,7 +445,9 @@ the Vulkan chain does (docs/vulkan.md, "The routed experts in the frame"):
   again when the tier's residency changed (`qt_chain_epoch`). The tier is held for the
   forward (`qt_chain_hold`): an eviction clears the flag at once and moves the epoch, but
   no swap writes into a resident's buffers until the forward is done.
-- A layer whose experts are all in the table has no host step. A layer with some
+- A layer whose experts are all in the table has no host step, and its route ids and
+  weights stay on the device during the frame: the ids of every layer come down in one
+  copy at its end, for the books below. A layer with some
   elsewhere (VRAM was short) signals the host once its routes and rows are down
   (`cc_signal`: a one-thread kernel writes a word of host memory after a system fence).
   The host computes the slots the table lacks as the tier's misses always were

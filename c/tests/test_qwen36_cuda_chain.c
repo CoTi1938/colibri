@@ -21,6 +21,8 @@
  *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path;
  *   - speculative steps (prompt lookup, the MTP head) run under the tier only when it holds
  *     every routed expert and the chain runs them (q36_cuda_tier_drafts).
+ *   - routed experts in the frame, all on the device or one layer's served by the host, give
+ *     the CPU path's logits and route books, with one copy of the route ids a frame.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -147,6 +149,11 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
     return ok;
 }
 
+/* a hybrid layer on the fake, whose ops run when called: the host answers inside the device's
+ * wait (the engine serves it again after the next layer, the same rows) */
+static Q36CChain *serve_ch; static Model *serve_m; static int serve_n;
+static int serve_layer1(unsigned v) { return q36cc_dm_serve(serve_ch, serve_m, 1, serve_n, v); }
+
 int main(void) {
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
@@ -271,6 +278,62 @@ int main(void) {
     ck(q36_cuda_tier_drafts(&m), "every routed expert on the device, the chain on: speculative steps");
     g_cuda_chain = 0;
     ck(!q36_cuda_tier_drafts(&m), "the chain off: none");
+
+    printf(" G. routed experts in the frame: logits, route books, one ids copy a frame\n");
+    fake_chain_table.size = offsetof(ColiCudaChainOps, tensor_dev) + sizeof fake_chain_table.tensor_dev;
+    for (int hyb = 0; hyb < 2; hyb++) {   /* every expert on the device, then layer 1 with one on the host */
+        Model r3, m3; build_model(&r3, &w); build_model(&m3, &w);
+        for (int i = 0; i < NL; i++) {
+            r3.L[i].qth_dnout = m3.L[i].qth_dnout = ref.L[i].qth_dnout;
+            r3.L[i].qth_q = m3.L[i].qth_q = ref.L[i].qth_q; r3.L[i].qth_k = m3.L[i].qth_k = ref.L[i].qth_k;
+            r3.L[i].qth_v = m3.L[i].qth_v = ref.L[i].qth_v; r3.L[i].qth_o = m3.L[i].qth_o = ref.L[i].qth_o;
+            r3.L[i].qth_shg = m3.L[i].qth_shg = ref.L[i].qth_shg; r3.L[i].qth_shu = m3.L[i].qth_shu = ref.L[i].qth_shu;
+            r3.L[i].qth_shd = m3.L[i].qth_shd = ref.L[i].qth_shd;
+        }
+        r3.freq = calloc((size_t)NL * E, sizeof(uint64_t)); m3.freq = calloc((size_t)NL * E, sizeof(uint64_t));
+        r3.resident_collecting = m3.resident_collecting = 1;
+        if (hyb) setenv("COLI_CUDA_CHAIN_PROMOTE", "0", 1);   /* the chain promotes nothing */
+        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        ck(c3 != NULL && c3->ok && c3->dm_on, "routed experts in the frame enabled");
+        if (hyb) {   /* expert 3 of layer 1 on the host, and kept there: with the residents made hot,
+                      * the tier's swap (a quarter hotter than the coldest, tier_should_promote)
+                      * never takes it back */
+            res_set(qs(1, 3), 0);
+            for (int i = 0; i < NL; i++) for (int e = 0; e < E; e++) if (qs(i, e)->resident) qs(i, e)->heat = 1u << 20;
+            serve_ch = c3; serve_m = &m3; fake_wait_hook = serve_layer1;
+        }
+        /* a step's downloads: the attention layer's K and V, the hybrid layer's ids, weights and
+         * rows, then the ids of every layer in one copy */
+        const int want = 2 + 3 * hyb + 1;
+        g_cuda_chain = 1;
+        float *lr3 = step_ex(&r3, ids, 3, 0, 1); r3.kv_len = 3;
+        int down0 = fake_chain_down_copies;
+        serve_n = 3; float *lc3 = step_ex(&m3, ids, 3, 0, 1); m3.kv_len = 3;
+        same_logits(lc3, lr3, V, "three prompt rows with routed experts in the frame");
+        ck(fake_chain_down_copies - down0 == want, hyb ? "prompt chunk: the hybrid layer's three copies, then one ids copy" :
+                                                         "prompt chunk: one route-ids download, no route-weights download");
+        int books = !memcmp(m3.seen, r3.seen, (size_t)NL * E) && !memcmp(m3.freq, r3.freq, (size_t)NL * E * sizeof(uint64_t));
+        free(lr3); free(lc3);
+        /* five decode rows, the books checked after each: ids read at the old offsets
+         * (i * rows * K, rows the chunk's capacity) would be another step's */
+        int one = 1;
+        for (int t = 3; t < 8; t++) {
+            lr3 = step_ex(&r3, ids + t, 1, t, 1); r3.kv_len = t + 1;
+            down0 = fake_chain_down_copies;
+            serve_n = 1; lc3 = step_ex(&m3, ids + t, 1, t, 1); m3.kv_len = t + 1;
+            same_logits(lc3, lr3, V, "decode row with routed experts in the frame");
+            one &= fake_chain_down_copies - down0 == want;
+            books &= !memcmp(m3.seen, r3.seen, (size_t)NL * E) && !memcmp(m3.freq, r3.freq, (size_t)NL * E * sizeof(uint64_t));
+            free(lr3); free(lc3);
+        }
+        ck(one && c3->dm_steps == 6 * NL && (hyb ? c3->dm_hyb > 0 : c3->dm_hyb == 0),
+           hyb ? "decode steps: the hybrid layer's three copies, then one ids copy" :
+                 "decode steps: one route-ids download across all layers");
+        ck(books, "route books (seen and freq) equal the CPU path's after the prompt and every step");
+        if (hyb) { fake_wait_hook = NULL; res_set(qs(1, 3), 1); unsetenv("COLI_CUDA_CHAIN_PROMOTE"); }
+        g_cuda_chain = 0;
+    }
+    fake_chain_table.size = CC_OPS_BASE_SIZE;
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
