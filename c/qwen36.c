@@ -5949,18 +5949,25 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
  * one DeltaNet input projection (the most numerous placed matrix) is timed
  * both ways on the device that would host it, ten GEMVs each, best of three
  * rounds after a warm-up, and the trunk goes to VRAM only if the GPU wins.
+ * The CPU's ten GEMVs read ten layers' projections, not one ten times: one
+ * 16 MiB projection (the 35B's) stays in a big L3 after the first GEMV, while
+ * decode reads each projection once a step, from RAM. Beside an RTX PRO 6000
+ * an EPYC 9B45 (three 32 MiB L3s) timed the one matrix at 0.050-0.051 ms
+ * against the card's 0.045-0.046; under nsys the two tied and the trunk and
+ * the experts went to the CPU: decode 21.5 tok/s, 113 on the card.
  * Only the automatic placement is questioned: a hand-written COLI_PLACE
  * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
- * probe's copy stays resident (one projection, ~25 MB on the 35B). */
+ * probe's copy stays resident (one projection, 16 MiB on the 35B). */
 static int trunk_probe_gpu_wins(Model *m){
     const char *e = getenv("COLI_TRUNK_PROBE");
     if (e && *e == '0') return 1;
     if (!qt_place_is_auto()) return 1;
     Cfg *c = &m->c;
-    QW *w = NULL; int dev = QT_PLACE_CPU;
-    for (int i = 0; i < c->n_layers && !w; i++) {
-        if (c->is_attn[i]) continue;
-        if (m->L[i].dn_qkv.q) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
+    QW *w = NULL, *cw[10]; int dev = QT_PLACE_CPU, nc = 0;
+    for (int i = 0; i < c->n_layers && nc < 10; i++) {
+        if (c->is_attn[i] || !m->L[i].dn_qkv.q) continue;
+        if (!w) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
+        if (m->L[i].dn_qkv.I == w->I && m->L[i].dn_qkv.O == w->O) cw[nc++] = &m->L[i].dn_qkv;
     }
     if (!w) return 1;                                /* dense-i8 off: nothing will be placed */
     if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
@@ -5977,9 +5984,10 @@ static int trunk_probe_gpu_wins(Model *m){
         double t0 = now_s();
         for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
         double tg = (now_s() - t0) / 10;
-        for (int k = 0; k < 3; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        /* with ten, the warm-up takes the last three, so the timed ten do not start in the cache it filled */
+        for (int k = 0; k < 3; k++) matmul_q(y, x, cw[(7 + k) % nc]->q, cw[(7 + k) % nc]->sc, I, O);
         t0 = now_s();
-        for (int k = 0; k < 10; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        for (int k = 0; k < 10; k++) matmul_q(y, x, cw[k % nc]->q, cw[k % nc]->sc, I, O);
         double tc = (now_s() - t0) / 10;
         if (tg < gpu) gpu = tg;
         if (tc < cpu) cpu = tc;
