@@ -672,11 +672,21 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
   large one, its layers holding an expert that left on the host's step as before. An expert
   whose page-lock is refused stays out until the next follow.
-- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
-  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
-  of the next such layer starts once the layer before has run its experts' GEMMs, so it
-  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
-  is the longer of the two and a second one would buy little.
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): VRAM for the most
+  non-resident experts any layer has, filled on a copy stream of its own. The copy of the
+  next such layer starts once the layer before has run its experts' GEMMs, so it overlaps
+  that layer's sum and the next layer's attention. With whole layers off the card (the
+  warm start in index order, before the spread residents) a staged layer has 256 experts
+  to copy, the copy is the longer of the two and one place is all there is. With the
+  residents spread over the layers (91 experts a layer on a Colab T4, the copy and the
+  layer's kernels ~15 ms each) the buffer has two places, the staged layers taking them
+  in turn (`cc_fetch_at`, `cc_fetch_wait_at`, `cc_fetch_done_at`, a pair of events each):
+  a layer's copy runs beside the layer before's experts. Two places only where both fit
+  in the `n_experts` experts `q36cc_rows_max` sets aside for the staging
+  (`2 * hmax <= n_experts`), so the residents and the chunk size are what they were; the
+  memory left for the KV mirrors is one place smaller than with one place (161 MB on the
+  T4). The line `stages the host pool's experts in` says how many places and how many
+  experts each.
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).
