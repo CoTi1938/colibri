@@ -25,7 +25,10 @@
  *     the CPU path's logits and route books, with one copy of the route ids a frame;
  *   - the MTP head on the chain picks its drafts on the device (cc_pick): the CPU head's ids,
  *     and its probabilities to 1e-5; a listed vocabulary, Q36_MTP_DUMP or a backend without the
- *     op keep bringing the scores down.
+ *     op keep bringing the scores down. With the adaptive list (Q36_MTP_VOCAB) it scores the
+ *     listed rows of the device's lm_head (cc_matmul_rows), and the device's copy of the list
+ *     follows every append and every rebuild, across requests too; a backend without
+ *     matmul_rows scores the whole vocabulary.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -37,6 +40,12 @@
 
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
+/* the MTP head's device copy of its adaptive list (the fake's CC_DEV buffers live on the host) is the list */
+static int vids_same(void) {
+    const DraftVocab *v = g_q36_mtp.voc;
+    return v && g_q36_mc.vids && g_q36_mc.vids_n == v->list_n &&
+           !memcmp(g_q36_mc.vids->d, v->list, (size_t)v->list_n * sizeof(int));
+}
 
 enum { D = 64, H = 4, KV = 2, HD = 16, QDIM = 2 * HD, ROT = 8, VH = 4, VK = 2, KD = 16, VD = 16, CONVK = 4 };
 enum { CD = 2 * VK * KD + VH * VD, VDIM = VH * VD, PD = CD + VDIM, E = 4, TOPK = 2, INTER = 32, SI = 32, V = 64, NL = 2, CAP = 48 };
@@ -339,11 +348,14 @@ int main(void) {
     fake_chain_table.size = CC_OPS_BASE_SIZE;
 
     printf(" H. the MTP head on the CUDA chain: its drafts picked on the device\n");
-    /* the whole vocabulary: picked on the device; a listed vocabulary, or a backend without the
-     * op: the scores come down and the host picks, as before. Each against the CPU head. */
-    for (int hc = 0; hc < 3; hc++) {
-        static const char *what[3] = {"the whole vocabulary", "a listed vocabulary", "a backend without the op"};
-        fake_chain_table.size = hc == 2 ? offsetof(ColiCudaChainOps, pick) : sizeof(ColiCudaChainOps);
+    /* the whole vocabulary or the adaptive list: picked on the device; a listed vocabulary, or a
+     * backend without the op: the scores come down and the host picks, as before; the adaptive
+     * list on a backend without matmul_rows: the whole vocabulary. Each against the CPU head. */
+    for (int hc = 0; hc < 5; hc++) {
+        static const char *what[5] = {"the whole vocabulary", "a listed vocabulary", "a backend without the op",
+                                      "an adaptive list", "an adaptive list, a backend without matmul_rows"};
+        fake_chain_table.size = hc == 2 ? offsetof(ColiCudaChainOps, pick) :
+                                hc == 4 ? offsetof(ColiCudaChainOps, matmul_rows) : sizeof(ColiCudaChainOps);
         uint32_t ms = 99;
         Q36Mtp *p = &g_q36_mtp;
         memset(p, 0, sizeof *p);
@@ -364,6 +376,12 @@ int main(void) {
         p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
         for (int e = 0; e < E; e++) { mk_qw(&p->eg[e], D, INTER, &ms); mk_qw(&p->eu[e], D, INTER, &ms); mk_qw(&p->ed[e], INTER, D, &ms); }
         p->pend = falloc(D);
+        if (hc == 3) {   /* the CPU head's list too: ids 40..63, so no draft's place in it is its id */
+            p->voc = draft_vocab_new(V, 16);
+            for (int t = 40; t < V; t++) draft_vocab_count(p->voc, t);
+            const int hi[3] = {40, 51, 63};
+            q36_mtp_vocab_begin(hi, 3);
+        }
         Model r3, m3; build_model(&r3, &w); build_model(&m3, &w);
         for (int i = 0; i < NL; i++) {
             r3.L[i].qth_dnout = m3.L[i].qth_dnout = ref.L[i].qth_dnout;
@@ -387,13 +405,15 @@ int main(void) {
         g_cuda_chain = 1;
         memset(&g_q36_mc, 0, sizeof g_q36_mc);
         p->on = 1;
+        if (hc == 4) { p->voc = draft_vocab_new(V, 16); q36_mtp_vocab_begin(ids, 3); }   /* dropped at init */
         q36_mtp_feed_rows(&m3, ids, 3, 0, hid_in);
         int d1_gpu = q36_mtp_draft(&m3, ids[3], 3, h_gpu);
         float p1_gpu = p->last_p;
         int d2_gpu = q36_mtp_draft_more(&m3, h_gpu, d1_gpu, 4);
         float p2_gpu = p->last_p;
 
-        int dev = hc == 0;
+        int dev = hc == 0 || hc >= 3;
+        if (hc == 4) ck(!p->voc, "an adaptive list, a backend without matmul_rows: the list is dropped");
         char msg[160];
         snprintf(msg, sizeof msg, "%s: %s", what[hc], dev ? "the logits stay in device memory, an 8-byte pick comes down" :
                                                             "the logits come down to the host, as before");
@@ -402,13 +422,27 @@ int main(void) {
         snprintf(msg, sizeof msg, "%s: draft 1 and draft 2 equal the CPU head's, their probabilities to 1e-5", what[hc]);
         ck(d1_gpu == d1_cpu && d2_gpu == d2_cpu && fabsf(p1_gpu - p1_cpu) <= 1e-5f * p1_cpu && fabsf(p2_gpu - p2_cpu) <= 1e-5f * p2_cpu,
            msg);
-        if (dev) {
+        if (hc == 3) ck(d1_gpu >= 40 && d2_gpu >= 40, "an adaptive list: the drafts are the list's ids, not their places in it");
+        if (hc == 0) {
             setenv("Q36_MTP_DUMP", "/tmp/unused", 1);
             memset(&g_q36_mc, 0, sizeof g_q36_mc);
             ck(q36_mc_init(&m3) && !g_q36_mc.pick_dev && g_q36_mc.outd->kind == CC_DOWN,
                "Q36_MTP_DUMP set when the head is set up: the logits buffer on the host, as before");
             unsetenv("Q36_MTP_DUMP");
         }
+        if (hc == 3) {   /* the device's copy of the list (read straight from the fake's buffer) */
+            q36_mtp_vocab_step(7);   /* an id outside the list: appended at its tail */
+            int d3 = q36_mtp_draft_more(&m3, h_gpu, d2_gpu, 5);
+            ck(p->voc->list[p->voc->list_n - 1] == 7 && vids_same(), "an adaptive list: an appended id reaches the device");
+            while (!p->voc->run.rebuilds) q36_mtp_vocab_step(5);   /* the counts halve: a rebuilt list */
+            int d4 = q36_mtp_draft_more(&m3, h_gpu, d3, 6);
+            ck(vids_same(), "an adaptive list: a rebuilt list reaches the device");
+            const int next[3] = {60, 33, 48};
+            q36_mtp_vocab_begin(next, 3);   /* the next request: after one rebuild the list changes again */
+            q36_mtp_draft_more(&m3, h_gpu, d4, 7);
+            ck(vids_same(), "an adaptive list: the next request's list reaches the device");
+        }
+        if (p->voc) { draft_vocab_free(p->voc); p->voc = NULL; }
         free(hid_in);
         g_cuda_chain = 0;
     }

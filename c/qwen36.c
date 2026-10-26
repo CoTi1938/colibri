@@ -83,6 +83,7 @@ static int qwen36_max_ctx(void) {
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
+#include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
@@ -6123,6 +6124,33 @@ static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
 #endif
     if (!qt_lmhead_matmul(logits, row, c->hidden, c->vocab)) matmul_d(logits, row, &m->lm_head, 1, c->hidden, c->vocab);
 }
+/* The scores of the lm_head rows ids[0..n) on one normed row, on the host: the MTP head's draft
+ * list (Q36_MTP_VOCAB). Without host rows, the whole vocabulary and then the listed ids. */
+static void q36_mtp_lm_rows(Model *m, const float *row, const int *ids, int n, float *scores) {
+    Cfg *c = &m->c; const QW *w = &m->lm_head; int D = c->hidden;
+    if (w->q && w->sc && dense_idot_on()) {
+        int8_t *xq = malloc((size_t)D);
+        if (!xq) { fprintf(stderr, "OOM MTP activation\n"); exit(1); }
+        float sx = dense_act_i8(row, D, xq, NULL);
+#ifdef IDOT_R16
+        if (w->q8r16) matmul_q_idot_rows_r16(scores, xq, sx, w->q, w->sc, ids, n, D);
+        else
+#endif
+        matmul_q_idot_rows(scores, xq, sx, w->q, w->sc, ids, n, D);
+        free(xq);
+    } else if (w->q && w->sc) {
+        for (int j = 0; j < n; j++)
+            matmul_q(scores + j, row, w->q + (int64_t)ids[j] * D, w->sc + ids[j], D, 1);
+    } else if (w->w) {
+        for (int j = 0; j < n; j++)
+            scores[j] = dot_f32_lanes(row, w->w + (int64_t)ids[j] * D, D);
+    } else {
+        float *full = falloc(c->vocab);
+        q36_mtp_lm_head(m, row, full);
+        for (int j = 0; j < n; j++) scores[j] = full[ids[j]];
+        free(full);
+    }
+}
 
 static void q36_embed_row(Model *m, int id, int pos, float *row) {
     int D = m->c.hidden;
@@ -6947,6 +6975,7 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
         if (sp->hist) { memcpy(sp->hist, prompt, (size_t)np * sizeof(int)); sp->hist_n = np; }
         else { sp->lookup = 0; sp->hist_cap = 0; }
     }
+    if (sp->mtp) q36_mtp_vocab_begin(prompt, np);
 }
 
 static void q36_spec_free(Q36Spec *sp) { free(sp->hist); sp->hist = NULL; sp->hist_n = sp->hist_cap = 0; }
@@ -7038,6 +7067,7 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
     Cfg *c = &m->c; int V = c->vocab;
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
+    if (sp->mtp) q36_mtp_vocab_step(tok);
     if (sp->ahead_n) {
         int i = sp->ahead_i;
         if (tok == sp->ids[i] && pos == sp->ahead_pos + i &&
@@ -7666,6 +7696,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
+    g_q36_mtp.voc_reuse = reuse;
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -8275,7 +8306,7 @@ static void serve_loop(Model *m){
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q); while(r==0||r==4||r==5);
-        if(r<0) return;
+        if(r<0){ q36_mtp_vocab_save(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
          * the only one the dashboard ever saw -- all grey, RAM 0, everything
@@ -9295,6 +9326,7 @@ int main(int argc, char **argv) {
     q36c_report(&m);
     vk_tier_turn(&m, "run");
 #endif
+    q36_mtp_vocab_save();
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
      * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI

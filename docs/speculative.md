@@ -142,6 +142,10 @@ head scores the whole vocabulary with `Q38_MTP_VOCAB=0`, with `Q38_MTP_DUMP`, wi
 while the dense chain is on, where the device scores it. Each run and served turn prints the
 average size of the list, the share of picks inside it, and the ids appended and rebuilds.
 
+Qwen3.6's head uses the same list with `Q36_MTP_VOCAB`, on by default where it drafts on the CUDA
+chain ([qwen36.md](qwen36.md#the-mtp-head-q36_mtp)); its engine writes the counts at exit, not on
+SIGTERM.
+
 ## The MTP head's drafts (qwen36)
 
 `Q36_MTP=1` reads the release's `mtp.*` block from the converted container
@@ -151,7 +155,8 @@ The head has its own causal KV cache; every completed pair contributes its K/V,
 and only a draft row runs the full attention/MoE/output computation.
 
 `Q36_MTP_DRAFTS=1..7` bounds the depth, `auto` lets the measured gate choose,
-`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB_IDS` limits
+`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB` (the most
+used tokens, on by default on the CUDA chain) or `Q36_MTP_VOCAB_IDS` limits
 only the draft's output scoring. When lookup also proposes tokens the gate
 chooses a source by its measured value. Both sources share verification and
 rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected

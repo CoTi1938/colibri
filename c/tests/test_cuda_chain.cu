@@ -957,10 +957,41 @@ int main(void) {
         ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
         T->free(lb); T->free(pb); T->free(small);
     }
+    printf("matmul_rows\n");
+    {
+        for (int c = 0; c < 3; c++) {
+            int fmt = c == 0 ? 0 : 1, I = c == 2 ? 518 : 512, O = 1024, n = 137;
+            std::vector<float> dq, x = rnd((size_t)I, 120 + c), want((size_t)n, 0.f);
+            ColiCudaTensor *t = NULL;
+            if (fmt == 0) {
+                dq = rnd((size_t)O * I, 130 + c);
+                std::vector<float> ones((size_t)O, 1.f);
+                coli_cuda_tensor_upload(&t, dq.data(), ones.data(), 0, I, O, 0);
+            } else {
+                t = moe_mat(1, 0, I, O, 140 + c, dq);
+            }
+            std::vector<int> ids((size_t)n);
+            for (int j = 0; j < n; j++) {
+                ids[j] = (j * 7 + 19) % O;
+                double s = 0;
+                for (int i = 0; i < I; i++) s += (double)x[i] * dq[(size_t)ids[j] * I + i];
+                want[j] = (float)s;
+            }
+            CcBuf *ib = T->buf((size_t)n * 4, CC_DEV), *xb = up(x), *yb = T->buf((size_t)n * 4, CC_DEV);
+            int ok = T->matmul_rows && t && ib && xb && yb && T->begin() && T->write(ib, 0, ids.data(), (size_t)n * 4) &&
+                     T->matmul_rows(t, ib, xb, yb, n) && T->submit(1);
+            std::vector<float> got = down(yb, (size_t)n);
+            ck(ok && maxdiff(got.data(), want.data(), (size_t)n) < 2e-4,
+               c == 0 ? "matmul_rows fmt 0 (f32)" : c == 1 ? "matmul_rows fmt 1 (i8, I % 16 == 0)" : "matmul_rows fmt 1 (i8, I % 16 != 0)");
+            if (c == 0) ck(!T->matmul_rows(t, ib, xb, yb, n + 1), "matmul_rows past its buffer refused");
+            if (t) coli_cuda_tensor_free(t);
+            T->free(ib); T->free(xb); T->free(yb);
+        }
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 18, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 21, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
