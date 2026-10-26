@@ -894,6 +894,41 @@ __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict
  * the stream held until the host's word reaches v */
 __global__ static void cc_signal_k(volatile unsigned *f, unsigned v) { __threadfence_system(); *f = v; __threadfence_system(); }
 __global__ static void cc_wait_k(volatile unsigned *f, unsigned v) { while (*f < v) { } __threadfence_system(); }
+/* one block of 256, two passes: the argmax of n logits (lowest index on a tie) into word 0
+ * of out and its softmax probability (terms within 20 of the maximum) into word 1 */
+__global__ static void __launch_bounds__(256) cc_pick_k(const float *__restrict__ lg, void *__restrict__ out, int n) {
+    __shared__ float rv[8];
+    __shared__ int ri[8];
+    int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
+    int be = tid < n ? tid : 0x7fffffff;
+    float bv = tid < n ? lg[tid] : -INFINITY;
+    for (int i = tid + 256; i < n; i += 256) {
+        float v = lg[i];
+        if (v > bv) { bv = v; be = i; }
+    }
+    float m = cc_wmax(bv);
+    int me = cc_wmin(bv == m ? be : 0x7fffffff);
+    if (lane == 0) { rv[sg] = m; ri[sg] = me; }
+    __syncthreads();
+    float mx = rv[0]; int best = ri[0];
+    for (int g = 1; g < 8; g++)
+        if (rv[g] > mx || (rv[g] == mx && ri[g] < best)) { mx = rv[g]; best = ri[g]; }
+    float z = 0.f;
+    for (int i = tid; i < n; i += 256) {
+        float d = lg[i] - mx;
+        if (d > -20.f) z += expf(d);
+    }
+    z = cc_wsum(z);
+    __syncthreads();
+    if (lane == 0) rv[sg] = z;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.f;
+        for (int g = 0; g < 8; g++) tot += rv[g];
+        ((int *)out)[0] = best == 0x7fffffff ? 0 : best;
+        ((float *)out)[1] = tot > 0.f ? 1.f / tot : 0.f;
+    }
+}
 
 /* ---- contexts ------------------------------------------------------------------- */
 static int cc_init(int device) {
@@ -1590,6 +1625,12 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 
 static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
 static int cc_kv16(void) { return 1; }   /* ew's F16 */
+static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
+    CcCtx *c = live();
+    if (!c || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
+    cc_pick_k<<<1, 256, 0, c->stream>>>(fp(logits), out->d, n);
+    return launched(c, "pick");
+}
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1607,5 +1648,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_attn_w2,
     cc_kv16,
     cc_rope_f16,
+    cc_pick,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

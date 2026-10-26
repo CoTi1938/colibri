@@ -650,6 +650,18 @@ static int fcc_tensor_dev(const ColiCudaTensor *t, const void **w, const float *
     if (!t || !t->w || !t->sc) return 0;
     *w = t->w; *sc = t->sc; if (gs) *gs = t->gs; return 1;
 }
+static int fcc_pick(CcBuf *logits, CcBuf *out, int n) {
+    if (!fcc_ready() || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
+    fake_chain_ops++;
+    const float *lg = logits->d;
+    int best = 0;
+    for (int i = 1; i < n; i++) if (lg[i] > lg[best]) best = i;
+    float z = 0.f, mx = lg[best];
+    for (int i = 0; i < n; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+    ((int *)out->d)[0] = best;
+    out->d[1] = z > 0.f ? 1.f / z : 0.f;
+    return 1;
+}
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static ColiCudaChainOps fake_chain_table = {
     CC_OPS_BASE_SIZE /* no routed experts in the frame by default: the engines' host step */, fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
@@ -659,6 +671,7 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_qsa, fcc_ple,
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    fcc_pick,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

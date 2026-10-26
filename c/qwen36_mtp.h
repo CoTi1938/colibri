@@ -17,7 +17,7 @@ typedef struct {
     QW *eg, *eu, *ed;                /* [E] */
     QW dvoc; int nvoc;               /* the shared lm_head rows selected by vid */
     float last_p;                    /* the newest draft's probability under the head */
-    int pick_id, pick_ok;            /* q36_mg_row's compact pick (a listed vocabulary) */
+    int pick_id, pick_ok;            /* q36_mg_row / q36_mc_row compact pick */
     int *vid;                        /* Q36_MTP_VOCAB_IDS: row j of dvoc scores id vid[j] (NULL: id j) */
     void *Kc, *Vc; int stride;       /* the head's KV rows [KV][stride][hd], q36_kv_es() bytes an element */
     void **Kp, **Vp;                 /* the model's per-layer pointers and the head's after them */

@@ -179,7 +179,9 @@ uploaded once as the tier's int8 or int4-g64 and read from an expert table of th
 addresses). There a head that cannot go on the device stays off: beside the card the
 CPU's head cost 5.1 ms a draft row and decode fell from 98 to 85-88 tok/s. Under a
 CUDA tier holding part of the experts there are no speculative steps, and `Q36_MTP=1`
-leaves the head off and says so.
+leaves the head off and says so. On the CUDA chain the head also picks its draft and the
+draft's probability on the device (`cc_pick`): 8 bytes come down a draft, not the
+vocabulary's logits. `Q36_MTP_VOCAB_IDS` and `Q36_MTP_DUMP` keep the scores coming down.
 
 Measured on an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64, `coli serve`, answers of 128
 tokens, two alternated rounds of three):
