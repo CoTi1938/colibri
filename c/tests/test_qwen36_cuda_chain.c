@@ -20,7 +20,9 @@
  *     equal the CPU path's;
  *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path;
  *   - speculative steps (prompt lookup, the MTP head) run under the tier only when it holds
- *     every routed expert and the chain runs them (q36_cuda_tier_drafts).
+ *     every routed expert and the chain runs them (q36_cuda_tier_drafts);
+ *   - the promotions' brake holds only where the warm start's set came from a history (this
+ *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -150,6 +152,7 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
 int main(void) {
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
+    unsetenv("HEAT_FILE");                      /* G: the tier starts without a history */
     setenv("COLI_LMHEAD_GPU", "0", 1);
     setenv("COLI_DENSE_IDOT", "0", 1);          /* f32 activations on the CPU too: the chain's arithmetic */
     setenv("COLI_CUDA_CHAIN", "1", 1);
@@ -272,7 +275,33 @@ int main(void) {
     g_cuda_chain = 0;
     ck(!q36_cuda_tier_drafts(&m), "the chain off: none");
 
+    printf(" G. the promotions' brake only where the warm start came from a history\n");
+    unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    ck(!qt_chain_history() && q36cc_promote_hits() == 0, "no heat file: no history, no brake");
+    setenv("COLI_CUDA_CHAIN_PROMOTE_HITS", "60", 1);
+    ck(q36cc_promote_hits() == 60, "the variable, when set, wins: 60 without a history");
+    unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
     qt_shutdown();
+    static const char heat[] = "test_qwen36_cuda_chain_heat.bin";
+    for (int own = 0; own < 2; own++) {   /* another model's heat file (an expert more a layer), then this one's */
+        uint32_t hdr[3] = {0x51544831u, NL, own ? E : E + 1}, h = 7;
+        FILE *f = fopen(heat, "wb");
+        fwrite(hdr, 4, 3, f);
+        for (uint32_t i = 0; i < hdr[1] * hdr[2]; i++) fwrite(&h, 4, 1, f);
+        fclose(f);
+        setenv("HEAT_FILE", heat, 1);
+        ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up again, a heat file given");
+        ck(qt_chain_history() == own && q36cc_promote_hits() == (own ? Q36CC_PROMO_HITS : 0),
+           own ? "this model's heat file: a history, the brake at 75" : "another model's heat file is not read: no brake");
+        if (own) {
+            setenv("COLI_CUDA_CHAIN_PROMOTE_HITS", "0", 1);
+            ck(q36cc_promote_hits() == 0, "the variable wins: 0 with a history");
+            unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+        }
+        unsetenv("HEAT_FILE");   /* qt_shutdown would write the heat back */
+        qt_shutdown();
+    }
+    remove(heat);
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds\n");
     return 0;

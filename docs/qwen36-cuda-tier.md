@@ -558,6 +558,17 @@ conversation the history fits pays for every swap -- a promoted expert displaces
 the history still routes to -- and gains little; one away from it, at 40-65 % hits, does not
 reach the brake for hundreds of tokens. `0` brakes never.
 
+The brake holds only where the warm start's set came from a history: a heat file with this
+model's shape, its layers and experts (`qt_chain_history`). Without one the set is the experts
+in index order, no conversation's, and the brake starts off (the chain's startup line says so).
+On a Google Colab T4 (6605 of 10240 experts in VRAM, OMP 4 threads, no heat file) the 41-token
+story at 75 held at 78-79 % hits, 24.4 / 23.9 ms a token over 200 / 600 tokens; without the
+brake it reached 86 / 94 %, 22.6 / 19.7 ms. Through the server's path on another such T4 a chat
+of 5 turns (1458 answer tokens, no heat file) took 29.4 s instead of 36.7. On a rented RTX 3070
+(EPYC 7B13, 2654 experts in VRAM, OMP 12 threads) the same runs differ by 0.6 and 2.0 % (17.5 /
+14.8 ms at 75 against 17.6 / 14.5), and the chat's session by less than 1 %.
+`COLI_CUDA_CHAIN_PROMOTE_HITS`, when set, wins either way.
+
 **Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4 per row, `COLI_PLACE=auto
 COLI_TRUNK_PROBE=0 CUDA_EXPERT_GB=auto`, OMP 12 threads, the heat file frozen; decode ms a
 token = (N / speed - TTFT) / (N - 1)):

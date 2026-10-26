@@ -238,7 +238,9 @@ void qt_stats(void);
  *   qt_chain_format    the residents' format as the backend holds them (1 int8, 2 int4,
  *                      4 int4 per gs inputs, 8 fp8-e4m3, 100 a GGUF's types by layer) and gs
  *   qt_chain_layer_format  layer's gate/up and down formats (100 + ggml type for a GGUF)
- *   qt_chain_devices   the tier's device count */
+ *   qt_chain_devices   the tier's device count
+ *   qt_chain_history   1 when the warm start's set came from a history (HEAT_FILE, or an
+ *                      engine's qt_heat_order); 0: the experts in index order */
 unsigned qt_chain_epoch(void);
 int  qt_chain_resident(int layer, int eid, int device, struct ColiCudaTensor **g, struct ColiCudaTensor **u, struct ColiCudaTensor **d);
 void qt_chain_hold(int on);
@@ -256,6 +258,7 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne);
 int  qt_note_wanted(int layer, int eid);
 void qt_note_heat(int layer, int eid);
 int  qt_chain_devices(void);
+int  qt_chain_history(void);
 /* The chain's promotions (qwen36_tier.c's comment): after a decode-sized step, up to max of its
  * misses into the buffers of the coldest residents by this conversation's routes -- the pairs,
  * the newcomer's RAM bytes and the victim's tensors, for the chain to copy; qt_chain_promote_done
@@ -330,6 +333,7 @@ static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(
 static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
 static inline int  qt_chain_devices(void){return 0;}
+static inline int  qt_chain_history(void){return 0;}
 typedef struct { int ci, vi; const uint8_t *g, *u, *d; const float *gs, *us, *ds; struct ColiCudaTensor *tg, *tu, *td; size_t mb, sb_gu, sb_d; } QtPromo;
 static inline int  qt_chain_promote(int a,QtPromo*b){(void)a;(void)b;return 0;}
 static inline void qt_chain_promote_stage(void*a,const QtPromo*b){(void)a;(void)b;}

@@ -1164,13 +1164,18 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * COLI_CUDA_CHAIN_PROMOTE_HITS percent (75) of their routes on the card, the step promotes
  * nothing -- a conversation the history fits (80-82 % on an RTX 3070) pays for every swap (a
  * promoted expert displaces a resident the history still routes to) and gains little; at 80 the
- * brake was marginal for it. 0 brakes never. */
+ * brake was marginal for it. It holds only where the warm start's set came from a history
+ * (HEAT_FILE). Without one the set is the experts in index order, no conversation's, and the
+ * brake starts off: on a T4 (64 % of the experts resident) it held a story at 78-79 % hits,
+ * where the promotions reach 86-94 % and a token costs 7-17 % less; on an RTX 3070 about 2 %
+ * either way. The variable, when set, wins; 0 brakes never. */
 #define Q36CC_PROMOTE 4
 #define Q36CC_PROMO_HITS 75
 #define QT_CHG_LIST 512   /* residency changes read at once (the tier's ring holds as many) */
 static int q36cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q36CC_PROMOTE; }
 static int q36cc_promote_hits(void) {
-    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS"); int h = e && *e ? atoi(e) : Q36CC_PROMO_HITS;
+    const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
+    int h = e && *e ? atoi(e) : qt_chain_history() ? Q36CC_PROMO_HITS : 0;
     return h < 0 ? 0 : h > 100 ? 100 : h;
 }
 /* entry (i, e) of the host's table from the tier: 1 resident on this device */
@@ -1310,11 +1315,13 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
         if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran || !ch->dm_nres) return 0;
         ch->promo_rate = q36cc_promote_rate(); ch->promo_hits = q36cc_promote_hits();
-        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready())
+        if (ch->promo_rate > 0 && qt_chain_devices() == 1 && ch->dm_fmt < 100 && cc_host_up_ready()) {
+            char brake[96];
+            if (ch->promo_hits > 0) snprintf(brake, sizeof brake, "none while the last %d steps hit %d %% or more", Q36CC_PROMO_WIN, ch->promo_hits);
+            else snprintf(brake, sizeof brake, "no brake%s", qt_chain_history() ? "" : " (no heat file: the warm start's set is no conversation's)");
             fprintf(stderr, "[chain] qwen36: up to %d experts a step promoted into the card by this conversation's routes, "
-                            "the coldest residents giving way, none while the last %d steps hit %d %% or more "
-                            "(COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, Q36CC_PROMO_WIN, ch->promo_hits);
-        else ch->promo_rate = 0;
+                            "the coldest residents giving way, %s (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", ch->promo_rate, brake);
+        } else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||

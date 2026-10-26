@@ -1379,6 +1379,7 @@ unsigned qt_chain_epoch(void){
     return e;
 }
 int qt_chain_devices(void){ return G.on ? G.ndev : 0; }
+int qt_chain_history(void){ return G.on && G.heat0; }
 int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTensor **u,ColiCudaTensor **d){
     if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     pthread_mutex_lock(&G.mx);
