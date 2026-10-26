@@ -7056,11 +7056,19 @@ static void q36_spec_hist_push(Q36Spec *sp, int tok, int pos) {
 }
 
 /* How many head drafts the next verify carries: Q36_MTP_DRAFTS, or the gate's pick up to
- * 7, within the room the caller leaves. */
+ * 7, within the room the caller leaves. A fixed depth of 2 or more that the drafts'
+ * probabilities trim takes a plain step every SPEC_REFRESH forwards: the trim prices
+ * rows with T(1) and rho, and nothing else measures T(1) there. */
 static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
     int maxm = room < Q36_SPEC_ROWS - 1 ? room : Q36_SPEC_ROWS - 1;
     if (maxm <= 0) return 0;
     if (sp->mtp_depth) {
+        if (sp->mtp_depth > 1 && sp->mtp_pstep && !sp->gate.off && !sp->mtp_force &&
+            sp->gate.since_plain >= SPEC_REFRESH) {
+            sp->gate.declined[SPEC_SRC_MTP]++;
+            if (value) *value = 1.0;
+            return 0;
+        }
         int km = sp->mtp_depth < maxm ? sp->mtp_depth : maxm;
         if (value) *value = spec_gate_value(&sp->gate, SPEC_SRC_MTP, km, NULL);
         return km;
@@ -7119,14 +7127,15 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
             static float pmin = -1.f;
             if (pmin < 0) { const char *pe = getenv("Q36_MTP_PMIN"); pmin = pe && *pe ? (float)atof(pe) : 0.f; }
             for (int j = 1; j < k; j++) {
-                if (g_q36_mtp.last_p < pmin) { k = j; break; }   /* the head is unsure: no deeper draft */
+                /* no deeper draft when the head is below Q36_MTP_PMIN, or when the drafts
+                 * so far leave no next draft that could pass */
+                if (g_q36_mtp.last_p < pmin ||
+                    (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force &&
+                     !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j, sp->ahead_p))) { k = j; break; }
                 double t1 = now_s();
                 d[j] = q36_mtp_draft_more(m, hd, d[j - 1], pos + j);
                 sp->ahead_p[j] = g_q36_mtp.last_p;
                 spec_gate_draft_cost(&sp->gate, SPEC_SRC_MTP, now_s() - t1);
-                /* this draft is not worth its row: a deeper one, no likelier, is not written */
-                if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && j + 1 < k &&
-                    !spec_gate_deeper_p(&sp->gate, SPEC_SRC_MTP, j + 1, sp->ahead_p)) { k = j + 1; break; }
             }
             /* the depth this step's drafts are worth, from their probabilities (DeepSeek's
              * confidence-scheduled verification): the drafts past it go unverified. The first
