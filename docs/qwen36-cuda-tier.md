@@ -143,7 +143,11 @@ a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
 one `[place] probe:` line reports both times, and if the GPU loses the whole
 automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. The experts follow
+bytes go back to the expert budget before the warmstart. On the CPU the ten
+GEMVs read the projections of ten layers, as decode reads each once a step:
+one 16 MiB projection read ten times stays in a big L3, and beside an RTX PRO
+6000 an EPYC 9B45 (three 32 MiB L3s) came within about 10% of the card that way
+and tied it under nsys. The experts follow
 (`[qtier] the experts stay on the CPU too`) when their allowance is automatic:
 the tier computes a resident expert with the same int8 GEMV and a round trip
 over PCIe, and a layer waits for its share. On a GTX 1650 Max-Q (#2211; 0.900
