@@ -45,6 +45,27 @@ class StopScopeTests(unittest.TestCase):
         self.assertTrue(coli._serve_cmdline_matches_port(raw, 8000))
         self.assertFalse(coli._serve_cmdline_matches_port(raw, 9000))
 
+    def test_web_is_a_server(self):
+        # `coli web` is `coli serve` plus a browser, and what `coli start` runs.
+        raw = self.cmdline("python3", "/opt/colibri/coli", "web", "--model", "/models/a",
+                           "--host", "127.0.0.1", "--port", "9000", "--no-browser")
+        self.assertTrue(coli._serve_cmdline_matches_port(raw, 9000))
+        self.assertFalse(coli._serve_cmdline_matches_port(raw, 8000))
+
+    def test_stop_without_pidfile_drains_a_web_launcher(self):
+        # Without the launcher in the table, its engine was killed as a stray and
+        # the launcher's watchdog started the engine again behind "stopped".
+        table = [(4242, self.cmdline("python3", "/opt/colibri/coli", "web",
+                                     "--port", "9123"), "python3")]
+        args = types.SimpleNamespace(port=9123, dry_run=True)
+        out = io.StringIO()
+        with mock.patch.object(coli, "banner"), \
+             mock.patch.object(coli, "serve_pidfile", return_value="/not/a/pidfile"), \
+             mock.patch.object(coli, "_stop_proc_table", return_value=table), \
+             contextlib.redirect_stdout(out):
+            coli.cmd_stop(args)
+        self.assertIn("would stop 4242: coli serve (cmdline, port 9123)", out.getvalue())
+
     def test_engine_tag_is_port_specific(self):
         raw = b"SNAP=/models/a\0SERVE=1\0COLI_SERVE_PORT=9000\0"
         self.assertTrue(coli._serve_environ_matches_port(raw, 9000))
