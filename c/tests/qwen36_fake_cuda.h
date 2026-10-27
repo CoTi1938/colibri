@@ -253,6 +253,7 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
 #include "../cuda_chain.h"
 struct CcBuf { int kind; size_t bytes; float *d; };
 static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
+static int fake_chain_host_stores;   /* matmuls whose output is host memory: stored over the bus on a real card */
 static size_t fake_chain_dev_bytes;
 static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
 static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
@@ -309,6 +310,7 @@ static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t y
     if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
     if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
     fake_chain_ops++;
+    if (y->kind != CC_DEV) fake_chain_host_stores++;
     for (int s = 0; s < S; s++) {
         const float *xs = x->d + xo + (size_t)s * t->I; float *ys = y->d + yo + (size_t)s * t->O;
         if (t->fmt == 1 && t->sc) {

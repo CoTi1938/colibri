@@ -82,7 +82,7 @@ typedef struct {
     int *kv_valid, *attn_ord, n_attn;
     int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else cap) */
     int dn_where, host_zero;
-    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
+    CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin, *out;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
     CcBuf *kg, *vg;   /* a long step's window over a ring: its rows before the step and the step's (q36cc_attention) */
@@ -447,7 +447,8 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->ds, r * D * F, CC_DEV) && cc_reserve(&ch->sgd, r * F, CC_DEV) && cc_reserve(&ch->fin, D * F, CC_DEV) &&
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
-             cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
+             cc_reserve(&ch->out, (size_t)c->vocab * F, CC_DEV) && cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) &&
+             cc_reserve(&ch->routed, r * RW * F, CC_UP) &&
              cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
              cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV);
     if (ok && c->muse)   /* Muse Spark's alone: the attention gate's rows, the experts' input rows */
@@ -1516,6 +1517,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (!mirror_ok || !q36cc_scratch(ch, m, rows) || (lf && !cc_reserve(&ch->lfd, (size_t)L * 3 * D * sizeof(float), CC_DOWN)) ||
         (want_x && !cc_reserve(&ch->xd, (size_t)rows * D * sizeof(float), CC_DOWN)) ||
         (nlogits > 1 && (!cc_reserve(&ch->fin, (size_t)nlogits * D * sizeof(float), CC_DEV) ||
+                         !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->outd, (size_t)nlogits * c->vocab * sizeof(float), CC_DOWN)))) {
         fprintf(stderr, "[chain] qwen36: device memory for %d rows refused; the per-matrix path\n", rows);
         ch->failed = 1;
@@ -1634,12 +1636,15 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
-        /* the final norm and lm_head on this chunk's share of the last nlogits rows */
+        /* the final norm and lm_head on this chunk's share of the last nlogits rows. The head writes its
+         * logits on the card and one copy takes them to outd: written into outd itself, one float per
+         * warp over the bus, the head took 7.4 ms of a 13.5 ms step on an RTX PRO 4000, 0.9 ms this way */
         int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = nlogits ? n - lo0 : 0;
         if (ok && lo_n > 0) {
             int dst = c0 + lo0 - (S - nlogits);
             ok = q36cc_norm(ch->x, (size_t)lo0 * D, ch->prm, ch->o_final, ch->fin, (size_t)dst * D, lo_n, D, c->eps) &&
-                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
+                 cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->out, (size_t)dst * c->vocab, lo_n) &&
+                 cc_copy(ch->outd, (size_t)dst * c->vocab, ch->out, (size_t)dst * c->vocab, (size_t)lo_n * c->vocab);
         }
         double t0 = tm_now();
         ok = ok && cc_submit(0);
