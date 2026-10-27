@@ -9184,8 +9184,8 @@ int main(int argc, char **argv) {
             else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
-         * when HEAT_FILE exists, natural order otherwise), loading all RAM
-         * slots along the way. */
+         * when HEAT_FILE exists, otherwise every layer's expert 0, then 1, ...),
+         * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }

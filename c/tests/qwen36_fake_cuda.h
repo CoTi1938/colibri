@@ -254,6 +254,7 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
 struct CcBuf { int kind; size_t bytes; float *d; };
 static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
 static size_t fake_chain_dev_bytes;
+static size_t fake_chain_dev_cap;   /* 0: no limit; else the most CC_DEV bytes the card holds: cc_buf fails past it */
 static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
 static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
 static int fcc_lost(void) { return !fake_chain_up || fake_chain_lost; }
@@ -262,6 +263,7 @@ static int fcc_device(int d) { int was = fake_chain_dev; fake_chain_dev = d; ret
 static int fcc_device_now(void) { return fake_chain_dev; }
 static CcBuf *fcc_buf(size_t bytes, int kind) {
     if (!bytes) bytes = 4;
+    if (kind == CC_DEV && fake_chain_dev_cap && fake_chain_dev_bytes + bytes > fake_chain_dev_cap) return NULL;
     CcBuf *b = (CcBuf *)calloc(1, sizeof *b);
     b->kind = kind; b->bytes = bytes; b->d = (float *)calloc(bytes, 1);
     if (kind == CC_DEV) fake_chain_dev_bytes += bytes;
@@ -270,7 +272,9 @@ static CcBuf *fcc_buf(size_t bytes, int kind) {
 static void fcc_free(CcBuf *b) { if (!b) return; if (b->kind == CC_DEV) fake_chain_dev_bytes -= b->bytes; free(b->d); free(b); }
 static int fcc_reserve(CcBuf **b, size_t bytes, int kind) {
     if (*b && (*b)->bytes >= bytes && (*b)->kind == kind) return 1;
-    CcBuf *n = fcc_buf(bytes, kind); fcc_free(*b); *b = n; return 1;
+    CcBuf *n = fcc_buf(bytes, kind);
+    if (!n) return 0;
+    fcc_free(*b); *b = n; return 1;
 }
 static void *fcc_ptr(const CcBuf *b) { return b ? b->d : NULL; }
 static size_t fcc_bytes(const CcBuf *b) { return b ? b->bytes : 0; }

@@ -23,7 +23,13 @@ more GPUs and computed there through the existing shared CUDA backend
   so a long-lived process can replace experts from an old workload instead of
   permanently freezing its initial hot set. A parallel **warmstart** fills the per-device
   budget before the first token — ordered by a persisted heat table
-  (`HEAT_FILE`) when present, so a second run starts fully placed.
+  (`HEAT_FILE`) when present, so a second run starts fully placed. Without one
+  it takes expert 0 of every layer, then expert 1, and so on, so each layer
+  holds its share: in index order the card held whole layers (on a Colab T4,
+  layers 0-24 and part of 25), and a prompt chunk copied the other layers'
+  experts over the bus one layer after another, after 25 layers with the bus
+  idle (a Colab T4's 512-token prompt, after a 64-token one and its decode,
+  reads 14 % faster: `docs/experiments/qwen36-tier-spread-2026-10-27`).
 - **Decode:** per (token, layer) the resident experts are issued as async
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
   fall back to the CPU and overlap with the in-flight groups, as does the

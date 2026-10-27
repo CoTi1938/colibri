@@ -1701,23 +1701,33 @@ void qt_note_block(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
-/* warmstart order -- heat descending (HEAT_FILE) or natural order.
- * Returns 0 once all budgets are full or the list is exhausted. */
+/* warmstart order -- heat descending (HEAT_FILE, or an engine's qt_heat_order), else expert
+ * by expert across the layers: expert 0 of every layer, then expert 1, ... Index order
+ * filled whole layers (a T4: layers 0-24 and part of 25 on the card, 26-39 none), and a
+ * prompt chunk then copied each of those layers' 256 experts over the bus while it waited,
+ * after 25 layers with the bus idle; spread, every layer copies its share beside the work of
+ * the layer before. Under G.mx; 0: no memory. */
 static const uint32_t *g_sort_heat;
 static int cmp_heat_desc(const void *a,const void *b){
     uint32_t ha=g_sort_heat[*(const int*)a], hb=g_sort_heat[*(const int*)b];
     return ha<hb ? 1 : ha>hb ? -1 : 0;
 }
+static int fill_order_make(void){
+    size_t n=(size_t)G.nl*G.ne;
+    G.fill_order=malloc(n*sizeof(int));
+    if(!G.fill_order) return 0;
+    /* no heat: the i-th pick is layer i%nl, expert i/nl; with heat: index order, sorted below */
+    for(size_t i=0;i<n;i++) G.fill_order[i]=G.heat0 ? (int)i : (int)((i%G.nl)*G.ne+i/G.nl);
+    if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
+    G.fill_cur=0;
+    return 1;
+}
+/* Returns 0 once all budgets are full or the list is exhausted. */
 int qt_fill_next(int *layer,int *eid){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
     pthread_mutex_lock(&G.mx);
-    if(!G.fill_order){
-        G.fill_order=malloc(n*sizeof(int));
-        for(size_t i=0;i<n;i++) G.fill_order[i]=(int)i;
-        if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
-        G.fill_cur=0;
-    }
+    if(!G.fill_order && !fill_order_make()){ pthread_mutex_unlock(&G.mx); return 0; }
     while((size_t)G.fill_cur<n){
         int gi=G.fill_order[G.fill_cur];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
@@ -1752,12 +1762,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
     size_t n=(size_t)G.nl*G.ne;
     int cnt=0;
     pthread_mutex_lock(&G.mx);
-    if(!G.fill_order){
-        G.fill_order=malloc(n*sizeof(int));
-        for(size_t i=0;i<n;i++) G.fill_order[i]=(int)i;
-        if(G.heat0){ g_sort_heat=G.heat0; qsort(G.fill_order,n,sizeof(int),cmp_heat_desc); }
-        G.fill_cur=0;
-    }
+    if(!G.fill_order && !fill_order_make()){ pthread_mutex_unlock(&G.mx); return 0; }
     while((size_t)G.fill_cur<n && cnt<max){
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
         if(full) break;

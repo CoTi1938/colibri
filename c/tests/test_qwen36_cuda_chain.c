@@ -29,6 +29,8 @@
  *     listed rows of the device's lm_head (cc_matmul_rows), and the device's copy of the list
  *     follows every append and every rebuild, across requests too; a backend without
  *     matmul_rows scores the whole vocabulary.
+ *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
+ *     has no room for both (q36cc_stage_reserve).
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -447,6 +449,18 @@ int main(void) {
         g_cuda_chain = 0;
     }
     fake_chain_table.size = CC_OPS_BASE_SIZE;
+
+    printf(" I. the staging buffer grows without room for a second copy beside it\n");
+    {   /* residents spread over the layers start the staging small and every promotion raises it; on a small card
+         * (room for 400 here) the bigger buffer takes the old one's place, it does not wait beside it */
+        CcBuf *st = NULL;
+        fake_chain_dev_cap = fake_chain_dev_bytes + 400;
+        ck(q36cc_stage_reserve(&st, 320) && cc_bytes(st) >= 320, "a staging buffer of 320");
+        ck(q36cc_stage_reserve(&st, 347) && cc_bytes(st) >= 347, "grown to 347 with room for 400: no second copy beside it");
+        ck(q36cc_stage_reserve(&st, 300) && cc_bytes(st) >= 347, "a smaller ask keeps the buffer");
+        ck(!q36cc_stage_reserve(&st, 500), "an ask over the card's room fails");
+        cc_free(st); fake_chain_dev_cap = 0;
+    }
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }

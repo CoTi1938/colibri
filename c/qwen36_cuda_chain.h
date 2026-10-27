@@ -1248,6 +1248,15 @@ static void q36cc_promote_settle(Q36CChain *ch) {
     for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
     ch->pr_npend = 0;
 }
+/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax (the most
+ * experts one layer has off the card) starts below the layer's 256 and every promotion can raise it; cc_reserve
+ * makes the new buffer before it frees the old one, so each growth wanted both at once. On an 8 GB card the
+ * second allocation failed in the middle of a conversation and the staging stayed off for the process (the
+ * RTX 3070 agent session in docs/experiments). A bigger buffer takes the old one's place: free it first. */
+static int q36cc_stage_reserve(CcBuf **stage, size_t bytes) {
+    if (*stage && cc_bytes(*stage) < bytes) { cc_free(*stage); *stage = NULL; }
+    return cc_reserve(stage, bytes, CC_DEV);
+}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
     size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
@@ -1272,7 +1281,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
         return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;

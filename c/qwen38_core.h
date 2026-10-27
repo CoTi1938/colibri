@@ -3864,7 +3864,7 @@ static void q38_tier_warm(Model *m,int hist) {
     }
     qt_fill_wait();
     fprintf(stderr,"[qtier] qwen38: warm start, %d of the GGUF's experts in VRAM, the history's most used first (%s) -- %.1f s\n",
-            n,hist?".coli_usage":"no history: in order",now_s()-t0);
+            n,hist?".coli_usage":"no history: expert by expert across the layers",now_s()-t0);
     free(pl);free(pe);
 }
 #ifdef COLI_CUDA
