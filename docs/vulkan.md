@@ -2393,11 +2393,20 @@ the CPU's kernels for them in `vk_tier.c` (int8 activations per 32 and integer d
 float reference of every one with `GQ_EXACT=1`). The low-bit formats (fmt 200 to 203)
 keep the device's reads. `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
 worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
-took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
-by a hash of layer and expert) stays with the device over PCIe, so a step with several
-such pairs splits them between the two sides; decode with the share at 0, 0.3, 0.5 and 0.7
-measured 45.3, 46.3, 46.1 and 46.0 tok/s, with the MTP head's 3-row verifies 43.8, 45.9,
-45.0 and 43.9.
+took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, by a
+hash of layer and expert) can stay with the device over PCIe; it is 0 by default, every
+one on the CPU. The CPU reads a GGUF's rows eight at a time (`ggml_quants.h`
+`gq_rows_f8`: the rows' bytes transposed in registers into the R16 forms' codes, or the
+grid types' rows with their signs on the activation, the R16 kernels' numerics) at its
+memory's speed, faster than the device reads them over PCIe, and a step's few pairs split by
+a hash leave the device the slower side on the steps that drew two. Warm 400-token
+answers, the share at 0.3 against 0: Flint UD-Q3_K_XL with 7.4 GB of the card 44.6
+against 49.4 tok/s (0.15 47.5, 0.45 40.8), with 12 GB 51.6 against 56.2; Qwen3.6-35B-A3B
+Q4_K_M 47.7 against 55.5 and 71.3 against 74.4; Qwen3.8 IQ2_XS on the whole card 49.1
+against 49.0. The worker sums the pairs in its own memory and copies the sum to the
+device's buffer once: that buffer is written by the host and read by the device, memory
+the CPU does not cache, and reading it back as the sum grew cost about 70 us a step of
+Flint's three pairs (decode 39.6 against 44.6 tok/s at 7.4 GB).
 
 Measured on the RTX PRO 4000 with an i5-13500 (Qwen3.8 IQ2_XS, the defaults, on and off
 started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the team on

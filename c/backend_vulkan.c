@@ -3895,8 +3895,10 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
     P->p.limit = bytes;
-    /* blocks no larger than the budget, so a small budget is not one refused block */
-    size_t bb = coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
+    /* blocks no larger than the budget, so a small budget is not one refused block; the host
+     * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
+     * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
+    size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
     P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
@@ -3906,6 +3908,14 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+int coli_vk_tier_pool_blocks(uint64_t *bytes, int max) {
+    VkWPool *P = &g_tpool;
+    pthread_mutex_lock(&P->mx);
+    const int nb = P->p.nb;
+    for (int k = 0; bytes && k < nb && k < max; k++) bytes[k] = P->p.b[k].present ? P->p.b[k].cap : 0;
+    pthread_mutex_unlock(&P->mx);
+    return nb;
+}
 int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
 /* The room the driver leaves in the system-RAM heap the host pool lives in (G.memtype_sys's):
  * its budget less its usage (VK_EXT_memory_budget), else the heap's size; 0 when unknown. The
@@ -4016,6 +4026,21 @@ struct ColiVkExpert {
 /* An expert's three tensors (gate, up, down). */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
+}
+int coli_vk_xb_expert_blocks(const ColiVkExpert *e, int *blk, int max) {
+    int n = 0;
+    const ColiVkTensor *t[3] = {e ? e->g : NULL, e ? e->u : NULL, e ? e->d : NULL};
+    for (int k = 0; k < 3; k++) {
+        if (!t[k] || t[k]->pool != &g_tpool) continue;
+        const VkaRange r[2] = {t[k]->wr, t[k]->sr};
+        for (int j = 0; j < 2; j++) {
+            if (!r[j].len) continue;
+            int seen = 0;
+            for (int q = 0; q < n; q++) seen |= blk[q] == r[j].block;
+            if (!seen && n < max) blk[n++] = r[j].block;
+        }
+    }
+    return n;
 }
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t region; } XbBuf;
 typedef struct XbCtx {
