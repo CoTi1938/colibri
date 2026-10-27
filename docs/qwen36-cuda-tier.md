@@ -687,6 +687,12 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   memory left for the KV mirrors is one place smaller than with one place (161 MB on the
   T4). The line `stages the host pool's experts in` says how many places and how many
   experts each.
+- A chunk of up to 256 rows (`Q36CC_ROUTED_ROWS`) routes to only a part of a layer's
+  experts: each staged layer copies just those, right after its router (the host reads the
+  routes down, then queues the copies). That copy no longer overlaps the layer before, so a
+  longer chunk, which routes to nearly every expert, keeps the whole copy. The chain says
+  the rule at its first staging; its report counts the layer steps that copied only their
+  routes.
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).
