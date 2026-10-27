@@ -166,6 +166,48 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
 static Q36CChain *serve_ch; static Model *serve_m; static int serve_n;
 static int serve_layer1(unsigned v) { return q36cc_dm_serve(serve_ch, serve_m, 1, serve_n, v); }
 
+/* the reference's resident copies, matrix by matrix (sections G and H write the same lines out) */
+static void share_trunk(Model *to, const Model *from) {
+    for (int i = 0; i < NL; i++) {
+        to->L[i].qth_dnout = from->L[i].qth_dnout; to->L[i].qth_q = from->L[i].qth_q; to->L[i].qth_k = from->L[i].qth_k;
+        to->L[i].qth_v = from->L[i].qth_v; to->L[i].qth_o = from->L[i].qth_o; to->L[i].qth_shg = from->L[i].qth_shg;
+        to->L[i].qth_shu = from->L[i].qth_shu; to->L[i].qth_shd = from->L[i].qth_shd;
+    }
+}
+
+/* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
+ * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
+ * in chunks, a decode token and a verify whose three logits rows lie in two chunks. */
+static void head_logits_on_the_card(Weights *w, const Model *shared, const int *ids) {
+    g_q36_mtp.on = 0; memset(&g_q36_mc, 0, sizeof g_q36_mc);   /* section H's MTP head is not part of these steps */
+    Model r, m; build_model(&r, w); build_model(&m, w);
+    share_trunk(&r, shared); share_trunk(&m, shared);
+    Q36CChain *ch = q36cc_setup(&m, 1);
+    ck(ch != NULL && ch->ok, "chain model ready for the head's logits");
+    g_cuda_chain = 1;
+    int stores0 = fake_chain_host_stores;
+    ch->rows_max = 3;
+    float *lr = step_ex(&r, ids, 7, 0, 1), *lc = step_ex(&m, ids, 7, 0, 1);
+    r.kv_len = m.kv_len = 7;
+    same_logits(lc, lr, V, "a prompt of seven tokens in chunks of three: its logits equal the CPU path's");
+    free(lr); free(lc);
+    lr = step_ex(&r, ids + 7, 1, 7, 1); lc = step_ex(&m, ids + 7, 1, 7, 1);
+    r.kv_len = m.kv_len = 8;
+    same_logits(lc, lr, V, "the decode token after it");
+    free(lr); free(lc);
+    ck(q36_spec_alloc(&r, 2) && q36_spec_alloc(&m, 2), "verify slots on the host");
+    r.snap_rows = m.snap_rows = 2; g_q36_rowwise = 1;
+    ch->rows_max = 2;   /* row 0 and 1 in the first chunk, row 2 in the second */
+    lr = step_ex(&r, ids + 8, 3, 8, 3); lc = step_ex(&m, ids + 8, 3, 8, 3);
+    r.snap_rows = m.snap_rows = 0; g_q36_rowwise = 0;
+    ck(same_logits(lc, lr, V, "row 0 of a verify split in two chunks") && same_logits(lc + V, lr + V, V, "row 1") &&
+       same_logits(lc + 2 * V, lr + 2 * V, V, "row 2"), "a verify's three rows, two chunks");
+    free(lr); free(lc);
+    ck(ch->forwards == 3 && !ch->failed && g_cuda_chain, "the chain took the three steps, none went to the CPU");
+    ck(fake_chain_host_stores == stores0, "no matmul of those steps stored into host memory: the head's logits come down in a copy");
+    g_cuda_chain = 0;
+}
+
 int main(void) {
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
@@ -315,15 +357,15 @@ int main(void) {
             serve_ch = c3; serve_m = &m3; fake_wait_hook = serve_layer1;
         }
         /* a step's downloads: the attention layer's K and V, the hybrid layer's ids, weights and
-         * rows, then the ids of every layer in one copy */
-        const int want = 2 + 3 * hyb + 1;
+         * rows, then the ids of every layer in one copy, and the head's logits */
+        const int want = 2 + 3 * hyb + 1 + 1;
         g_cuda_chain = 1;
         float *lr3 = step_ex(&r3, ids, 3, 0, 1); r3.kv_len = 3;
         int down0 = fake_chain_down_copies;
         serve_n = 3; float *lc3 = step_ex(&m3, ids, 3, 0, 1); m3.kv_len = 3;
         same_logits(lc3, lr3, V, "three prompt rows with routed experts in the frame");
-        ck(fake_chain_down_copies - down0 == want, hyb ? "prompt chunk: the hybrid layer's three copies, then one ids copy" :
-                                                         "prompt chunk: one route-ids download, no route-weights download");
+        ck(fake_chain_down_copies - down0 == want, hyb ? "prompt chunk: the hybrid layer's three copies, then one ids copy, the logits" :
+                                                         "prompt chunk: one route-ids download, no route-weights download, the logits");
         int books = !memcmp(m3.seen, r3.seen, (size_t)NL * E) && !memcmp(m3.freq, r3.freq, (size_t)NL * E * sizeof(uint64_t));
         free(lr3); free(lc3);
         /* five decode rows, the books checked after each: ids read at the old offsets
@@ -339,8 +381,8 @@ int main(void) {
             free(lr3); free(lc3);
         }
         ck(one && c3->dm_steps == 6 * NL && (hyb ? c3->dm_hyb > 0 : c3->dm_hyb == 0),
-           hyb ? "decode steps: the hybrid layer's three copies, then one ids copy" :
-                 "decode steps: one route-ids download across all layers");
+           hyb ? "decode steps: the hybrid layer's three copies, then one ids copy, the logits" :
+                 "decode steps: one route-ids download across all layers, the logits");
         ck(books, "route books (seen and freq) equal the CPU path's after the prompt and every step");
         if (hyb) { fake_wait_hook = NULL; res_set(qs(1, 3), 1); unsetenv("COLI_CUDA_CHAIN_PROMOTE"); }
         g_cuda_chain = 0;
@@ -447,6 +489,9 @@ int main(void) {
         g_cuda_chain = 0;
     }
     fake_chain_table.size = CC_OPS_BASE_SIZE;
+
+    printf(" I. the head's logits: computed on the card, then copied to the host\n");
+    head_logits_on_the_card(&w, &ref, ids);
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
