@@ -2418,6 +2418,19 @@ the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and u
 the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
 in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
 that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+**Whether the hybrid pays is measured, not assumed** (`vk_hyb_gate.h`). On an RTX 3070 at
+PCIe 4.0 x16 with Qwen3.6 int4 (2756 of 10240 experts on the card, about 1.4 host pool pairs
+a decode step) the hybrid steps took a token from 18.5 ms to 33 to 50: the CPU's pair cost
+300 to 500 us at one to twelve threads where the device read the same expert over the bus
+in about 130, and a step's three frames and timeline round trip came on top. So the chain
+times its decode forwards with the device's reads for three forwards, then with the hybrid
+steps for three (the first forward of each warms it), keeps the faster (the hybrid where it
+is not slower by a twentieth) and measures again after 1024 forwards; the run's line says
+what it measured and what it kept. `COLI_VK_HYBRID_GATE=0` keeps the steps on, as before.
+The same card had come up without timeline semaphores at all when the build's headers
+predated the cooperative matrix (the feature was asked for inside that extension's block),
+so the steps never ran there; every device is asked now.
+
 The run's line adds `hybrid: N steps,
 P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
 4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:

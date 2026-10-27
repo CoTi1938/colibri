@@ -1181,6 +1181,20 @@ int coli_vk_init(const char *spv_path) {
             free(ep);
         }
     }
+    /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps
+     * (vk_chain.c). Asked of every device, with or without the matrix units and whatever the
+     * headers of the build: an RTX 3070 built against headers before the cooperative matrix
+     * came up without the semaphores, and its hybrid steps (the host pool's experts on the
+     * CPU beside the device's) never ran. */
+    {
+        VkPhysicalDeviceProperties tp; vkGetPhysicalDeviceProperties(G.phys, &tp);
+        if (tp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            G.has_tsem = tq.timelineSemaphore != 0;
+        }
+    }
     /* Cooperative-matrix GEMM (optional, COLI_VK_COOP=0 turns it off): the KHR extension
      * with a 16x16x16 fp16 x fp16 -> fp32 subgroup shape, shaderFloat16, the Vulkan
      * memory model, and a subgroup size the pipeline can require. All of it or none. */
@@ -1257,13 +1271,7 @@ int coli_vk_init(const char *spv_path) {
     v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
     v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
     v12f.bufferDeviceAddress = G.has_bda ? VK_TRUE : VK_FALSE;
-    {   /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps */
-        VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
-        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
-        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (pp.apiVersion >= VK_API_VERSION_1_2) { vkGetPhysicalDeviceFeatures2(G.phys, &f2); G.has_tsem = tq.timelineSemaphore != 0; }
-    }
-    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;
+    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;   /* queried above, for every device */
 #endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = nqi, .pQueueCreateInfos = qis};
