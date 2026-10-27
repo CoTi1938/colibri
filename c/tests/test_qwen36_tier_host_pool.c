@@ -6,8 +6,9 @@
  * a prompt chunk's layer holding it went to the host's step whole (q36cc_stage_table). Here a
  * warm start as the engine's, three promotions (one copy failed), then the follow: the pool is
  * the non-residents again, nothing else; a page-lock refused, whole or for the scales only,
- * leaves nothing locked; every page-lock undone at the exit. Fake CUDA backend (its page-locks
- * counted), no GPU, no toolkit. */
+ * leaves nothing locked; every page-lock undone at the exit. Then a warm start that pools every
+ * expert, the residents too (qt_chain_host_all): the follow keeps them all, and a start after it
+ * follows again. Fake CUDA backend (its page-locks counted), no GPU, no toolkit. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,11 +47,49 @@ static void step(int layer, int a, int b) {   /* a row's routes, the misses offe
             qt_note(layer, e, pw[layer][e], pw[layer][e] + MB, pw[layer][e] + 2 * MB, sc[layer][e], sc[layer][e] + IH, sc[layer][e] + 2 * IH);
     }
 }
-/* a warm start as the engine's (tier_warmstart): every expert in RAM, eight on the card, the rest page-locked */
-static void warm(void) {
+/* a warm start as the engine's (tier_warmstart): every expert in RAM, eight on the card, the rest page-locked;
+ * all: the residents too (its pool_all) */
+static void warm(int all) {
+    if (all) qt_chain_host_all();
     for (int e = 0; e < NE; e++) for (int l = 0; l < NL; l++) note(l, e, 0);
     qt_fill_wait();
-    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) if (!resident(l, e)) note(l, e, 1);
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) if (all || !resident(l, e)) note(l, e, 1);
+}
+static int promote_layer0(QtPromo *pr) {   /* layer 0 routes 4 and 5 three times; the promotions, done */
+    for (int t = 0; t < 3; t++) step(0, 4, 5);
+    int np = qt_chain_promote(8, pr);
+    for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
+    return np;
+}
+
+/* Every expert pooled at the warm start: a promotion's victim is in the pool already and the
+ * follow releases nothing, the newcomers' copies kept for when they leave the card. The start
+ * after it (the flag cleared at the exit) follows again. */
+static void every_expert_pooled(void) {
+    QtPromo pr[8];
+    int j, l, np, unregs;
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, every expert to be pooled");
+    warm(1);
+    check(qt_chain_host_count() == NL * NE && fake_host_regs - fake_host_unregs == 2 * NL * NE,
+          "every expert pooled: all sixteen page-locked, the eight residents too");
+    np = promote_layer0(pr);
+    check(np >= 1 && !resident(pr[0].vi / NE, pr[0].vi % NE) && pooled(pr[0].vi / NE, pr[0].vi % NE),
+          "every expert pooled: a victim off the card is in the pool already");
+    unregs = fake_host_unregs;
+    check(qt_chain_host_follow(&j, &l) == 0 && j == 0 && l == 0 && qt_chain_host_count() == NL * NE &&
+          fake_host_unregs == unregs, "every expert pooled: the follow releases nothing, the newcomers stay in the pool");
+    qt_shutdown();
+    check(fake_host_unregs == fake_host_regs, "every expert pooled: the exit releases every page-lock");
+
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, the experts off the card pooled");
+    warm(0);
+    np = promote_layer0(pr);
+    check(np >= 1 && qt_chain_host_follow(&j, &l) == 1 && j == np && l == np && pool_is_rest(),
+          "the next start follows again: the victims join, the newcomers leave");
+    qt_source_planar(0);
+    qt_shutdown();
 }
 
 int main(void) {
@@ -69,7 +108,7 @@ int main(void) {
 
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (int4 gs=64, planar source)");
-    warm();
+    warm(0);
     int chg[16], over, j, l;
     check(qt_chain_host_count() == 8 && fake_host_regs == 16 && G_host_bytes == 8 * eb,
           "warm start: the eight experts off the card page-locked (weights and scales), 16 registrations");
@@ -138,7 +177,7 @@ int main(void) {
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, the pool off");
     regs = fake_host_regs;
-    warm();
+    warm(0);
     for (int t = 0; t < 3; t++) step(0, 4, 5);
     np = qt_chain_promote(8, pr);
     for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
@@ -148,7 +187,10 @@ int main(void) {
     qt_shutdown();
     setenv("COLI_CUDA_HOST_POOL", "", 1);
 
+    every_expert_pooled();
+
     if (fails) { printf("test_qwen36_tier_host_pool: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit\n");
+    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, or every expert when the "
+           "warm start pooled them all; every page-lock released at the exit\n");
     return 0;
 }
