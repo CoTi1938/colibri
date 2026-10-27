@@ -3301,6 +3301,38 @@ Lavapipe has one type for everything); the staging type is host-visible and cohe
 not device-local where one exists, so staging never takes the window. Vendor types
 (AMD's uncached and device-coherent ones) are passed over.
 
+**A window smaller than the card.** A card whose host-visible device-local type is as big as its
+heap can still be given less of it. On a Colab A100 80 GB (NVIDIA's 580 driver) the engine's device is
+given 39.75 GiB of it, mapped or not, and then a block is refused with `VK_ERROR_OUT_OF_DEVICE_MEMORY`,
+while the heap says 80 GiB and `VK_EXT_memory_budget` 79.21; on a Colab L4 (24 GB) it is given 9.75 GiB
+of 22.5.
+On the mapped path the expert tier and the weights add up to about that window, and the allocations
+made after them (the streaming slots, the expert batch's scratch) are refused: with Qwen3.8's int4
+experts, `origin/dev` held 13,784 of 24,576 experts, and a prompt of 512 tokens fell to the CPU and
+took 98 s to the first token. On the L4 the pool asks the type for another block for each tensor
+that does not fit (`pool_suballoc`; read in the code, the stuck runs did not count their refusals), a
+refused block took about 0.6 s in a probe program, and the start-up of Qwen3.6's expert tier (10,240
+experts) had not finished after 15 minutes in four runs, with five threads waiting for the pool's mutex
+and one inside the driver; staged it takes 21 s. So when `COLI_VK_STAGED` is unset and the card is discrete, `coli_vk_init`
+asks once, as soon as the device exists (`vk_window_decide`), by allocating 1 GiB blocks of the type
+up to 9/10 of its heap in whole GiB (less if `VK_EXT_memory_budget` says less is free, so memory
+another process holds is not read as a small window; without the extension it is), and takes the
+staged path when it is refused before that. The blocks go back all together when the loop ends. That took 2.3 to 2.4 s at the engine's start on that A100
+(39 GiB obtained, a refusal, the frees; about 50 ms for each GiB allocated and freed) and 1.0 s on
+the L4, and another process on the card can see allocations refused while they are held. For this
+the device is made with the queue a staged card would ask for, as the rule above would.
+`COLI_VK_STAGED=0` skips the probe. The probe's blocks are counted by the device-memory books like
+any other allocation, so `COLI_VK_DEVICE_CAP_MB` limits them. `COLI_VK_WINDOW_PROBE_MB=N` answers N
+MiB without asking, and `COLI_VK_WINDOW_ASK_MB=N` asks for N MiB at most so that the loop runs for
+real (tests; a device with a host-visible device-local type that is not staged already). The log says which way it went; on that A100:
+
+```
+[VK] memory: staged uploads, resident data in device-local memory (type 1, 81920 MiB heap) copied from host staging memory (type 3) on a transfer queue (the driver gave 39 of the 72 GiB asked of the host-visible device-local memory (9/10 of its heap, less if its budget leaves less), found in 2.3 s)
+```
+
+and when the type gives what was asked, the line starts `[VK] memory: mapped weights, the host-visible
+device-local memory gave the N GiB asked`.
+
 **What moves where, staged:**
 
 | Data | Mapped path | Staged |
