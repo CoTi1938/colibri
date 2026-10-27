@@ -1324,11 +1324,13 @@ static void qt_lfru_tick_locked(void);
  * copy over the bus costs per expert: from a few dozen rows up, copying a layer's non-resident
  * experts into VRAM (the chain's staging, one layer at a time, the copy of the next overlapping
  * the layer before) and running them there beats the host's step. The engine's RAM cache serves
- * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
- * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
- * recycled), the RAM copy is expert_ffn.h's planar int4 per 64, one device, and the backend's
- * f16 GEMMs read that layout (coli_cuda_planar_rows); COLI_CUDA_HOST_POOL=0 off. */
-static int G_host_on = -1;
+ * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM):
+ * the non-residents' copies, and the residents' too when the card holds fewer than every expert
+ * and the chain runs (tier_warmstart, qt_chain_host_all). A decode step's slots stay the CPU's.
+ * On when the RAM holds every expert (no slot is ever recycled), the RAM copy is expert_ffn.h's
+ * planar int4 per 64, one device, and the backend's f16 GEMMs read that layout
+ * (coli_cuda_planar_rows); COLI_CUDA_HOST_POOL=0 off. */
+static int G_host_on = -1, G_host_all;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
@@ -1370,17 +1372,22 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     return r;
 }
 int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+/* The warm start page-locks every expert, the residents too (tier_warmstart): the experts the
+ * card lets go are in the pool already, and those that come in stay, for when they leave again.
+ * The follow below then has nothing to do. Said once, before the warm start's threads. */
+void qt_chain_host_all(void){ G_host_all = 1; }
 /* The pool follows the residents. The warm start page-locks the experts it leaves in RAM; the
  * chain's promotions and the tier's LFRU swaps then trade experts between the card and the RAM, and
  * the pool kept its first set: an expert that left the card was not in it, so a prompt chunk's
  * layer holding one went to the host's step whole (q36cc_stage_table), and one that came in kept
  * its RAM page-locked for nothing. Before a large prompt chunk (Q36CC_FOLLOW_ROWS) the chain calls
  * this: the non-residents join the pool, the residents leave it; the CUDA calls outside the lock,
- * as in qt_note_host.
+ * as in qt_note_host. Nothing when the pool holds every expert (qt_chain_host_all): an expert
+ * whose page-lock the warm start was refused then stays out.
  * 1 when the pool changed; *joined and *left say how many. */
 int qt_chain_host_follow(int *joined,int *left){
     *joined=*left=0;
-    if(!G.on || G_host_on <= 0) return 0;
+    if(!G.on || G_host_on <= 0 || G_host_all) return 0;
     size_t n = (size_t)G.nl*G.ne, mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
     int *mv = malloc(n*sizeof(int)), nj = 0, nl = 0;   /* the joins from the front, the leaves from the back */
     if(!mv) return 0;
@@ -2202,7 +2209,7 @@ void qt_shutdown(void){
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
-    G_host_on=-1; G_host_n=G_host_bytes=0;
+    G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }
 

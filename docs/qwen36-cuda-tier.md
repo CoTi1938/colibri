@@ -644,6 +644,14 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
   large one, its layers holding an expert that left on the host's step as before. An expert
   whose page-lock is refused stays out until the next follow.
+- The residents' copies go to the pool too when the card holds fewer than every expert and
+  the chain runs (`tier_warmstart`, `qt_chain_host_all`): an expert the promotions or the
+  swaps move off the card is in the pool already, for any prompt chunk that stages, and the
+  follow has nothing to do; an expert whose page-lock the warm start was refused stays out.
+  It costs the residents' page-locks: on a Colab T4, 16.88 GB of the RAM cache page-locked
+  instead of 6.00 (the same pages), the model ready in 22.80 s instead of 19.88. The
+  startup line `host pool` says which. A card that holds every expert pools nothing, as
+  before.
 - The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
   the most non-resident experts any layer has, filled on a copy stream of its own. The copy
   of the next such layer starts once the layer before has run its experts' GEMMs, so it
