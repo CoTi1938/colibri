@@ -1125,6 +1125,13 @@ uses it.
 
 ## The dense chain (`vk_chain.c`)
 
+The decode GEMVs' int8 path (`chain_gemv.comp`) and the routed experts' rows
+(`chain_moe_gv.comp`) issue four 16-byte steps' loads before the first is summed: a loop
+that loaded one step and summed it waited for every load in turn. The sums go into the same
+accumulators in the same order, so a row's bits are unchanged (tests/test_vk_chain). An RTX
+3070: int8 8192 x 2048 78 -> 66 us a matrix in `COLI_VK_CHAIN_BENCH=1`, Qwen3.6-35B int4 decode
+18.5 -> 17.5 ms a token; the experts' bench (every expert in VRAM) unchanged.
+
 With the dense matrices on the device one `coli_vk_matmul` at a time, each matrix is
 a submit and a host round trip: about 726 of them per Qwen3.8 decode token. On an
 integrated GPU that made the dense part slower on the device than on the CPU (see
