@@ -40,7 +40,6 @@
  * on the CPU from the prefix record and continues there (q38cc_recover).
  * COLI_CUDA_CHAIN_FAULT=n fakes the loss at the n-th frame. */
 #include "cuda_chain.h"
-#include "cu_tier.h"   /* cut_host_pairs: the CPU's rows of the host pool's experts (vk_tier.c's host_pairs) */
 
 #define Q38CC_HOST 0
 #define Q38CC_DEV  1
@@ -842,7 +841,7 @@ static void q38cc_kv_down(Q38CChain *ch, Model *m, int i, int n, int pb) {
  * page-locked RAM mapped into the device (cc_buf CC_DOWN: cached, the CPU reads it at its
  * memory's speed), as the file has them (a GGUF's rows, whole words). A decode step's
  * pooled experts are the CPU's (pool_cpu): their rows eight at a time where they are
- * (cut_host_pairs, vk_tier.c's hybrid steps), the device computing its residents meanwhile,
+ * (q38cc_pool_pairs, as vk_tier.c's hybrid steps), the device computing its residents meanwhile,
  * from a decode table without them (dm_tabd). A prompt chunk's table points at them, so a
  * layer whose experts are all on the card or here has no host step: the GEMV reads a pooled
  * expert's matrices over PCIe once. COLI_CUDA_CHAIN_POOL_READ=1 has the device read a decode
@@ -1347,6 +1346,58 @@ static int q38cc_dm_layer(Q38CChain *ch, Model *m, Layer *l, int i, int n, unsig
     ch->dm_steps++;
     return ok;
 }
+/* np pooled slots on the CPU, their rows where the pool holds them (g[p]: gate, up and down at
+ * 0, Q38CC_PAD(gate bytes), twice that), x[p] each slot's input row: gate and up, SwiGLU, down
+ * into dn[p * H]. A matrix's rows by eight (ggml_quants.h gq_rows_f8, whose bits do not
+ * depend on the other rows of a call) where its type has the kernel, the row kernels where
+ * not: vk_tier.c's host_pairs computes the same, in one parallel region. */
+static int q38cc_pool_pairs(const uint8_t *const *g, const float *const *x, int np, int H, int I, int tg, int td,
+                            float *gu, float *hh, float *dn) {
+    const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
+    const size_t pg = Q38CC_PAD(rg * I);
+    gq_act *ax = calloc((size_t)np, sizeof *ax), *ah = calloc((size_t)np, sizeof *ah);
+    int err = !ax || !ah;
+    for (int p = 0; p < np && !err; p++) err = gq_act_set(&ax[p], x[p], 1, H) != 0;
+    const int cgu = (2 * I + 7) / 8, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
+    if (!err) {
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(dynamic, 4)
+            for (int c = 0; c < np * cgu; c++) {
+                const int p = c / cgu, o0 = (c % cgu) * 8, o1 = o0 + 8 < 2 * I ? o0 + 8 : 2 * I;
+                if (o1 - o0 == 8 && (o1 <= I || o0 >= I) && f8g) {
+                    const uint8_t *m = o0 < I ? g[p] : g[p] + pg; const int oo = o0 < I ? o0 : o0 - I;
+                    gq_rows_f8(gu + (size_t)p * 2 * I + o0, 1, &ax[p], m + (int64_t)oo * rg, rg, tg, H, 8);
+                    continue;
+                }
+                for (int o = o0; o < o1; o++) {
+                    const uint8_t *m = o < I ? g[p] : g[p] + pg; const int oo = o < I ? o : o - I;
+                    gq_row_all(gu + (size_t)p * 2 * I + o, 1, &ax[p], m + (int64_t)oo * rg, tg, H);
+                }
+            }
+            #pragma omp for schedule(static)
+            for (int p = 0; p < np; p++) {
+                const float *gg = gu + (size_t)p * 2 * I, *uu = gg + I; float *h = hh + (size_t)p * I;
+                for (int o = 0; o < I; o++) h[o] = gg[o] / (1.f + expf(-gg[o])) * uu[o];
+                if (gq_act_set(&ah[p], h, 1, I)) {
+                    #pragma omp atomic write
+                    err = 1;
+                }
+            }
+            #pragma omp for schedule(dynamic, 8)
+            for (int c = 0; c < np * cdn; c++) {
+                const int p = c / cdn, o0 = (c % cdn) * 8, o1 = o0 + 8 < H ? o0 + 8 : H;
+                if (!ah[p].q) continue;
+                const uint8_t *m = g[p] + 2 * pg;
+                if (o1 - o0 == 8 && f8d) { gq_rows_f8(dn + (size_t)p * H + o0, 1, &ah[p], m + (int64_t)o0 * rd, rd, td, I, 8); continue; }
+                for (int o = o0; o < o1; o++) gq_row_all(dn + (size_t)p * H + o, 1, &ah[p], m + (int64_t)o * rd, td, I);
+            }
+        }
+    }
+    for (int p = 0; ax && ah && p < np; p++) { gq_act_free(&ax[p]); gq_act_free(&ah[p]); }
+    free(ax); free(ah);
+    return !err;
+}
 /* the host's share of hybrid layer i: once the device's word says its routes and rows are
  * down, the slots the table lacks, its rows up, its word */
 static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
@@ -1387,7 +1438,6 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
             return 0;
         }
         const int I = c->inter, tg = fg - 100, td = fd - 100;
-        const int64_t gb = gq_row_bytes(tg, H) * I;
         if (ch->pc_cap < npc) {
             free(ch->pc_gu); free(ch->pc_hh); free(ch->pc_dn);
             ch->pc_gu = malloc((size_t)npc * 2 * I * sizeof(float)); ch->pc_hh = malloc((size_t)npc * I * sizeof(float));
@@ -1395,15 +1445,13 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
             ch->pc_cap = ch->pc_gu && ch->pc_hh && ch->pc_dn ? npc : 0;
             if (!ch->pc_cap) { fprintf(stderr, "[chain] qwen38: no memory for the CPU's pool slots\n"); return 0; }
         }
-        VktHostExpert hv[Q38CC_DM_ROWS * 32]; const VktHostExpert *hp[Q38CC_DM_ROWS * 32]; const float *xp[Q38CC_DM_ROWS * 32];
+        const uint8_t *gp[Q38CC_DM_ROWS * 32]; const float *xp[Q38CC_DM_ROWS * 32];
         for (int p = 0; p < npc; p++) {
             const int a = pa[p]; const char *g = q38cc_pool_host(ch, i * E + ids[a]);
             if (!g) { fprintf(stderr, "[chain] qwen38: layer %d's expert %d has no place in the host pool\n", i, ids[a]); return 0; }
-            hv[p] = (VktHostExpert){(const uint8_t *)g, (const uint8_t *)g + Q38CC_PAD(gb), (const uint8_t *)g + 2 * Q38CC_PAD(gb), tg, td,
-                                    (size_t)gq_row_bytes(tg, H), (size_t)gq_row_bytes(td, I), NULL, NULL, NULL, 0, 0};
-            hp[p] = &hv[p]; xp[p] = x + (size_t)(a / K) * H;
+            gp[p] = (const uint8_t *)g; xp[p] = x + (size_t)(a / K) * H;
         }
-        if (!cut_host_pairs(hp, xp, npc, H, I, 0.f, 0, ch->pc_gu, ch->pc_hh, ch->pc_dn)) {
+        if (!q38cc_pool_pairs(gp, xp, npc, H, I, tg, td, ch->pc_gu, ch->pc_hh, ch->pc_dn)) {
             fprintf(stderr, "[chain] qwen38: the CPU's pool slots of layer %d failed\n", i);
             return 0;
         }
