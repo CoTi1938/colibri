@@ -3322,7 +3322,7 @@ template<> struct HcgW<WF> { bd_u32 h[8]; }; \
 template<> __device__ __forceinline__ void hcg_fetch_w<WF>(HcgW<WF> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc, \
                                                         int gs, int ng, int n, int N, int k0, int K, int planar) { \
     (void)sc; (void)gs; (void)ng; (void)planar; \
-    if (n >= N) { _Pragma("unroll") for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
+    if (n >= N) { for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
     constexpr int t = WF - 200; \
     size_t rw = ((size_t)K / HcgBt<t>::B * HcgBt<t>::BYTES + 3) / 4; \
     bd_dec16h(t, reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw, (bd_u32)(k0 + (threadIdx.x & 3) * 16), r.h); \
@@ -3343,13 +3343,13 @@ template<> struct HcgW<WF> { bd_u32 h[8]; }; \
 template<> __device__ __forceinline__ void hcg_fetch_w<WF>(HcgW<WF> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc, \
                                                         int gs, int ng, int n, int N, int k0, int K, int planar) { \
     (void)gs; (void)ng; (void)planar; \
-    if (n >= N) { _Pragma("unroll") for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
+    if (n >= N) { for (int j = 0; j < 8; j++) r.h[j] = 0u; return; } \
     constexpr int t = WF - 200; \
     const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc); \
     size_t rw = ((size_t)K / __ldg(tab + BDT_BLK + t) * __ldg(tab + BDT_BYTES + t) + 3) / 4; \
     float f[16]; \
     bd_dec16(t, reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw, (bd_u32)(k0 + (threadIdx.x & 3) * 16), tab, f); \
-    _Pragma("unroll") for (int j = 0; j < 8; j++) r.h[j] = bd_h2u(__halves2half2(hcg_h(f[2 * j]), hcg_h(f[2 * j + 1]))); \
+    for (int j = 0; j < 8; j++) r.h[j] = bd_h2u(__halves2half2(hcg_h(f[2 * j]), hcg_h(f[2 * j + 1]))); \
 } \
 template<> __device__ __forceinline__ void hcg_store_w<WF>(__half (*Ws)[HCG_LDH], const HcgW<WF> &r, int planar) { \
     (void)planar; \
