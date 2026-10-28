@@ -2,9 +2,9 @@
 
 colibri's `dev` plus 15 of my 27 open pull requests, the ones that apply to today's `dev`, in order: branch
 [`pila/ultima`](https://github.com/CoTi1938/colibri/tree/pila/ultima). The other 12 (a Metal series and one Vulkan
-change) wait for a rebase. 17 of my PRs are already merged in `dev`. Most are on the CUDA path for small cards (Colab
-T4 and L4) and on the CUDA chains of Qwen3.6 and Qwen3.8. Each PR below carries its record (commands, raw logs,
-sha256) in `docs/experiments/`.
+change) wait for a rebase. 17 of my PRs are already merged in `dev`. They cover the Qwen3.6 engine on Apple Silicon
+and the CPU (Metal kernels, the graph, the expert cache, GGUF, NEON), the CUDA path of Qwen3.6 and Qwen3.8, Vulkan and
+the RAM planner. Each PR below carries its record (commands, raw logs, sha256) in `docs/experiments/`.
 
 | PR | card | what | before → after |
 |---|---|---|---|
