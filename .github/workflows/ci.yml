@@ -730,7 +730,9 @@ jobs:
 
   engine-cuda-syntax:
     name: CUDA syntax check
-    runs-on: ubuntu-latest
+    # 24.04, not ubuntu-latest: on 26.04 the toolkit action's network method finds no
+    # cuda-nvcc-12-6 package in NVIDIA's ubuntu2604 repository (2026-10-28)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit (compiler only)

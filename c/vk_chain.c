@@ -49,6 +49,8 @@ static const char *const pipe_file[P_NPIPE] = {
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
 #define VKC_FA_MAX 8   /* chain_attn_flash pipelines, a (head dim, query heads a KV head) each */
+#define VKC_FA_ROWS 64 /* chain_attn_flash's query rows a workgroup (its R) */
+#define VKC_FA_SLICE 16 /* chain_attn_flash's units of COLI_VK_ATTN_SLICE's budget to chain_attnb's one */
 #define VKC_FRAMES 16
 #define VKC_STAGE0 (((size_t)16 << 20) / VKC_FRAMES)   /* a frame's first staging buffer: 16 MiB over the frames, as when they were 4 of 4 MiB */
 #define VKC_BIND 8
@@ -1527,9 +1529,11 @@ static int attn_slice_next(void) {   /* the open frame out, a new one in */
 static VkPipeline fa_pipe(int hd, int gq) {
     for (int i = 0; i < KC.nfa; i++) if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq) return KC.fa[i];
     if (!KC.mod_fa || KC.nfa == VKC_FA_MAX) return VK_NULL_HANDLE;
-    int32_t sv[2] = {hd, gq};
-    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-    VkSpecializationInfo si = {2, me, sizeof sv, sv};
+    /* keys a block (64, 32 at head dim 256: its scores, P and K/V tiles in 28 KiB of shared
+     * memory) and the subgroups that share a row tile's work (256 invocations, 4 row tiles) */
+    int32_t sv[4] = {hd, gq, hd > 128 ? 32 : 64, 256 / KC.core.coop_sg / 4};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof sv, sv};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = (uint32_t)KC.core.coop_sg};
@@ -1614,7 +1618,7 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py) */
     int G = w->a.H / w->a.KVH;
     if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->win && !w->ring && !w->kv_pm && !w->sink && w->vd == w->a.hd &&
-          w->a.hd % 64 == 0 && 16 % G == 0 && fa_pipe(w->a.hd, G))) return 0;
+          w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && fa_pipe(w->a.hd, G))) return 0;
     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
     int L = attn_dec_len(n, w->a.H), nb = 1;
     for (int r = 0; r < S; r++) {   /* the most blocks a row takes */
@@ -1640,10 +1644,10 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
     int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows();
-    /* a prompt chunk's causal attention on the matrix units (chain_attn_flash), 16 / G rows a
-     * workgroup; else the blocked shader, else chain_attn */
+    /* a prompt chunk's causal attention on the matrix units (chain_attn_flash), VKC_FA_ROWS / G
+     * tokens a workgroup; else the blocked shader, else chain_attn */
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
-                    w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
+                    w.vd == w.a.hd && w.a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
     int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
     /* a decode's or a verify's rows over many positions: split over them; a verify across
      * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
@@ -1656,8 +1660,13 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         return vkc_attn_w(q, kc, vc, o, gate, sel, snk, &lo) && vkc_attn_w(q, kc, vc, o, gate, sel, snk, &hi);
     }
     if (!fp && !blocked && !(sel && w.a.sel_row > 0) && attn_dec(q, kc, vc, o, gate, snk, &w)) return 1;
-    int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
-                                        fp ? 16 / G : blocked ? br : 1);
+    /* the slices' budget counts chain_attnb's work: the matrix units do a unit of it 8.5 to 13
+     * times faster (a Radeon 8060S, 186 -> 22 ms; Flint's 16K prompt on an RTX PRO 4000,
+     * 100 -> 7.8 s), so a slice of theirs takes VKC_FA_SLICE times the units, about twice
+     * chain_attnb's time a submission. At the budget's own size Qwen3.6's 16K prompt was cut
+     * into slices of 64 rows, 16 workgroups and a submission each: 5.9 s of attention */
+    int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd) / (fp ? VKC_FA_SLICE : 1),
+                                        fp ? VKC_FA_ROWS / G : blocked ? br : 1);
     int ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
         VkcAttnW x = w;
@@ -1667,7 +1676,7 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
         if (w.a.sel_row > 0) x.a.sel_off += r0 * w.a.sel_row;
         if (r0 && !attn_slice_next()) return 0;
         if (fp) {
-            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + 16 / G - 1) / (16 / G)), (uint32_t)x.a.KVH, 1);
+            ok = record(fp, bd, 7, &x, sizeof x, (uint32_t)((x.a.S + VKC_FA_ROWS / G - 1) / (VKC_FA_ROWS / G)), (uint32_t)x.a.KVH, 1);
             KC.st.attn_flash += ok;
         } else if (blocked) {
             struct { VkcAttnW w; int br, B, anchor, part, st_off; } pc = {x, br, 0, 0, 0, 0};
