@@ -85,10 +85,19 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     free(t);
 }
-/* no bus to copy host memory over: the tier keeps the host's step for those experts */
-int coli_cuda_host_register(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
-void coli_cuda_host_unregister(void *p) { (void)p; }
-int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return 0; }
+/* no bus to copy host memory over: the tier keeps the host's step for those experts. A test of
+ * the host pool sets fake_host_reg_ok and fake_planar_rows, and fake_host_reg_bytes to lock only
+ * ranges of that size; the page-locks taken and the releases are counted. */
+static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs;
+static size_t fake_host_reg_bytes;
+int coli_cuda_host_register(void *p, size_t bytes) {
+    (void)p;
+    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes);
+    fake_host_regs += ok;
+    return ok;
+}
+void coli_cuda_host_unregister(void *p) { (void)p; fake_host_unregs++; }
+int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return fake_planar_rows; }
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
@@ -253,6 +262,7 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
 #include "../cuda_chain.h"
 struct CcBuf { int kind; size_t bytes; float *d; };
 static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
+static int fake_chain_host_stores;   /* matmuls whose output is host memory: stored over the bus on a real card */
 static size_t fake_chain_dev_bytes;
 static size_t fake_chain_dev_cap;   /* 0: no limit; else the most CC_DEV bytes the card holds: cc_buf fails past it */
 static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
@@ -313,6 +323,7 @@ static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t y
     if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
     if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
     fake_chain_ops++;
+    if (y->kind != CC_DEV) fake_chain_host_stores++;
     for (int s = 0; s < S; s++) {
         const float *xs = x->d + xo + (size_t)s * t->I; float *ys = y->d + yo + (size_t)s * t->O;
         if (t->fmt == 1 && t->sc) {
@@ -696,7 +707,7 @@ static ColiCudaChainOps fake_chain_table = {
     fcc_qsa, fcc_ple,
     fcc_route, fcc_moe, fcc_signal, fcc_wait_host, fcc_tensor_dev,   /* past CC_OPS_BASE_SIZE unless a test raises size */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    fcc_pick, fcc_matmul_rows, NULL, NULL, NULL,
+    fcc_pick, fcc_matmul_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

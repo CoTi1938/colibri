@@ -268,6 +268,15 @@ typedef struct ColiCudaChainOps {
     /* matmul_rows: y[0..n) = the rows ids[0..n) of a resident tensor (fmt 0 or 1, one input
      * row x[I]); an MTP head's adaptive draft vocabulary scored from the model's lm_head */
     int  (*matmul_rows)(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n);
+    /* A float16 KV cache (half the memory and half the reads of a float32 one): kvh 1 when
+     * the next three take one (0 on HIP); attn_h and attn_wh are attn and attn_wr over caches
+     * of halves (kc, vc and their offsets in halves); copy_regions_h copies float32 regions of
+     * src (offsets in floats) into such a cache (offsets in halves), each value rounded to the
+     * nearest float16 */
+    int  (*kvh)(void);
+    int  (*attn_h)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p);
+    int  (*attn_wh)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring);
+    int  (*copy_regions_h)(CcBuf *dst, CcBuf *src, const CcRegion *r, int n);
     /* fetch_at, fetch_wait_at, fetch_done_at: fetch, fetch_wait and fetch_done for place `slot`
      * (0 or 1), each place with its own pair of events: a second staging place is filled while
      * the first is read. fetch, fetch_wait and fetch_done are place 0's. */
@@ -343,6 +352,20 @@ static inline int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gat
 static inline int cc_attn_wr_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof t->attn_wr; }
 static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
     return cc_attn_wr_ready() ? cc_ops()->attn_wr(q, kc, vc, o, gate, snk, p, ring) : 0;
+}
+/* a float16 KV cache's ops (kvh): 0 from an older backend or HIP */
+static inline int cc_kvh_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh();
+}
+static inline int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    return cc_kvh_ready() ? cc_ops()->attn_h(q, kc, vc, o, gate, sel, p) : 0;
+}
+static inline int cc_attn_wh(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p, int ring) {
+    return cc_kvh_ready() ? cc_ops()->attn_wh(q, kc, vc, o, gate, snk, p, ring) : 0;
+}
+static inline int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    return cc_kvh_ready() ? cc_ops()->copy_regions_h(dst, src, r, n) : 0;
 }
 static inline int cc_kv16_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
