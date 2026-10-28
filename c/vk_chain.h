@@ -868,6 +868,8 @@ typedef struct {
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
     unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
+    unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

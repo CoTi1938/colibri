@@ -1581,33 +1581,59 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
         return;
     }
+    /* the row's blocks joined: their max M (in any order: the same bits) with the sink's
+     * logit; each block's weight w = exp(m_b - M) once and l_b * w, 128 blocks at a time in
+     * sc (not a weight a value, each thread's loads one after the other); the sums over the
+     * blocks in block order, l's by thread 0 from sc, the values' loads four at a time, so the
+     * bits are a weight a value's (chain_attn_dec.comp's mode 1). hd <= 256 (qs) */
     int s = blockIdx.y, n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
     int L = cc_attn_dec_len(n - first, hc), nbr = (n - first + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
+    float mm = -3.0e38f;
+    for (int b = tid; b < nbr; b += 256) mm = fmaxf(mm, xs[xo + (size_t)b * stride]);
+    for (int m = 16; m > 0; m >>= 1) mm = fmaxf(mm, cc_shfl_xor(mm, m));
+    if (lane == 0) red[wp] = mm;
+    __syncthreads();
     float M = snk ? snk[sink_off + h] : -3.0e38f;   /* the sink joins the max and the sum, with no value */
-    for (int b = 0; b < nbr; b++) M = fmaxf(M, xs[xo + (size_t)b * stride]);
-    float Lt = snk ? expf(snk[sink_off + h] - M) : 0.f;
-    for (int b = 0; b < nbr; b++) Lt += xs[xo + (size_t)b * stride + 1] * expf(xs[xo + (size_t)b * stride] - M);
+    for (int g = 0; g < 8; g++) M = fmaxf(M, red[g]);
+    float Lt = snk ? expf(snk[sink_off + h] - M) : 0.f, v = 0.f;
+    for (int b0 = 0; b0 < nbr; b0 += 128) {
+        int nc = min(128, nbr - b0);
+        __syncthreads();   /* red, then the last chunk's weights, read */
+        if (tid < nc) { size_t xb = xo + (size_t)(b0 + tid) * stride; float w = expf(xs[xb] - M); sc[tid] = w; sc[128 + tid] = xs[xb + 1] * w; }
+        __syncthreads();
+        if (tid == 0) for (int b = 0; b < nc; b++) Lt += sc[128 + b];
+        if (tid < hd) {
+            const float *xv = xs + xo + (size_t)b0 * stride + 2 + tid;
+            int b = 0;
+            for (; b + 4 <= nc; b += 4) {
+                float x0 = xv[(size_t)b * stride], x1 = xv[(size_t)(b + 1) * stride], x2 = xv[(size_t)(b + 2) * stride], x3 = xv[(size_t)(b + 3) * stride];
+                v += x0 * sc[b]; v += x1 * sc[b + 1]; v += x2 * sc[b + 2]; v += x3 * sc[b + 3];
+            }
+            for (; b < nc; b++) v += xv[(size_t)b * stride] * sc[b];
+        }
+    }
+    if (tid == 0) red[0] = Lt;
+    __syncthreads();
+    Lt = red[0];
     float inv = Lt > 0.f ? 1.f / Lt : 0.f;
     int ob = p.o_off + s * p.o_row + h * hd, gb = p.g_off + s * p.g_row + h * p.g_seg;
-    for (int d = tid; d < hd; d += 256) {
-        float v = 0.f;
-        for (int b = 0; b < nbr; b++) v += xs[xo + (size_t)b * stride + 2 + d] * expf(xs[xo + (size_t)b * stride] - M);
+    if (tid < hd) {
         v *= inv;
-        if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + d]));
-        o[ob + d] = v;
+        if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + tid]));
+        o[ob + tid] = v;
     }
 }
 /* cc_attn_dec_k's mode 0 for the G query heads of a KV head at once: a block a (KV head, block
  * of positions, row), each K and V row read once for the G heads instead of once a head, four
  * floats a load (chain_attn_dec.comp's mode 2). Qwen3.6's eight heads a KV head after an 18K
- * prompt read 74 MB of rows a layer eight times. A K row over a warp's lanes; V a float4 column a
- * thread, the positions over 256 / (hd / 4) groups of threads, their sums added group by group.
+ * prompt read 74 MB of rows a layer eight times. The scores a thread or two a position; V a float4
+ * column a thread, the positions over 256 / (hd / 4) groups of threads, their sums added group by group.
  * The blocks' rule counts four blocks a KV head (hc); the join is cc_attn_dec_k's mode 1 with
  * that rule. Dynamic shared memory: the heads' q rows and scores, G * (hd + 256) floats. */
 template <int G, typename KT = float>
 __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__restrict__ q, const KT *__restrict__ kc,
-        const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc) {
+        const KT *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc, int tpp) {
     extern __shared__ float4 cc_decg_sm[];
     __shared__ float red[G * 8];
     const int hd = p.hd, stride = hd + 2, NV = hd / 4, NG = 256 / NV;
@@ -1630,38 +1656,75 @@ __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__rest
     }
     __syncthreads();
     int kbase = kvh * p.cap;
-    for (int j = wp; j < cnt; j += 8) {
-        size_t kr = p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
-        float4 kk[2];
-#pragma unroll
-        for (int i = 0; i < 2; i++) { int c = lane + 32 * i; kk[i] = c < NV ? cc_kv4(kc, kr + 4 * c) : make_float4(0.f, 0.f, 0.f, 0.f); }
-        float a[G];
-#pragma unroll
-        for (int g = 0; g < G; g++) a[g] = 0.f;
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            int c = lane + 32 * i;
-            if (c < NV)
-#pragma unroll
-                for (int g = 0; g < G; g++) {
-                    float4 x = qv[g * NV + c];
-                    a[g] += x.x * kk[i].x + x.y * kk[i].y + x.z * kk[i].z + x.w * kk[i].w;
-                }
-        }
-#pragma unroll
-        for (int g = 0; g < G; g++) {
-            float x = a[g];
-            for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
-            if (lane == 0) sc[g * 256 + j] = x * p.scale;
-        }
-    }
-    __syncthreads();
+    /* the scores. tpp 0: a K row over a warp's lanes, two float4s a lane, the heads' sums by
+     * shuffles; tpp 1, 2 or 4: that many threads a position (adjacent lanes, a float4 each in
+     * turn along the K row) against the G q rows, their sums joined across the tpp lanes, the max
+     * on the way (chain_attn_dec.comp's mode 2), the loop's trips the block's so every lane meets
+     * the shuffle. cc_decg_tpp chooses */
     float M[G], e[G];
 #pragma unroll
     for (int g = 0; g < G; g++) M[g] = -3.0e38f;
-    for (int j = tid; j < cnt; j += 256)
+    if (tpp == 0) {
+        for (int j = wp; j < cnt; j += 8) {
+            size_t kr = p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+            float4 kk[2];
 #pragma unroll
-        for (int g = 0; g < G; g++) M[g] = fmaxf(M[g], sc[g * 256 + j]);
+            for (int i = 0; i < 2; i++) { int c = lane + 32 * i; kk[i] = c < NV ? cc_kv4(kc, kr + 4 * c) : make_float4(0.f, 0.f, 0.f, 0.f); }
+            float a[G];
+#pragma unroll
+            for (int g = 0; g < G; g++) a[g] = 0.f;
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int c = lane + 32 * i;
+                if (c < NV)
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        float4 x = qv[g * NV + c];
+                        a[g] += x.x * kk[i].x + x.y * kk[i].y + x.z * kk[i].z + x.w * kk[i].w;
+                    }
+            }
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float x = a[g];
+                for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
+                if (lane == 0) sc[g * 256 + j] = x * p.scale;
+            }
+        }
+        __syncthreads();
+        for (int j = tid; j < cnt; j += 256)
+#pragma unroll
+            for (int g = 0; g < G; g++) M[g] = fmaxf(M[g], sc[g * 256 + j]);
+    } else {
+        int part = tid % tpp;
+        for (int j0 = 0; j0 < cnt; j0 += 256 / tpp) {
+            int j = j0 + tid / tpp;
+            float a[G];
+#pragma unroll
+            for (int g = 0; g < G; g++) a[g] = 0.f;
+            if (j < cnt) {
+                size_t kr = p.k_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd;
+#pragma unroll 4
+                for (int c = part; c < NV; c += tpp) {
+                    float4 kk = cc_kv4(kc, kr + 4 * c);
+#pragma unroll
+                    for (int g = 0; g < G; g++) {
+                        float4 x = qv[g * NV + c];
+                        a[g] += x.x * kk.x + x.y * kk.y + x.z * kk.z + x.w * kk.w;
+                    }
+                }
+            }
+            for (int m = 1; m < tpp; m <<= 1)
+#pragma unroll
+                for (int g = 0; g < G; g++) a[g] += cc_shfl_xor(a[g], m);
+            if (j < cnt)
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    float x = a[g] * p.scale;
+                    if (part == 0) sc[g * 256 + j] = x;
+                    M[g] = fmaxf(M[g], x);
+                }
+        }
+    }
 #pragma unroll
     for (int g = 0; g < G; g++) {
         float x = M[g];
@@ -1727,16 +1790,26 @@ static int cc_decg_heads(int G, int hd) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
     return on && hd >= 4 && hd <= 256 && hd % 4 == 0 && (G == 2 || G == 4 || G == 8 || G == 16) ? G : 0;
 }
+/* cc_attn_decg_k's scores: two threads a position, COLI_CUDA_ATTN_DEC_TPP (0, 1, 2 or 4) sets it.
+ * One layer after 18K positions in float16 on an RTX PRO 4000 (tests/test_cuda_chain.cu's
+ * COLI_CUDA_CHAIN_BENCH=adec), at 0 / 1 / 2 / 4: Qwen3.6's 16/2 heads of 256 115.0 / 128.1 /
+ * 108.6 / 108.5 us, Flint's 32/4 of 128 140.5 / 146.2 / 122.1 / 121.9 */
+static int cc_decg_tpp(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_TPP"); v = e && (*e == '0' || *e == '1' || *e == '2' || *e == '4') ? *e - '0' : 2; }
+    return v;
+}
 template <typename KT>
 static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const KT *vc, float *xs, const CcAttn &p, int nb,
                            int win, int ring, int hc) {
     dim3 g((unsigned)p.KVH, (unsigned)nb, (unsigned)p.S);
     size_t sm = (size_t)G * (p.hd + 256) * sizeof(float);
+    int tpp = cc_decg_tpp();
     switch (G) {
-    case 2: cc_attn_decg_k<2><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
-    case 4: cc_attn_decg_k<4><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
-    case 8: cc_attn_decg_k<8><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
-    default: cc_attn_decg_k<16><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
+    case 2: cc_attn_decg_k<2><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 4: cc_attn_decg_k<4><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    case 8: cc_attn_decg_k<8><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
+    default: cc_attn_decg_k<16><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc, tpp); break;
     }
 }
 template <typename KT>
