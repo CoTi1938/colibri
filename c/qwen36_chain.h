@@ -97,7 +97,9 @@ typedef struct {
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
     int n, head;                               /* layers lo..lo+n-1 on the device; lm_head there too */
     int rows;                                  /* scratch capacity in rows */
-    int cap;                                   /* the host's kv_cap the mirrors follow */
+    int cap;                                   /* positions the mirrors hold (q36c_mirror: grown with the context, at most kv_cap) */
+    int host_cap;                              /* the host's kv_cap when they were planned (its sliding layers' form) */
+    size_t keep;                               /* the device memory a mirror of Q36C_KV_START positions leaves free (q36c_mirror) */
     int dev_rows;                              /* device KV rows a layer: cap, or the split's */
     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
     VkcBuf *prm;                               /* every norm / conv / DeltaNet parameter */
@@ -649,6 +651,8 @@ static int q36c_kv_up(VkcBuf *dst, size_t at, const void *base, int64_t idx, siz
  * leaves it free (VktConfig.chain_bytes). Before, Flint int4 at 32K of context mirrored
  * 6.6 GB beside a tier that had left 1 GiB, and its chain ran only with
  * COLI_VK_TIER_RESERVE_GB=12. */
+#define Q36C_CONV_ROWS 2048
+#define Q36C_KV_START 8192   /* the positions the tier leaves the mirror at the start (q36c_mirror grows past them) */
 static size_t q36c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
@@ -658,36 +662,76 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
 }
-/* Plan and allocate the KV mirror before sizing a prompt chunk. */
-static int q36c_mirror(Q36Chain *ch, Model *m) {
+/* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
+ * conversation the chain holds. The mirror grows with the context, as a multiplexed place does
+ * (q36c_conv_grow): twice what it held, from Q36C_CONV_ROWS, rounded to 1024, at most the
+ * context, its rows again from the host. A device without the room takes it from the
+ * expert tier (vkt_give_back), which reserved only the start (q36c_late_bytes at
+ * Q36C_KV_START). Before, the mirror took the host's whole capacity at the first forward:
+ * 2.79 GiB of an 8 GB card for Flint at 64K of context, whose tier then held 1.41 GiB of
+ * experts against 3.67 at 8K (decode 43.1 against 49.4 tok/s on an RTX PRO 4000 at 7.4 GB). */
+#define Q36C_KV_MARGIN ((size_t)256 << 20)
+static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads;
-    if (ch->cap != m->kv_cap) {        /* the host cache grew: mirror it again (whole, or split past the budget) */
-        size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
-        /* the rings counted at their rows, as that many layers of the cache's length */
-        int nf = 0, nr = 0;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
-        int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + m->kv_cap - 1) / m->kv_cap) : 0);
-        size_t held = 0;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
-        int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, m->kv_cap, 1, 0, held) : 1;
-        if (!plan) { ch->cap = 0; return 0; }
-        if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
-            fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
-                            "sliding window or sinks (Flint); the chain stops\n");
-            vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
-        }
-        ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
-        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
-            if (!c->is_attn[i]) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
-            ch->kv_valid[i] = 0;
-            ch->kv_rows[i] = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
-            ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
-            ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
-        }
-        ch->cap = m->kv_cap;
+    if (need < 1) need = 1;
+    /* the positions a step can reach: the mirror's rows follow them, not the host's capacity,
+     * which grows request by request (its rows keep their positions when it does) */
+    const int top = qwen36_max_ctx() > m->kv_cap ? qwen36_max_ctx() : m->kv_cap;
+    int cap = ch->cap;
+    if (cap >= need) {
+        if (ch->host_cap == m->kv_cap) return 1;
+        /* the host's capacity moved: a sliding layer may have turned from its first rows into a
+         * ring (q36c_ring), the rest keep theirs */
+    } else {
+        cap = cap ? 2 * cap : Q36C_CONV_ROWS;
+        while (cap < need) cap *= 2;
+        cap = (cap + 1023) / 1024 * 1024;
+        if (cap > top) cap = top;
+        if (cap < need) { ch->cap = 0; return 0; }
     }
+    size_t row = (size_t)KV * c->k_head_dim * 2 * sizeof(float);
+    /* the rings counted at their rows, as that many layers of the mirror's length */
+    int nf = 0, nr = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) { if (q36c_ring(m, i)) nr++; else nf++; }
+    int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + cap - 1) / cap) : 0);
+    size_t held = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
+    /* the full layers' rows past Q36C_KV_START come out of the tier: the memory free beside
+     * a mirror of that start (keep, measured at the first) stays free, so a long
+     * conversation's prompt chunks are the size a short one's are */
+    size_t want = (size_t)nf * cap * row, more = want > held ? want - held : 0;
+    if (!ch->keep) {
+        const size_t start = (size_t)nf * (top < Q36C_KV_START ? top : Q36C_KV_START) * row, av = vkc_dev_avail() + held;
+        ch->keep = av > start + Q36C_KV_MARGIN ? av - start : Q36C_KV_MARGIN;
+    }
+    size_t took = 0;
+    const size_t av0 = vkc_dev_avail();
+    if (more && av0 < more + ch->keep) took = vkt_give_back(more + ch->keep - av0);
+    if (ch->cap && cap != ch->cap)
+        fprintf(stderr, "[VK] qwen36 chain: the KV mirror grows from %d to %d positions (%.1f MiB more, %.1f MiB of them from the "
+                        "expert tier)\n", ch->cap, cap, more / 1048576.0, took / 1048576.0);
+    int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), leq, row, cap, 1, 0, held) : 1;
+    if (!plan) { ch->cap = 0; return 0; }
+    if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
+        fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
+                        "sliding window or sinks (Flint); the chain stops\n");
+        vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
+    }
+    ch->dev_rows = ch->ks.on ? ch->ks.rows : cap;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        if (!c->is_attn[i]) continue;
+        const int rows = q36c_ring(m, i) ? m->kv_ring : ch->dev_rows;
+        /* a mirror whose rows stay keeps them (a ring's, a full layer's at the same length);
+         * a split's go again, as its window moves */
+        if (ch->kc[i] && ch->kv_rows[i] == rows && !ch->ks.on) continue;
+        vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
+        ch->kv_valid[i] = 0;
+        ch->kv_rows[i] = rows;
+        ch->kc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
+        ch->vc[i] = vkc_buf((size_t)KV * ch->kv_rows[i] * c->k_head_dim * sizeof(float), VKC_DEV);
+        if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
+    }
+    ch->cap = cap; ch->host_cap = m->kv_cap;
     return 1;
 }
 
@@ -802,7 +846,6 @@ static void q36c_conv_free(Model *m, Q36cConv *v) {
 /* A place's mirrors start at Q36C_CONV_ROWS rows and double as its conversation grows
  * (q36c_conv_grow): a conversation takes the device memory its length needs, not the
  * context's. A sliding layer's ring keeps its rows. */
-#define Q36C_CONV_ROWS 2048
 static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++)
@@ -1449,8 +1492,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         q36c_conv_save(ch);
         mirror_ok = q36c_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36c_conv_load(ch, ch->conv_cur);
-        if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m); }
-    } else mirror_ok = q36c_mirror(ch, m);
+        if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m, pos_base + S); }
+    } else mirror_ok = q36c_mirror(ch, m, pos_base + S);
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
     int half = c->rotary_dim / 2;

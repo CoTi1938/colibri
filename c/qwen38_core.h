@@ -4321,7 +4321,10 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
             return;
         }
 #endif
-        for(int o=r0;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
+        int o=r0;
+        if(gq_f8_ok(w->gq_type,I))   /* the file's rows by eight (ggml_quants.h gq_rows_f8) */
+            for(;o+8<=r1;o+=8)gq_rows_f8(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,rb,w->gq_type,I,8);
+        for(;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
         return;
     }
     if(w->kind==Q38_WEIGHT_INT4G64){
