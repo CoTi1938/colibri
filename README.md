@@ -1,3 +1,26 @@
+## This fork: CoTi1938's stack
+
+colibri's `dev` plus 15 of my 27 open pull requests, the ones that apply to today's `dev`, in order: branch
+[`pila/ultima`](https://github.com/CoTi1938/colibri/tree/pila/ultima). The other 12 (a Metal series and one Vulkan
+change) wait for a rebase. 17 of my PRs are already merged in `dev`. Most are on the CUDA path for small cards (Colab
+T4 and L4) and on the CUDA chains of Qwen3.6 and Qwen3.8. Each PR below carries its record (commands, raw logs,
+sha256) in `docs/experiments/`.
+
+| PR | card | what | before → after |
+|---|---|---|---|
+| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 512-token prompt after a conversation | 180.18 → 440.11 tok/s (+144.3%) |
+| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 8-turn agent session | 71.6 → 43.1 s |
+| [#2423](https://github.com/JustVugg/colibri/pull/2423) | Colab T4 | 512-token prompt after a 64-token one | +14.3% |
+| [#2424](https://github.com/JustVugg/colibri/pull/2424) | Colab T4 | 512-token prompt alone | 519.29 → 657.25 tok/s (+26.6%) |
+| [#2434](https://github.com/JustVugg/colibri/pull/2434) | Colab T4 | 8192-token prompt, first in a process | 618.34 → 798.12 tok/s (+29.07%) |
+| [#2421](https://github.com/JustVugg/colibri/pull/2421) | RTX PRO 4000 | Qwen3.6 decode | 74.748 → 145.064 tok/s (+94.1%) |
+| [#2418](https://github.com/JustVugg/colibri/pull/2418) | RTX PRO 4000 | Qwen3.8, 1628-token prompt | 216.2 → 424 tok/s (+96%) |
+
+Each number is measured on that PR's own base, as its record says. The project's licence and notices apply
+(Apache 2.0, `LICENSE`, `NOTICE`); my changes are contributed under the same licence.
+
+---
+
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì: tiny engine, immense model">
 </p>
