@@ -259,12 +259,15 @@ static int q36cc_attn_wc(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, 
     if (q36cc_kvh()) return cc_attn_wh(q, kc, vc, o, gate, snk, w, ring);
     return ring ? cc_attn_wr(q, kc, vc, o, gate, snk, w, ring) : cc_attn_w(q, kc, vc, o, gate, snk, w);
 }
-/* the mirrors at ctx positions, any model's (a sliding layer's ring where the backend reads one) */
+/* the mirrors at ctx positions, any model's (a sliding layer's ring where the backend reads one),
+ * as float32: the tier's room for them. A float16 mirror takes half, and the half it leaves goes
+ * to the prompt's chunk rows: with the tier's room halved, Flint UD-Q3_K_XL with 7 GiB free on
+ * an RTX PRO 4000 took 2048 rows a chunk instead of 4096, its 4K-token prompt 1768 -> 1190 tok/s */
 static size_t q36cc_mirror_at(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1) return 0;
     int R = c->win_layer && cc_attn_wr_ready() ? q36_ring_for(c, ctx) : 0;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * q36cc_kves(), kv = 0;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0;
     for (int i = 0; i < c->n_layers; i++)
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer[i] ? R : ctx);
     return kv;

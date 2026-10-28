@@ -458,7 +458,6 @@ static void q36c_fit_qw(const QW *w, size_t *dev, size_t *mat) {
  * (f32 tensors), the DeltaNet state and conv ring, the K/V mirror at its starting size
  * (`kv_rows` positions: the split's floor of three blocks; past it the split decides
  * from what is free then), and its share of the parameter arena. */
-static int q36c_kvh_want(void);
 static void q36c_fit_layer(Model *m, int i, int kv_rows, size_t *dev, size_t *mat) {
     Cfg *c = &m->c; Layer *l = &m->L[i]; int D = c->hidden, vh = c->dn_vheads;
     QW *ws[16]; int nw = q36c_layer_qws(m, i, ws);
@@ -469,7 +468,7 @@ static void q36c_fit_layer(Model *m, int i, int kv_rows, size_t *dev, size_t *ma
         if (l->kn) prm += c->k_head_dim;
         if (l->sinks) prm += c->q_heads;
         if (c->muse) prm += 5 * (size_t)D + q36_eh(c);
-        *dev += 2 * vkc_fit_buf((size_t)c->kv_heads * kv_rows * c->k_head_dim * (q36c_kvh_want() ? 2 : sizeof(float)));
+        *dev += 2 * vkc_fit_buf((size_t)c->kv_heads * kv_rows * c->k_head_dim * sizeof(float));
     } else {
         prm += (size_t)c->dn_conv_dim * c->dn_convk + 2 * (size_t)vh + c->dn_vdim;
         *dev += vkc_fit_tensor(10, D, 2 * vh, 0); *mat += coli_vk_tensor_payload(10, D, 2 * vh, 0);
@@ -689,7 +688,7 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
     int R = q36_ring_for(c, ctx), hi = g_q36c_fit_on ? g_q36c_fit.n : c->n_layers;
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * (q36c_kvh_want() ? 2 : sizeof(float)), kv = 0, half = vkc_dev_avail() / 2;
+    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * sizeof(float), kv = 0, half = vkc_dev_avail() / 2;   /* as float32 (q36cc_mirror_at) */
     for (int i = 0; i < hi && i < c->n_layers; i++)
         if (c->is_attn[i]) kv += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
     return kv > half ? half : kv;
