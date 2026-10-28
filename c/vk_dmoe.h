@@ -74,7 +74,9 @@ typedef struct {
     VkcHybJob q[VKC_HYB_Q]; int qh, qt, busy;
     unsigned long long steps, pairs;   /* steps done, host pool pairs computed */
     double cpu_ms;                     /* the worker's compute time */
+    double wait_ms;                    /* its time waiting for the device's routes (the layer's dense part on the device) */
     float *gu, *hh, *dn; int cap;      /* its scratch: gate and up, the hidden rows, down, for cap pairs */
+    float *ys; int ycap;               /* the weighted sum, n rows, before it goes to the device's buffer */
 } VkcHyb;
 /* one worker for every engine's steps on the device: the host's timeline rises in its order */
 static VkcHyb g_vkc_hyb;
@@ -148,14 +150,23 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     int E = d->E, K = d->K, D = d->D, I = d->I, n = j->n;
     const int *ids = (const int *)vkc_ptr(d->rid) + (size_t)j->i * d->cap * K;
     const float *wt = (const float *)vkc_ptr(d->rwt), *x = (const float *)vkc_ptr(d->hxx);
+    /* the sum goes to the device's buffer (written by the host, read by the device: memory the
+     * CPU does not cache, on a discrete card often its BAR) in one copy at the end; reading
+     * it back as the sum grew cost about 70 us a step of Flint's three pairs */
     float *y = (float *)vkc_ptr(d->cy);
-    memset(y, 0, (size_t)n * D * sizeof(float));
     int ps[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], pk[VKC_DMOE_ROWS * VKC_ROUTE_KMAX], np = 0;
     const VktHostExpert *hx = d->hx + (size_t)j->i * E;
     for (int s = 0; s < n; s++)
         for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e >= 0 && e < E && hx[e].g) { ps[np] = s; pk[np] = k; np++; } }
-    if (!np) return;
     VkcHyb *w = &g_vkc_hyb;
+    if (!np) { memset(y, 0, (size_t)n * D * sizeof(float)); return; }
+    if (w->ycap < n * D) {
+        free(w->ys); w->ys = malloc((size_t)n * D * sizeof(float));
+        w->ycap = w->ys ? n * D : 0;
+        if (!w->ycap) { memset(y, 0, (size_t)n * D * sizeof(float)); w->err = 1; return; }
+    }
+    float *yl = w->ys;
+    memset(yl, 0, (size_t)n * D * sizeof(float));
     w->pairs += (unsigned long long)np;
     if (w->cap < np) {
         free(w->gu); free(w->hh); free(w->dn);
@@ -168,9 +179,10 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     for (int p = 0; p < np; p++) { hp[p] = &hx[ids[ps[p] * K + pk[p]]]; xp[p] = x + (size_t)ps[p] * D; }
     if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, vkc_hyb_threads(), w->gu, w->hh, dn)) w->err = 1;
     for (int p = 0; p < np; p++) {   /* in rank order within a row */
-        float wv = wt[ps[p] * K + pk[p]]; float *ys = y + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
+        float wv = wt[ps[p] * K + pk[p]]; float *ys = yl + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
         for (int c = 0; c < D; c++) ys[c] += wv * o[c];
     }
+    memcpy(y, yl, (size_t)n * D * sizeof(float));
 }
 static void *vkc_hyb_main(void *arg) {
     (void)arg;
@@ -181,7 +193,10 @@ static void *vkc_hyb_main(void *arg) {
         if (w->qh == w->qt && w->quit) { w->busy = 0; pthread_cond_broadcast(&w->cv_idle); pthread_mutex_unlock(&w->mx); break; }
         VkcHybJob j = w->q[w->qh % VKC_HYB_Q]; w->busy = 1;
         pthread_mutex_unlock(&w->mx);
-        if (!vkc_hybrid_host_wait(j.g)) w->err = 1;
+        const double tw = vkc_hyb_now_ms();
+        const int got = vkc_hybrid_host_wait(j.g);
+        w->wait_ms += vkc_hyb_now_ms() - tw;
+        if (!got) w->err = 1;
         else {
             double t0 = vkc_hyb_now_ms();
             vkc_hyb_compute(j.d, &j);
@@ -671,8 +686,9 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
         fprintf(stderr, "[VK] %s chain: the experts' table read whole %llu times, patched %llu times (%llu entries the tier changed)\n",
                 engine, d->reads, d->patches, d->patched);
     if (!d->hyb_steps) return;
-    fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step)%s\n",
-            engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0,
+    fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step; "
+                    "%.1f ms waiting for the device's routes)%s\n",
+            engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0, w->wait_ms,
             w->err ? ", errors seen" : "");
 }
 #endif
