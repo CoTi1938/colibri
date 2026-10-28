@@ -2506,6 +2506,10 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
         int t = p->gfmt - 100, kq = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14;
         int wide = kq || (long long)p->K * ((p->I + 63) / 64) >= 128;
         rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
+        /* Q6_K's down at 4 steps: its step's decode wants more lanes a row (an RTX PRO 4000,
+         * D 2048 I 512 K 8: 27.4 -> 20.9 us; D 2560 I 640 K 10 34.1 -> 32.3; the other types
+         * the same or slower) */
+        if (p->dfmt == 114) sd = 4;
     }
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */

@@ -3447,6 +3447,31 @@ static void bench_dn(void) {
     free(cv); free(ab); free(z); free(prm);
 }
 
+/* COLI_VK_CHAIN_BENCH=disp: what a dispatch costs in a frame, a tiny one (chain_ew's scale over
+ * 2048 floats) n times: each reading the one before (a barrier between them, as a forward's
+ * dependent ops), and each on a buffer of its own (none) */
+static void bench_disp(void) {
+    const int n = 400, N = 2048;
+    float *x = fvec(N, 1.f);
+    VkcBuf *a = up(x, N), *bs[16];
+    for (int i = 0; i < 16; i++) bs[i] = up(x, N);
+    for (int mode = 0; mode < 2; mode++) {
+        double best = 1e9; int ok = 1;
+        for (int r = 0; r < 5 && ok; r++) {
+            vkc_begin();
+            for (int i = 0; i < n && ok; i++) {
+                VkcEw e = {VKC_EW_SCALE, N, N, 1, 0, 0, 0, 0, 0, 0, 0, 1.0f};
+                VkcBuf *y = mode ? bs[i % 16] : a;
+                ok = vkc_ew(y, mode ? a : y, NULL, NULL, NULL, &e);
+            }
+            double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+            if (dt < best) best = dt;
+        }
+        if (ok) printf("bench disp: %s, %.2f us a dispatch\n", mode ? "each its own buffer" : "each reading the one before", best * 1e6 / n);
+    }
+    vkc_free(a); for (int i = 0; i < 16; i++) vkc_free(bs[i]); free(x);
+}
+
 /* COLI_VK_CHAIN_BENCH=adec: a decode step's attention over many positions (chain_attn_dec) at
  * Qwen3.6's shapes, each of n layers its own K and V (a forward's rows come from memory);
  * COLI_VK_BENCH_ADEC "H KVH hd positions" sets them */
@@ -3920,6 +3945,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "adec")) bench_adec();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "disp")) bench_disp();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
