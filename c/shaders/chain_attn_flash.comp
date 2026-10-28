@@ -1,7 +1,8 @@
 #version 450
 // The dense chain's attention core on the matrix units (vk_chain.c, VKC_P_ATTN_FLASH):
-// chain_attn.comp's causal case (no selection list, window, ring, sink or second V
-// width, head-major cache) for a prompt chunk, KHR cooperative matrix f16 x f16 -> f32.
+// chain_attn.comp's causal case (no selection list or second V width, a head-major cache;
+// a sliding window, a ring and a sink logit per head as chain_attnb.comp takes them) for a
+// prompt chunk, KHR cooperative matrix f16 x f16 -> f32.
 // Same bindings and push constants as chain_attn.comp, so vkc_attn_w picks either.
 // After llama.cpp's flash_attn_cm1.comp (MIT): 16 query rows, 64 keys a step, 256
 // invocations, the softmax on a shared copy of the scores. The matrix work goes to 4
@@ -14,7 +15,10 @@
 //    accumulators (no rescaling, O never leaves the registers), / l at the end;
 //  * K/V arrive f32 and are converted to f16 while staged, in 16x16 tiles stored
 //    contiguously (strided cooperative-matrix loads measured slow on RADV);
-//  * causality inline: key t is valid for row r iff t <= pos_base + token(r).
+//  * causality inline: key t is valid for row r iff t <= pos_base + token(r), and with a
+//    window (win > 0) t > pos_base + token(r) - win; the key blocks before the first row's
+//    window are skipped. A ring (ring > 0) keeps position t in row t % ring. A sink starts
+//    each row's softmax at m = sink, l = 1 (one more term of the denominator, no value).
 // Q is scaled before its f16 rounding; P = exp(s - m) is in (0, 1]. Not bit-identical
 // to chain_attn.comp (f16 operands); the CPU's order differs from both anyway.
 // Grid: x = ceil(S / (16/GQ)) token groups, y = kv heads. HD and GQ are specialization
@@ -38,6 +42,7 @@ layout(std430, binding = 1) readonly buffer KB { float kc[]; };   // K[k_off + (
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };   // V likewise from v_off
 layout(std430, binding = 3) buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
+layout(std430, binding = 6) readonly buffer SB { float snk[]; };
 layout(push_constant) uniform P {   // chain_attn.comp's; the fields after v_off are zero here
     int S, H, KVH, hd, pos_base, cap;
     int q_off, q_row, q_seg;
@@ -73,7 +78,7 @@ void stage(uint g, uint k0, uint nt, uint tid, bool isv) {
         uint key = k0 + kl, d = d8 * 8u;
         vec4 a = vec4(0.0), b = vec4(0.0);
         if (key < nt) {
-            uint base = (g * uint(p.cap) + key) * HD + d;
+            uint base = (g * uint(p.cap) + (p.ring > 0 ? key % uint(p.ring) : key)) * HD + d;
             if (isv) { base += uint(p.v_off); a = vec4(vc[base], vc[base+1u], vc[base+2u], vc[base+3u]); b = vec4(vc[base+4u], vc[base+5u], vc[base+6u], vc[base+7u]); }
             else     { base += uint(p.k_off); a = vec4(kc[base], kc[base+1u], kc[base+2u], kc[base+3u]); b = vec4(kc[base+4u], kc[base+5u], kc[base+6u], kc[base+7u]); }
         }
@@ -88,6 +93,8 @@ void main() {
     uint nt = uint(p.pos_base) + S;
     uint tlast = min(t0 + TPW, S) - 1u;
     uint nkb = (uint(p.pos_base) + tlast) / BC + 1u;          // key blocks this workgroup needs
+    uint win = uint(max(p.win, 0)), first = uint(p.pos_base) + t0;   // the first row's position
+    uint kb_lo = win > 0u && first + 1u > win ? (first + 1u - win) / BC : 0u;   // blocks before it hold no key of any row
 
     // softmax thread layout: row = tid / 16, 16 lanes per row, keys cl + 16 i
     uint row = tid >> 4u, cl = tid & 15u;
@@ -114,9 +121,10 @@ void main() {
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Sc;
     float m = -1e30, l = 0.0;
+    if (p.sink != 0) { m = snk[uint(p.sink_off) + g * GQ + row % GQ]; l = 1.0; }
 
     // pass 1: row max and sum
-    for (uint kb = 0u; kb < nkb; kb++) {
+    for (uint kb = kb_lo; kb < nkb; kb++) {
         stage(g, kb * BC, nt, tid, false);
         barrier();
         if (mm) {
@@ -131,7 +139,7 @@ void main() {
         float sv[4], bm = -1e30;
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
             uint key = kb * BC + i * 16u + cl;
-            sv[i] = key <= qpos ? ss[i * 256u + row * 16u + cl] : -1e30;
+            sv[i] = key <= qpos && (win == 0u || key + win > qpos) ? ss[i * 256u + row * 16u + cl] : -1e30;
             bm = max(bm, sv[i]);
         }
         bm = subgroupClusteredMax(bm, 16u);
@@ -149,7 +157,7 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Oa[NDS];
     [[unroll]] for (uint u = 0u; u < NDS; u++) Oa[u] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> PA;
-    for (uint kb = 0u; kb < nkb; kb++) {
+    for (uint kb = kb_lo; kb < nkb; kb++) {
         stage(g, kb * BC, nt, tid, false);
         barrier();
         if (mm) {
@@ -164,7 +172,7 @@ void main() {
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
             uint key = kb * BC + i * 16u + cl;
             float s = ss[i * 256u + row * 16u + cl];
-            sp[i * 256u + row * 16u + cl] = float16_t(key <= qpos ? exp(s - m) : 0.0);
+            sp[i * 256u + row * 16u + cl] = float16_t(key <= qpos && (win == 0u || key + win > qpos) ? exp(s - m) : 0.0);
         }
         stage(g, kb * BC, nt, tid, true);
         barrier();

@@ -645,6 +645,11 @@ void qt_trunk_withdraw(const char *why){
 /* qt_reserve: device bytes the engine places after the tier sized itself (qwen36_tier.h) */
 static size_t G_reserve;
 void qt_reserve(size_t bytes){ G_reserve = bytes; }
+/* qt_reserve_short: bytes kept out of a device's expert budget only when it holds fewer than
+ * `experts` of them (a chain's staging of the experts the RAM keeps, which with every expert on
+ * the card would hold memory for nothing) */
+static size_t G_reserve_short, G_short_experts;
+void qt_reserve_short(size_t bytes, size_t experts){ G_reserve_short = bytes; G_short_experts = experts; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -1091,6 +1096,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
         G_trunk_bytes[i] = trunk;                 /* by expert-device index, for qt_stats */
         G.budget[i] = G_trunk_only ? 0 : cap_i > trunk ? cap_i - trunk : 0;
+        if(G_reserve_short && G.ndev == 1 && G.budget[i] && G.budget[i]/G.exp_bytes < G_short_experts){
+            G.budget[i] = G.budget[i] > G_reserve_short ? G.budget[i] - G_reserve_short : 0;
+            fprintf(stderr,"[qtier] dev %d: %.2f GB kept for a prompt chunk's experts from the host pool (fewer than all %zu fit)\n",
+                    G.dev[i], G_reserve_short/1073741824.0, G_short_experts);
+        }
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
                 trunk ? " after trunk" : "");
@@ -1326,35 +1336,41 @@ static void qt_lfru_tick_locked(void);
  * the layer before) and running them there beats the host's step. The engine's RAM cache serves
  * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
  * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
- * recycled), the RAM copy is expert_ffn.h's planar int4 per 64, one device, and the backend's
- * f16 GEMMs read that layout (coli_cuda_planar_rows); COLI_CUDA_HOST_POOL=0 off. */
+ * recycled), one device, and the RAM copy is a layout the device's GEMMs read: expert_ffn.h's
+ * planar int4 per 64 (coli_cuda_planar_rows), or a GGUF's rows as the file has them (gate, up
+ * and down back to back, no scales; the engine holds them so when this tier takes a GGUF's
+ * experts). COLI_CUDA_HOST_POOL=0 off. */
 static int G_host_on = -1;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
     const char *e = getenv("COLI_CUDA_HOST_POOL");
-    G_host_on = !(e && *e == '0') && G.on && !G_stream && !G_trunk_only && G_src_planar && G.wfmt == 4 && G.egs == 64 &&
-                G.ndev == 1 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih);
+    G_host_on = !(e && *e == '0') && G.on && !G_stream && !G_trunk_only && G.ndev == 1 &&
+                ((G_src_planar && G.wfmt == 4 && G.egs == 64 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih)) || G.wfmt == QT_GGUF);
     return G_host_on;
 }
+/* a host pool expert's bytes: its matrices (three of mb, a GGUF's gate, up and down) and scales */
+static size_t host_w_bytes(int layer){ return G.wfmt == QT_GGUF ? 2*G_gmb[layer] + G_gmbd[layer] : 3*((size_t)G.D*G.Ih/2); }
+static size_t host_s_bytes(void){ return G.wfmt == QT_GGUF ? 0 : (2*G.sc_gu + G.sc_d)*sizeof(float); }
 void qt_note_host(int layer,int eid,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || !gs || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
-    size_t mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+    const int gg = G.wfmt == QT_GGUF;
+    if(!G.on || !g4 || (!gs && !gg) || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
+    size_t mb = gg ? G_gmb[layer] : (size_t)G.D*G.Ih/2, wb = host_w_bytes(layer), sb = host_s_bytes();
     /* one block each: the three matrices and the three scale arrays, as the engine's slot holds them */
-    if(u4 != g4 + mb || d4 != g4 + 2*mb || us != gs + G.sc_gu || ds != gs + 2*G.sc_gu) return;
+    if(u4 != g4 + mb || d4 != g4 + 2*mb || (!gg && (us != gs + G.sc_gu || ds != gs + 2*G.sc_gu))) return;
     pthread_mutex_lock(&G.mx);
     QSlot *s = qs(layer,eid);
     int skip = !host_pool_on() || s->hreg || G.th_stop;   /* decided once, under the lock (the warm start's threads) */
-    if(!skip){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+    if(!skip){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gg?NULL:gs; s->us=gg?NULL:us; s->ds=gg?NULL:ds; }
     pthread_mutex_unlock(&G.mx);
     if(skip) return;
-    if(!coli_cuda_host_register((void *)g4, 3*mb)) return;
-    if(!coli_cuda_host_register((void *)gs, sb)){ coli_cuda_host_unregister((void *)g4); return; }
+    if(!coli_cuda_host_register((void *)g4, wb)) return;
+    if(sb && !coli_cuda_host_register((void *)gs, sb)){ coli_cuda_host_unregister((void *)g4); return; }
     pthread_mutex_lock(&G.mx);
     s->hreg = 1; G.epoch++; if(G.chg_on) G.chg_over=1;
-    G_host_n++; G_host_bytes += 3*mb + sb;
+    G_host_n++; G_host_bytes += wb + sb;
     pthread_mutex_unlock(&G.mx);
 }
 int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,size_t *sb){
@@ -1363,8 +1379,8 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     QSlot *s = qs(layer,eid);
     int r = s->hreg;
     if(r){
-        *w = s->g4; *wb = 3*((size_t)G.D*G.Ih/2);
-        *sc = s->gs; *sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+        *w = s->g4; *wb = host_w_bytes(layer);
+        *sc = s->gs; *sb = host_s_bytes();
     }
     pthread_mutex_unlock(&G.mx);
     return r;

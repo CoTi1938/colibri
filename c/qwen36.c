@@ -3527,6 +3527,18 @@ static void gguf_expert_held(Model *m, GqExp *x) {
     if (tot > m->gqe_max) m->gqe_max = tot;
 }
 static int gguf_expert_ilv(const GqExp *x) { return x->hg != x->tg || x->hu != x->tu || x->hd != x->td; }
+/* The CUDA expert tier takes a GGUF's experts as the file has them: the RAM slots then hold the
+ * file's rows too, not the rows interleaved by 16. The tier reads them in place (an interleaved
+ * slot unpacked each into a second buffer of its own: Flint UD-Q3_K_XL, an 18.5 GB file, took
+ * 30.6 GB of RSS), the host pool copies a prompt chunk's experts from them to the device, and
+ * the CPU computes its experts eight rows at a time (gq_rows_f8). Before any slot is filled. */
+static void gguf_hold_file_rows(Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) {
+        GqExp *x = &m->gqx[i];
+        x->hg = x->tg; x->hu = x->tu; x->hd = x->td;
+        x->hb_g = x->eb_g; x->hb_u = x->eb_u; x->hb_d = x->eb_d;
+    }
+}
 
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
@@ -6182,6 +6194,16 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+/* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
+ * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
+ * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
+ * experts' buffers and took the host's step from then on. COLI_CUDA_HOST_POOL=0: none. */
+static void q36_gguf_stage_reserve(Model *m) {
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    size_t st = g_gguf && !(e && *e == '0') ? q36cc_gguf_stage_bytes(m) : 0, routed = 0;
+    for (int i = 0; i < m->c.n_layers; i++) routed += !q36_dense_l(&m->c, i);
+    if (st) qt_reserve_short(st, routed * (size_t)m->c.n_experts);
+}
 #endif
 
 /* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
@@ -9051,8 +9073,10 @@ int main(int argc, char **argv) {
     /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
      * its budget: out of the tier's allowance, or the tier fills the card and the chain's
      * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
-    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
+        q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
+    }
 #endif
 #ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
@@ -9067,7 +9091,10 @@ int main(int argc, char **argv) {
                  q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
+            gguf_tier = 1;   /* the slots' rows stay */
+            gguf_hold_file_rows(&m);
+        }
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);

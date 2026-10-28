@@ -488,6 +488,17 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
+On sm_80 and later `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
+and sum): a block of four warps takes 64 query rows (the query heads of a kv head dividing
+64), so a block of keys is staged once for four times the rows, and its scores never leave
+the registers. The m16n8k16 accumulator is the A operand's layout, so exp(s - m) goes from
+a score tile straight into P V, and each row's output fragments are rescaled as its max
+moves. Windows, rings and sinks as `cc_attn_fk` takes them; head dim 256 reads Q from
+shared memory each block (the registers hold O). Flint at 16K tokens (RTX PRO 4000): the
+attention 9.6 s -> 1.09 s, the prompt 671 -> 1032 tok/s before the host pool's GGUF
+staging; Qwen3.6 UD-Q4_K_M 796 -> 1956 tok/s at 16K with both.
+`COLI_CUDA_CHAIN_FLASH2=0` keeps `cc_attn_fk`.
+
 On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
 `hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
 card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
@@ -670,6 +681,35 @@ after a 2000-token prompt (200 tokens scored): 1.7567 nats every expert in VRAM,
 host pool, 1.7555 the host's step. The staging takes about 450 MB of VRAM here;
 without room for it the chain says so once and the chunk keeps the host's step.
 `COLI_CUDA_HOST_POOL=0` keeps the host's step for a prompt's non-resident experts.
+
+**A GGUF's experts** take the same road. When the tier takes them (`qt_init_gguf`), the
+engine holds the file's rows in RAM instead of the rows interleaved by 16, so the tier and
+the host pool read them in place and the CPU computes its share eight rows at a time
+(`gq_rows_f8`). An interleaved slot had unpacked each expert into a second buffer of its
+own: Flint UD-Q3_K_XL (an 18.5 GB file) took 30.6 GB of RSS, 19.1 GB now. The staging holds
+a layer's experts at the largest layer's three matrices, 256-byte aligned: one copy an
+expert where its gate and up end on 256 bytes, three otherwise. A layer whose rows are not
+whole words keeps the host's step. The tier keeps the staging out of its expert budget
+when not every routed expert fits (`qt_reserve_short`). Taken from the mirrors' room
+instead, a 16K prompt found no memory for the routed experts' buffers and the chain took
+the host's step from then on. Where the mirrors or a step's buffers still lack memory, the
+staging gives its VRAM back.
+
+Before, a GGUF's prompt computed its non-resident experts on the CPU while the device
+waited: 1.8 s a 4096-row chunk for the last two layers of Flint on a whole RTX PRO 4000,
+and 58 tok/s with 7 GiB free. Measured on the RTX PRO 4000 (tok/s; the reference GGUF
+engine on the same card in the last column):
+
+| Flint UD-Q3_K_XL | before | the host pool and `cc_attn_f2` | reference |
+|---|---|---|---|
+| 7 GiB free, 1K tokens | 60 | 512 | 317 |
+| 7 GiB free, 4K tokens | 58 | 1696 | 378 |
+| whole card, 1K tokens | 758 | 1577 | 1852 |
+| whole card, 4K tokens | 1011 | 2344 | 2060 |
+| whole card, 16K tokens | 715 | 2276 | 1988 |
+
+Decode is the same: 111.5 against 111.3 tok/s on the whole card, and 50.9 against 53.3
+with 7 GiB free.
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 

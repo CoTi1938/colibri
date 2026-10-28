@@ -52,6 +52,31 @@ static void ref_rope(float *x, const float *cs, const CcRope *p) {
         for (int j = 0; j < p->half_; j++) { float c = cb[2 * j], s = cb[2 * j + 1], a = base[j], b = base[j + p->half_]; base[j] = a * c - b * s; base[j + p->half_] = b * c + a * s; }
     }
 }
+/* ref_attn with a sliding window of win positions (0: all), a sink logit per head
+ * (snk[sink_off + h], NULL: none) and a ring of `ring` rows (position t in row t % ring; 0: none) */
+static void ref_attn_w(const float *q, const float *kc, const float *vc, float *o, const CcAttn *p, int win, const float *snk,
+                       int sink_off, int ring) {
+    int rep = p->H / p->KVH;
+    std::vector<float> sv((size_t)p->pos_base + p->S);
+    for (int s = 0; s < p->S; s++) for (int h = 0; h < p->H; h++) {
+        int kvh = h / rep, pos = p->pos_base + s, lo = win > 0 && pos - win + 1 > 0 ? pos - win + 1 : 0;
+        const float *qs = q + p->q_off + s * p->q_row + h * p->q_seg;
+        float m = snk ? snk[sink_off + h] : -3.0e38f;
+        for (int t = lo; t <= pos; t++) {
+            const float *kb = kc + p->k_off + (size_t)(kvh * p->cap + (ring ? t % ring : t)) * p->hd; float a = 0.f;
+            for (int d = 0; d < p->hd; d++) a += qs[d] * kb[d];
+            sv[t] = a * p->scale; if (sv[t] > m) m = sv[t];
+        }
+        double l = snk ? exp((double)snk[sink_off + h] - m) : 0.0, acc[256] = {0};
+        for (int t = lo; t <= pos; t++) {
+            double e = exp((double)sv[t] - m); l += e;
+            const float *vb = vc + p->v_off + (size_t)(kvh * p->cap + (ring ? t % ring : t)) * p->hd;
+            for (int d = 0; d < p->hd; d++) acc[d] += e * vb[d];
+        }
+        float *ob = o + p->o_off + s * p->o_row + h * p->hd;
+        for (int d = 0; d < p->hd; d++) ob[d] = (float)(acc[d] / l);
+    }
+}
 static void ref_attn(const float *q, const float *kc, const float *vc, float *o, const float *gate, const int *sel, const CcAttn *p) {
     int rep = p->H / p->KVH;
     for (int s = 0; s < p->S; s++) for (int h = 0; h < p->H; h++) {
@@ -612,6 +637,33 @@ int main(void) {
             ck(d < 4e-3f, what);
             printf("  %s: max |diff| %.2e\n", what, d);
             T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+        }
+    }
+    {   /* a prompt chunk with a sliding window and a sink per head (Flint), its cache linear or a
+         * ring: the tensor cores where the device has them (within 4e-3 of the reference) */
+        struct { int H, KV, hd, S, pos_base, win, ring; } cs[] = {{32, 4, 128, 300, 700, 129, 0}, {32, 4, 128, 90, 900, 129, 230},
+                                                                  {16, 2, 256, 70, 300, 100, 0}, {8, 8, 64, 33, 0, 20, 0},
+                                                                  {32, 4, 128, 200, 0, 513, 0}};
+        for (auto &k : cs) {
+            const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+            std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 71), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 72),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 73), sk = rnd((size_t)k.H + so, 74, 2.f);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            CcAttnW w = {a, k.win, 1, so};
+            ref_attn_w(q.data(), kc.data(), vc.data(), ref.data(), &a, k.win, sk.data(), so, k.ring);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *ob = T->buf(o.size() * 4, CC_DEV);
+            char what[160];
+            snprintf(what, sizeof what, "prompt rows, window %d and sinks: H %d KV %d hd %d, %d rows after %d%s", k.win, k.H, k.KV, k.hd,
+                     k.S, k.pos_base, k.ring ? ", a ring" : "");
+            float d = 1e30f;
+            int ok = T->begin() && (k.ring ? T->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof T->attn_wr && T->attn_wr(qb, kb, vb, ob, NULL, sb, &w, k.ring)
+                                           : T->attn_w(qb, kb, vb, ob, NULL, sb, &w)) && T->submit(1);
+            if (ok) d = maxdiff(down(ob, o.size()).data(), ref.data(), o.size());
+            ck(d < 4e-3f, what);
+            printf("  %s: max |diff| %.2e\n", what, d);
+            T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
         }
     }
     printf("dnconv\n");
