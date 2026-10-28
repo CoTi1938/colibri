@@ -204,17 +204,30 @@ void main() {
         int c = tid % NVW, grp = tid / NVW;
         vec4 acc[GQ], acc2[GQ];
         for (int g = 0; g < GQ; g++) { acc[g] = vec4(0.0); acc2[g] = vec4(0.0); }
-        for (int j = grp; j < cnt; j += NGW) {
+        // four positions' loads in flight, then their sums in position order (one at a time's bits)
+        int j = grp;
+        for (; j + 3 * NGW < cnt; j += 4 * NGW) {
+            vec4 va[4], vb[4];
+            [[unroll]] for (int u4 = 0; u4 < 4; u4++) {
+                int t = first + t0 + j + u4 * NGW, r = p.ring > 0 ? t % p.ring : t;
+                int vb4 = (p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4;
+                if (KV16) {
+                    uvec4 u = vc16[vb4 / 2 + c];
+                    va[u4] = vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); vb[u4] = vec4(unpackHalf2x16(u.z), unpackHalf2x16(u.w));
+                } else { va[u4] = vc4[vb4 + 2 * c]; vb[u4] = vc4[vb4 + 2 * c + 1]; }
+            }
+            [[unroll]] for (int u4 = 0; u4 < 4; u4++)
+                for (int g = 0; g < GQ; g++) { float w = sc[g * 256 + j + u4 * NGW]; acc[g] += w * va[u4]; acc2[g] += w * vb[u4]; }
+        }
+        for (; j < cnt; j += NGW) {
             int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
             int vb4 = (p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4;
+            vec4 v0, v1;
             if (KV16) {
                 uvec4 u = vc16[vb4 / 2 + c];
-                vec4 v0 = vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)), v1 = vec4(unpackHalf2x16(u.z), unpackHalf2x16(u.w));
-                for (int g = 0; g < GQ; g++) { float w = sc[g * 256 + j]; acc[g] += w * v0; acc2[g] += w * v1; }
-            } else {
-                vec4 v0 = vc4[vb4 + 2 * c], v1 = vc4[vb4 + 2 * c + 1];
-                for (int g = 0; g < GQ; g++) { float w = sc[g * 256 + j]; acc[g] += w * v0; acc2[g] += w * v1; }
-            }
+                v0 = vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); v1 = vec4(unpackHalf2x16(u.z), unpackHalf2x16(u.w));
+            } else { v0 = vc4[vb4 + 2 * c]; v1 = vc4[vb4 + 2 * c + 1]; }
+            for (int g = 0; g < GQ; g++) { float w = sc[g * 256 + j]; acc[g] += w * v0; acc2[g] += w * v1; }
         }
         for (int k = NGW - 1; k >= 1; k--) {   // the groups' sums into group 0's, the last group first
             if (grp == k)

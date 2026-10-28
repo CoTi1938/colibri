@@ -1751,7 +1751,21 @@ __global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__rest
     float4 acc[G];
 #pragma unroll
     for (int g = 0; g < G; g++) acc[g] = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int j = grp; j < cnt; j += NG) {
+    /* four positions' loads in flight, then their sums in position order (the bits of one at a time) */
+    int j = grp;
+    for (; j + 3 * NG < cnt; j += 4 * NG) {
+        float4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; u++) { int t = t0 + j + u * NG; v[u] = cc_kv4(vc, p.v_off + (size_t)(kbase + (ring ? t % ring : t)) * hd + 4 * c); }
+#pragma unroll
+        for (int u = 0; u < 4; u++)
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float w = sc[g * 256 + j + u * NG];
+                acc[g].x += w * v[u].x; acc[g].y += w * v[u].y; acc[g].z += w * v[u].z; acc[g].w += w * v[u].w;
+            }
+    }
+    for (; j < cnt; j += NG) {
         float4 v = cc_kv4(vc, p.v_off + (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * hd + 4 * c);
 #pragma unroll
         for (int g = 0; g < G; g++) {
