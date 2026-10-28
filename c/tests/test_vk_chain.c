@@ -3058,8 +3058,13 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
             for (size_t i = 0; i < (size_t)S * D; i++) { double d = fabs((double)a[i] - b[i]); if (d > mx) mx = d; if (fabs(a[i]) > ref) ref = fabs(a[i]); }
             CHECK(mx <= (coop ? 2e-3 * ref : 1e-4 * (ref > 1 ? ref : 1)), "moe rows %s/%s S %d%s: max |diff| %.3g of %.3g against chain_moe",
                   gq_type_name(tg), gq_type_name(td), S, coop ? " (matrix units)" : "", mx, ref);
+            int wide = s1.grp_wide > s0.grp_wide;
             printf("moe rows %s/%s S %d K %d E %d%s: max |diff| %.3g of %.3g against chain_moe\n", gq_type_name(tg), gq_type_name(td), S, K, E,
-                   coop ? " on the matrix units" : "", mx, ref);
+                   wide ? " on the matrix units' wider item" : coop ? " on the matrix units" : "", mx, ref);
+            /* the wider item (qmatmul_grp*_bdcw) from 32 rows an expert on average */
+            const char *we = getenv("COLI_VK_GRP_WIDE");
+            if (coop && !(we && *we)) CHECK(wide == (S * K >= 32 * E), "moe rows %s/%s S %d K %d E %d: %s the wider item", gq_type_name(tg),
+                                            gq_type_name(td), S, K, E, wide ? "on" : "not on");
             if (coop) {   /* an x a thousand times that: the hidden far past 65504, the sums finite */
                 for (size_t i = 0; i < (size_t)S * D; i++) x[i] *= 1000.f;
                 int okb = vkc_begin() && vkc_write(xb, 0, x, (size_t)S * D * 4) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
@@ -3264,6 +3269,9 @@ done:
     }
     free(t); free(ex); free(tab); free(wg); free(wu); free(wd);
 }
+/* where the matrix units take a prompt's GEMM: 1 when this call must be on qmatmul_gemm_bdcw.comp's
+ * 128 tile, 0 when on qmatmul_gemm_bdc.comp's 64, -1 unchecked */
+static int g_bd_wide = -1;
 static void test_matmul_bd(int t, int S, int I, int O) {
     int fmt = 100 + t, bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
     int64_t rbs = gq_row_bytes(t, I);
@@ -3285,6 +3293,8 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     vkc_stats(&st1);
     vkc_moe_set_idot(-1);
     int coop = st1.tile_gemms > st0.tile_gemms;   /* qmatmul_gemm_bdc.comp: f16 weights and x */
+    if (g_bd_wide >= 0 && coop) CHECK((st1.tile_wide > st0.tile_wide) == g_bd_wide, "matmul_bd %s S %d [%d x %d]: %s the 128 tile",
+                              gq_type_name(t), S, O, I, g_bd_wide ? "not on" : "on");
     float *y = down(yb, 0, (size_t)S * O), *ref = malloc((size_t)S * O * sizeof *ref);
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
@@ -3335,6 +3345,12 @@ static void test_bd(void) {
         test_matmul_bd(t, 1, 16640, 9);     /* x past the staging (16 KiB floats at most): read from the buffer */
         test_matmul_bd(t, 70, 1280, 33);    /* a prompt's rows: the tiled GEMM, partial tiles both ways */
         test_matmul_bd(t, 130, 2560, 160);
+        {   /* on the matrix units, the 128 tile from 128 rows for the types with no IQ grid */
+            int wide = t != GQ_IQ2_XXS && t != GQ_IQ2_XS && t != GQ_IQ3_XXS && t != GQ_IQ3_S && t != GQ_IQ2_S;
+            g_bd_wide = 0; test_matmul_bd(t, 127, 1280, 200);
+            g_bd_wide = wide; test_matmul_bd(t, 128, 1280, 128); test_matmul_bd(t, 300, 2560, 200);
+            g_bd_wide = -1;
+        }
         if ((int)k < nstep) { test_matmul_bd_i8(t, 1, 2560, 130); test_matmul_bd_i8(t, 3, 1280, 33); test_matmul_bd_i8(t, 4, 256, 70); }
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
@@ -3681,7 +3697,8 @@ static void bench_xb(void) {
 /* COLI_VK_CHAIN_BENCH=rows: a prompt chunk's routed experts (vkc_route + vkc_moe_rows) at
  * Qwen3.6's shapes in our int4-g64 (D 2048, I 512, 256 experts, top 8), S rows
  * (COLI_VK_BENCH_ROWS, 467), L layers of experts of their own (COLI_VK_BENCH_L, 4) each
- * its own route, so the weights come from memory; COLI_VK_BENCH_FMTS "fmt gs" sets the format */
+ * its own route, so the weights come from memory; COLI_VK_BENCH_FMTS "fmt gs" sets the format
+ * (100 + a ggml type: a GGUF's blocks, random, for the time) */
 static void bench_rows(void) {
     int D = 2048, I = 512, E = 256, K = 8, S = 467, L = 4, fmt = 4, gs = 64;
     const char *re = getenv("COLI_VK_BENCH_ROWS"), *le = getenv("COLI_VK_BENCH_L"), *fe = getenv("COLI_VK_BENCH_FMTS");
@@ -3689,7 +3706,9 @@ static void bench_rows(void) {
     if (le && atoi(le) > 0) L = atoi(le);
     if (fe && *fe) sscanf(fe, "%d %d", &fmt, &gs);
     if (!vkc_moe_rows_ready(fmt, fmt) || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench rows: not on this device\n"); return; }
-    size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
+    int blk = fmt >= 100;
+    size_t rg = blk ? coli_vk_tensor_row_bytes(fmt, D) : fmt == 1 ? (size_t)D : (size_t)D / 2;
+    size_t rd = blk ? coli_vk_tensor_row_bytes(fmt, I) : fmt == 1 ? (size_t)I : (size_t)I / 2;
     size_t ng = fmt == 4 ? (size_t)D / gs : 1, nd = fmt == 4 ? (size_t)I / gs : 1;
     uint8_t *wg = malloc(rg * I), *wd = malloc(rd * D);
     float *sg = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
@@ -3700,12 +3719,13 @@ static void bench_rows(void) {
     int ok = wg && wd && sg && sd && t && ex && tab;
     for (size_t i = 0; ok && i < rg * I; i++) wg[i] = (uint8_t)rnd();
     for (size_t i = 0; ok && i < rd * D; i++) wd[i] = (uint8_t)rnd();
+    if (blk) { gs = 0; for (size_t i = 0; i < rg * I; i++) wg[i] &= 0x3B; for (size_t i = 0; i < rd * D; i++) wd[i] &= 0x3B; }   /* small f16 scales */
     for (size_t i = 0; ok && i < (size_t)I * ng; i++) sg[i] = 0.002f;
     for (size_t i = 0; ok && i < (size_t)D * nd; i++) sd[i] = 0.002f;
     int g = fmt == 4 ? gs : 0;
     for (int e = 0; e < n && ok; e++)
-        ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wg, sg, fmt, D, I, g) &&
-             coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+        ok = coli_vk_tensor_ensure(&t[3 * e], wg, blk ? NULL : sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wg, blk ? NULL : sg, fmt, D, I, g) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], wd, blk ? NULL : sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
              coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
     if (ok) {
         float *lg = fvec((size_t)L * S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
@@ -3724,7 +3744,7 @@ static void bench_rows(void) {
             double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
             if (r && dt < best) best = dt;
         }
-        double bytes = (double)E * ((double)2 * (rg * I + I * ng * 4) + rd * D + D * nd * 4);
+        double bytes = (double)E * ((double)2 * (rg * I + (blk ? 0 : I * ng * 4)) + rd * D + (blk ? 0 : D * nd * 4));
         if (ok) printf("bench rows fmt %d gs %d, S %d K %d E %d D %d I %d: %.0f us a layer (its experts %.0f MB: %.0f GB/s)\n",
                        fmt, gs, S, K, E, D, I, best * 1e6 / L, bytes / 1e6, bytes * L / best / 1e9);
         else printf("bench rows: the frame failed\n");
@@ -4282,6 +4302,11 @@ int main(int argc, char **argv) {
         test_moe_rows(GQ_IQ2_XS, GQ_IQ2_XS, 40, 4, 12, 512, 256);
         test_moe_rows(GQ_IQ3_XXS, GQ_Q3_K, 40, 4, 12, 512, 256);
         test_moe_rows(GQ_IQ1_M, GQ_Q2_K, 40, 4, 12, 512, 256);
+        /* rows enough for the wider item: tiles of 64 rows, partial ones, an output block past D */
+        test_moe_rows(GQ_Q4_K, GQ_Q6_K, 200, 4, 12, 512, 256);
+        test_moe_rows(GQ_IQ2_XXS, GQ_IQ3_S, 200, 4, 12, 512, 256);
+        test_moe_rows(GQ_Q8_0, GQ_Q8_0, 300, 8, 16, 576, 320);
+        test_moe_rows(GQ_IQ4_XS, GQ_IQ2_S, 144, 4, 12, 512, 256);
         /* and our own formats: int8 rows, int4 rows, int4 per 64 and per 32 (qmatmul_grp_q.comp) */
         test_moe_rows_q(1, 0, 40, 4, 12, 512, 256);
         test_moe_rows_q(2, 0, 40, 4, 12, 512, 256);
