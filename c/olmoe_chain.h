@@ -522,14 +522,22 @@ static int olc_dmoe(OlmChain *ch, Model *m, int rows) {
  * that ran their experts in it into the host's cache, and their books. */
 static void olc_dmoe_done(OlmChain *ch, Model *m, int from, int to, int n, int pb) {
     Cfg *c = &m->c; int D = c->hidden, H = c->n_heads, hd = c->head_dim, K = c->topk, r = ch->kvl_rows;
+    /* the K/V rows into the host's cache, every layer's and head's at once: a 3.5K-token
+     * prompt's 900 MB went in one thread after the frame while the device waited (the first
+     * 3K-token prompt on an RTX PRO 4000: 0.75 -> 0.63 s) */
+    #pragma omp parallel for collapse(2) schedule(static) if ((size_t)n * (to - from) >= 64)
+    for (int i = from; i < to; i++)
+        for (int h = 0; h < H; h++) {
+            if (!vkc_dmoe_on(&ch->dm, i)) continue;
+            const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
+            for (int s = 0; s < n; s++) {
+                size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
+                memcpy(m->V[i] + dst, kv + (size_t)r * D + src, hd * sizeof(float));
+            }
+        }
     for (int i = from; i < to; i++) {
         if (!vkc_dmoe_on(&ch->dm, i)) continue;
-        const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
-        for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
-            size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-            memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
-            memcpy(m->V[i] + dst, kv + (size_t)r * D + src, hd * sizeof(float));
-        }
         const int *ids = vkc_dmoe_ids(&ch->dm, i);
         if (!m->hot_pinned) for (int s = 0; s < n; s++) rt_count(i, ids + s * K, K);
         pthread_mutex_lock(&g_pilot_mx);
@@ -624,11 +632,13 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
             if (dmoe) olc_dmoe_done(ch, m, from, i, n, pb);
             from = i + 1; prev_dev = 0;
             const float *kv = (const float *)vkc_ptr(ch->kvd);   /* the rows into the host's cache */
-            for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
-                size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
-                memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
-                memcpy(m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd * sizeof(float));
-            }
+            #pragma omp parallel for schedule(static) if (n >= 64)
+            for (int h = 0; h < H; h++)
+                for (int s = 0; s < n; s++) {
+                    size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+                    memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
+                    memcpy(m->V[i] + dst, kv + (size_t)ch->rows * D + src, hd * sizeof(float));
+                }
             const float *xa = pilot ? (const float *)vkc_ptr(ch->xpd) : NULL;
             if (pilot && i + 1 < c->n_layers) pilot_prefetch(m, i + 1, xa, n);   /* the model's next layers, wherever they run */
             double t1 = now_s();
