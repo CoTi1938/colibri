@@ -1431,6 +1431,7 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
         ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
+}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     if (ch->dm_fmt >= 100) return q36cc_stage_table_gguf(ch, m);
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
