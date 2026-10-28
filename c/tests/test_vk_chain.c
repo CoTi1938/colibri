@@ -209,8 +209,8 @@ static void test_rope(void) {
 }
 
 /* vkc_copy_regions: a prompt chunk's K rows into a head-major cache (a region per row and
- * head: a grid, one dispatch from 64 regions), the same few (the copy command), a list off
- * the grid (the copy command), and a grid with COLI_VK_COPY_GRID=0; exact. */
+ * head: a grid, one dispatch), the same few (one dispatch too: a grid whole), a list off the
+ * grid (the copy command), and a grid with COLI_VK_COPY_GRID=0; exact. */
 static void test_copy_regions(int S, int H, int hd, int DR, int pb, int shuffle, int env_off) {
     size_t ns = (size_t)S * H * hd, nd = (size_t)H * DR * hd;
     float *src = fvec(ns, 1.f), *ref = fvec(nd, 1.f);
@@ -226,7 +226,7 @@ static void test_copy_regions(int S, int H, int hd, int DR, int pb, int shuffle,
     vkc_stats(&b);
     if (env_off) unsetenv("COLI_VK_COPY_GRID");
     float *y = down(db, 0, nd);
-    int grid = S * H >= 64 && !shuffle && !env_off, same = !memcmp(y, ref, nd * sizeof(float));
+    int grid = S * H >= 2 && !shuffle && !env_off, same = !memcmp(y, ref, nd * sizeof(float));
     CHECK(ok && same && (b.copy_grids - a.copy_grids) == (unsigned long long)grid,
           "copy_regions S %d H %d hd %d%s%s: %s, %llu grid dispatches (want %d)", S, H, hd, shuffle ? " off the grid" : "",
           env_off ? " COLI_VK_COPY_GRID=0" : "", same ? "same" : "differs", b.copy_grids - a.copy_grids, grid);
@@ -3488,6 +3488,40 @@ static void bench_disp(void) {
     vkc_free(a); for (int i = 0; i < 16; i++) vkc_free(bs[i]); free(x);
 }
 
+/* COLI_VK_CHAIN_BENCH=small: a decode step's small ops at OLMoE's shapes (D 2048, 16 heads of
+ * 128), 400 a frame, each reading the one before: what one costs on the device */
+static void bench_small(void) {
+    const int n = 400, H = 16, hd = 128;
+    const char *de = getenv("COLI_VK_BENCH_D");
+    const int D = de && atoi(de) >= 256 ? atoi(de) : 2048;
+    float *x = fvec((size_t)2 * D, 1.f), *cs = fvec(hd, 1.f), *w = fvec((size_t)2 * D, 1.f);
+    VkcBuf *a = up(x, 2 * D), *b = up(x, 2 * D), *cb = up(cs, hd), *wb = up(w, 2 * D), *kc = vkc_buf((size_t)H * 64 * hd * 4, VKC_DEV);
+    VkcRegion rg[16];
+    for (int h = 0; h < H; h++) rg[h] = (VkcRegion){(size_t)h * 64 * hd + 5 * hd, (size_t)h * hd, (size_t)hd};
+    const char *name[] = {"norm (1 row)", "norm (q and k: 2 rows, 2 weights)", "rope (16 heads)", "copy (2048 floats)",
+                          "copy_regions (16 of 128)", "ew add (2048)"};
+    for (int k = 0; k < 6; k++) {
+        double best = 1e9; int ok = 1;
+        for (int r = 0; r < 5 && ok; r++) {
+            vkc_begin();
+            for (int i = 0; i < n && ok; i++) {
+                VkcBuf *src = i % 2 ? b : a, *dst = i % 2 ? a : b;
+                if (k == 0) { VkcNorm p = {1, D, 1, 0, D, D, 0, D, D, 0, 0, 0, 1e-6f, 1.f}; ok = vkc_norm(src, wb, dst, &p); }
+                else if (k == 1) { VkcNorm p = {2, D, 2, 0, 2 * D, D, 0, 2 * D, D, 0, 2, 0, 1e-6f, 1.f}; ok = vkc_norm(src, wb, dst, &p); }
+                else if (k == 2) { VkcRope p = {H, H, 0, D, hd, hd / 2, 0, hd}; ok = vkc_rope(src, cb, &p); }
+                else if (k == 3) ok = vkc_copy(dst, 0, src, 0, D);
+                else if (k == 4) ok = vkc_copy_regions(kc, src, rg, H);
+                else { VkcEw e = {VKC_EW_ADD, D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f}; ok = vkc_ew(dst, src, dst, NULL, NULL, &e); }
+            }
+            double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+            if (dt < best) best = dt;
+        }
+        if (ok) printf("bench small: %s, %.2f us a dispatch\n", name[k], best * 1e6 / n);
+        else printf("bench small: %s refused\n", name[k]);
+    }
+    vkc_free(a); vkc_free(b); vkc_free(cb); vkc_free(wb); vkc_free(kc); free(x); free(cs); free(w);
+}
+
 /* COLI_VK_CHAIN_BENCH=adec: a decode step's attention over many positions (chain_attn_dec) at
  * Qwen3.6's shapes, each of n layers its own K and V (a forward's rows come from memory);
  * COLI_VK_BENCH_ADEC "H KVH hd positions" sets them */
@@ -3959,6 +3993,7 @@ int main(int argc, char **argv) {
     if (!vkc_init()) { printf("FAIL: the chain's pipelines did not come up\n"); return 1; }
     if (getenv("COLI_VK_CHAIN_BENCH")) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
+        if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "small")) bench_small();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "xb")) bench_xb();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
@@ -4026,7 +4061,8 @@ int main(int argc, char **argv) {
     test_chunk_rows();
     test_copy_regions(100, 4, 32, 256, 7, 0, 0);   /* a prompt chunk's grid */
     test_copy_regions(70, 1, 48, 128, 3, 0, 0);    /* one head: rows alone */
-    test_copy_regions(3, 4, 32, 64, 0, 0, 0);      /* a few: the copy command */
+    test_copy_regions(3, 4, 32, 64, 0, 0, 0);      /* a few: one dispatch, a grid whole */
+    test_copy_regions(3, 4, 32, 64, 0, 1, 0);      /* a few off the grid: the copy command */
     test_copy_regions(100, 4, 32, 256, 7, 1, 0);   /* off the grid */
     test_copy_regions(100, 4, 32, 256, 7, 0, 1);   /* COLI_VK_COPY_GRID=0 */
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);

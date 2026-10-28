@@ -1037,7 +1037,10 @@ int vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n) {
  * a copy command with 16384 regions of 512 bytes took 3.3 ms on an RTX PRO 4000 (OLMoE,
  * a chunk of 1024 rows, four of them a layer). Regions on a grid (one length; the
  * destination and the source moving by fixed steps along an inner and an outer index)
- * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. */
+ * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. A
+ * shorter list takes one dispatch when it is a grid whole: a decode step's 16 regions of 512
+ * bytes (OLMoE's heads) took 8.3 us as a copy command, 1.46 us as a dispatch. A list that is
+ * no grid keeps the copy command rather than many small dispatches. */
 #define VKC_CP2_MIN 64
 static struct { VkShaderModule mod; VkPipeline pipe, pipe_h; int tried, tried_h; } g_cp2[2];
 #define CP2 (g_cp2[g_kd])
@@ -1064,8 +1067,8 @@ static void cp2_shutdown(void) {
 }
 typedef struct { uint32_t d0, s0; int32_t dh, sh, dq, sq; uint32_t len, per, n; } VkcCp2;
 /* the regions' grid, when they are one: region i = (q, h) = (i / per, i % per) */
-static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g) {
-    if (n < VKC_CP2_MIN || !r[0].n) return 0;
+static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g, int min) {
+    if (n < min || n < 2 || !r[0].n) return 0;
     long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
     long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
     int per = 1;
@@ -1116,12 +1119,20 @@ int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
         }
     VkcCp2 g;
     const char *e = getenv("COLI_VK_COPY_GRID");   /* 0: every list through the copy command */
+    if (dst != src && !(e && *e == '0') && n >= 2 && n < VKC_CP2_MIN && cp2_pipe() && cp2_grid(r, n, &g, 2)) {
+        KC.kind = PK_COPY;   /* a short list that is one grid */
+        VkcBind bd[2] = {B(src, 0), B(dst, 1)};
+        uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
+        if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) return 0;
+        KC.st.copy_grids++;
+        return 1;
+    }
     const int grids = dst != src && !(e && *e == '0') && n >= VKC_CP2_MIN && cp2_pipe();
     VkBufferCopy *c = NULL;
     int nc = 0;
     for (int i = 0; i < n; ) {   /* each grid of VKC_CP2_MIN regions or more in a launch, the rest in one copy */
         int k = grids ? cp2_run(r + i, n - i) : n - i;
-        if (grids && k >= VKC_CP2_MIN && cp2_grid(r + i, k, &g)) {
+        if (grids && k >= VKC_CP2_MIN && cp2_grid(r + i, k, &g, VKC_CP2_MIN)) {
             KC.kind = PK_COPY;
             VkcBind bd[2] = {B(src, 0), B(dst, 1)};
             uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
@@ -1162,7 +1173,7 @@ int vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
     for (int i = 0; i < n; ) {
         int k = cp2_run(r + i, n - i);
         VkcCp2 g;
-        if (!(k >= 2 && cp2_grid(r + i, k, &g))) {
+        if (!cp2_grid(r + i, k, &g, 2)) {
             k = 1;
             g = (VkcCp2){(uint32_t)r[i].dst, (uint32_t)r[i].src, 0, 0, 0, 0, (uint32_t)r[i].n, 1, 1};
         }
