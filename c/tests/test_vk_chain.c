@@ -1725,7 +1725,7 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
                   rid + (size_t)s * K, rw + (size_t)s * K);
     VkcBuf *lb = up(lg, (size_t)S * lrow), *bb = up(bias, (size_t)E + 5);
     VkcBuf *ib = vkc_buf((size_t)(S * irow + 4) * 4, VKC_DEV), *wb = vkc_buf((size_t)(S * wrow + 4) * 4, VKC_DEV);
-    VkcRoute rp = {S, E, K, kind, 1, lrow, 2, has_bias, 3, irow, 1, wrow, ng, tg, norm, temp, scale, eps};
+    VkcRoute rp = {S, E, K, kind, 1, lrow, 2, has_bias, 3, irow, 1, wrow, ng, tg, norm, temp, scale, eps, 0};
     int ok = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
     float *gi = down(ib, 3, (size_t)S * irow), *gw = down(wb, 1, (size_t)S * wrow);
     int same = 1; double worst = 0;
@@ -1858,7 +1858,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *tb = vkc_buf((size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4, VKC_DEV);
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
-    VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
+    VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f, 0};
     VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0, 0, 0, 0, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
@@ -3049,7 +3049,7 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0, 0};
         VkcMoeRows rr = {0};
         vkc_moe_set_idot(0);   /* against chain_moe's float form: the grouped GEMMs' sums */
@@ -3123,7 +3123,7 @@ static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) 
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
         VkcMoeRows rr = {0};
         VkcStats s0, s1; vkc_stats(&s0);
@@ -3219,7 +3219,7 @@ static void test_moe_i8(int tg, int td, int S, int K, int E, int D, int I) {
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DOWN);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0, 0};
         VkcStats s0, s1; vkc_stats(&s0);
         vkc_moe_set_idot(1);
@@ -3608,7 +3608,7 @@ static void bench_moe(void) {
         VkcBuf *lb = up(lg, (size_t)S * E * nl), *xb = up(x, (size_t)S * D);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
-        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, !ours, fg, fd, E, 0, 0};   /* block-format experts, or ours */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
         double best = 1e9;
@@ -3780,7 +3780,7 @@ static void bench_rows(void) {
         for (int r = 0; r < 4 && ok; r++) {
             ok = vkc_begin();
             for (int l = 0; l < L && ok; l++) {
-                VkcRoute rp = {S, E, K, 0, l * S * E, E, 0, 0, l * S * K, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+                VkcRoute rp = {S, E, K, 0, l * S * E, E, 0, 0, l * S * K, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
                 VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, l * E, 0, D, l * S * K, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
                 ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_moe_rows(xb, ib, wb, tb, &rr, yb, &mp);
             }
@@ -3840,7 +3840,7 @@ static void bench_route(void) {
     for (int r = -1; r < 5 && ok && lb && ib && wb; r++) {   /* r -1 untimed */
         vkc_begin();
         for (int l = 0; l < nl && ok; l++) {
-            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
             ok = vkc_route(lb, NULL, ib, wb, &rp);
         }
         double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
