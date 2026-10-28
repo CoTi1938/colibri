@@ -666,6 +666,95 @@ int main(void) {
             T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
         }
     }
+    {   /* a decode's or a verify's rows with a window and a sink per head (Flint) after many positions:
+         * in blocks of positions, a KV head's query heads a block, float32 (within 1e-4); a verify's
+         * rows each a one-row step's bits */
+        struct { int H, KV, hd, S, pos_base, win, ring; } cs[] = {{32, 4, 128, 1, 17000, 0, 0}, {32, 4, 128, 3, 5000, 128, 0},
+                                                                  {32, 4, 128, 1, 4000, 200, 236}, {16, 2, 256, 4, 2000, 0, 0}};
+        for (auto &k : cs) {
+            const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+            std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 81), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 82),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 83), sk = rnd((size_t)k.H + so, 84, 2.f);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            CcAttnW w = {a, k.win, 1, so};
+            ref_attn_w(q.data(), kc.data(), vc.data(), ref.data(), &a, k.win, sk.data(), so, k.ring);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *ob = T->buf(o.size() * 4, CC_DEV);
+            const int wr = k.ring && T->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof T->attn_wr;
+            auto run = [&](CcBuf *out, const CcAttnW *x) {
+                return T->begin() && (k.ring ? wr && T->attn_wr(qb, kb, vb, out, NULL, sb, x, k.ring) : T->attn_w(qb, kb, vb, out, NULL, sb, x)) &&
+                       T->submit(1);
+            };
+            char what[160];
+            snprintf(what, sizeof what, "decode rows, window %d and sinks: H %d KV %d hd %d, %d rows after %d%s", k.win, k.H, k.KV, k.hd,
+                     k.S, k.pos_base, k.ring ? ", a ring" : "");
+            float d = 1e30f;
+            if (run(ob, &w)) d = maxdiff(down(ob, o.size()).data(), ref.data(), o.size());
+            ck(d < 1e-4f, what);
+            printf("  %s: max |diff| %.2e\n", what, d);
+            if (k.S > 1) {
+                std::vector<float> all = down(ob, o.size());
+                CcBuf *o1 = T->buf((size_t)k.H * k.hd * 4, CC_DEV);
+                int same = 1;
+                for (int r = 0; r < k.S && same; r++) {
+                    CcAttnW w1 = w; w1.a.S = 1; w1.a.pos_base = k.pos_base + r; w1.a.q_off = r * a.q_row; w1.a.o_off = 0;
+                    same = run(o1, &w1) && !memcmp(down(o1, (size_t)k.H * k.hd).data(), all.data() + (size_t)r * k.H * k.hd, (size_t)k.H * k.hd * 4);
+                }
+                ck(same, "and each row a one-row step's bits");
+                T->free(o1);
+            }
+            T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
+        }
+    }
+    {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
+         * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
+         * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
+        if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+        else {
+            struct { int H, KV, hd, S, pos_base, win, ring, sink; } cs[] = {
+                {16, 2, 256, 3, 2500, 0, 0, 0}, {8, 8, 128, 4, 700, 0, 0, 0}, {16, 2, 256, 70, 33, 0, 0, 0}, {4, 2, 64, 40, 0, 0, 0, 0},
+                {32, 4, 128, 1, 4000, 200, 236, 1}, {32, 4, 128, 90, 900, 129, 230, 1}, {32, 4, 128, 3, 5000, 128, 0, 1}};
+            for (auto &k : cs) {
+                const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+                std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 91), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 92),
+                                   vc = rnd(kc.size(), 93), sk = rnd((size_t)k.H + so, 94, 2.f), o((size_t)k.S * k.H * k.hd);
+                kv16_round(kc.data(), (int64_t)kc.size()); kv16_round(vc.data(), (int64_t)vc.size());
+                std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+                kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+                CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *o32 = T->buf(o.size() * 4, CC_DEV), *o16 = T->buf(o.size() * 4, CC_DEV);
+                CcBuf *khb = T->buf(kh.size() * 2, CC_DEV), *vhb = T->buf(vh.size() * 2, CC_DEV);
+                int ok = khb && vhb && T->begin() && T->write(khb, 0, kh.data(), kh.size() * 2) && T->write(vhb, 0, vh.data(), vh.size() * 2) &&
+                         T->submit(1);
+                CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                            1.f / sqrtf((float)k.hd), k_off, k_off};
+                CcAttnW w = {a, k.win, k.sink, so};
+                if (k.win || k.sink)
+                    ok = ok && T->begin() && (k.ring ? T->attn_wr(qb, kb, vb, o32, NULL, sb, &w, k.ring) : T->attn_w(qb, kb, vb, o32, NULL, sb, &w)) &&
+                         T->attn_wh(qb, khb, vhb, o16, NULL, sb, &w, k.ring) && T->submit(1);
+                else ok = ok && T->begin() && T->attn(qb, kb, vb, o32, NULL, NULL, &a) && T->attn_h(qb, khb, vhb, o16, NULL, NULL, &a) && T->submit(1);
+                char what[160];
+                snprintf(what, sizeof what, "a float16 cache: H %d KV %d hd %d, %d rows after %d%s%s: a float32 cache's bits", k.H, k.KV, k.hd,
+                         k.S, k.pos_base, k.win ? ", a window and sinks" : "", k.ring ? " in a ring" : "");
+                ck(ok && !memcmp(down(o32, o.size()).data(), down(o16, o.size()).data(), o.size() * 4), what);
+                T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(o32); T->free(o16); T->free(khb); T->free(vhb);
+            }
+            /* copy_regions_h: a step's K rows into a head-major cache (a grid), and one region alone */
+            const int n = 5, KV = 2, kvd = 64, rows = 20, pb = 7;
+            std::vector<float> src = rnd((size_t)n * KV * kvd, 95);
+            std::vector<CcRegion> rg;
+            for (int s2 = 0; s2 < n; s2++)
+                for (int h = 0; h < KV; h++) rg.push_back(CcRegion{((size_t)h * rows + pb + s2) * kvd, (size_t)s2 * KV * kvd + (size_t)h * kvd, (size_t)kvd});
+            rg.push_back(CcRegion{(size_t)KV * rows * kvd - 10, 3, 10});
+            std::vector<uint16_t> want((size_t)KV * rows * kvd, 0), got(want.size());
+            for (auto &r : rg) kv16_pack(want.data() + r.dst, src.data() + r.src, (int64_t)r.n);
+            CcBuf *sbuf = up(src), *dbuf = T->buf(want.size() * 2, CC_DEV);
+            int ok = dbuf && T->begin() && T->copy_regions_h(dbuf, sbuf, rg.data(), (int)rg.size()) && T->submit(1) &&
+                     T->read(dbuf, 0, got.data(), got.size() * 2);
+            ck(ok && got == want, "copy_regions_h: a grid of rows and a region alone, each value its float16");
+            T->free(sbuf); T->free(dbuf);
+        }
+    }
     printf("dnconv\n");
     {
         const int CD = 200, CK = 4, S = 5, PD = CD + 16;

@@ -9091,6 +9091,8 @@ int main(int argc, char **argv) {
                  q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
+        /* each expert in a slot of its own layer's size (COLI_CUDA_EXACT_SLOTS=0: the largest layer's) */
+        { const char *xs = getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(!(xs && *xs == '0')); }
         if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
             gguf_tier = 1;   /* the slots' rows stay */
             gguf_hold_file_rows(&m);
