@@ -367,7 +367,11 @@ both the same way:
   The host routes, runs the routed experts through the tier (`moe_ex` routed only) and
   hands the sum up. Frame A2, not waited for: the shared expert and its gate, on the
   chain's stream while the tier's groups run on the backend's. The last frame runs the
-  final norm and lm_head on the last row, or on every row of a speculative verify.
+  final norm and lm_head on the last row, or on every row of a speculative verify; the
+  logits are written in device memory and one copy brings them to the host's buffer.
+  (Written into it directly, one float per warp over the bus, the head took 7.4 ms of a
+  13.5 ms step on an RTX PRO 4000. On an L4 the step does not get faster and the extra
+  copy costs 0.1 ms.)
 
 **What it needs.** Every projection of every layer, the shared expert's three matrices
 and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
@@ -404,14 +408,15 @@ the fake's host-side table (`tests/qwen36_fake_cuda.h`, the same arithmetic as t
 kernels): a prompt and decode tokens give the CPU path's logits (max diff 2e-5 of 20),
 the host state is untouched while the chain runs and reads back as the CPU path's, the
 K/V rows reach the host cache, a reset and a CPU step in between continue from the right
-state, a verify's three rows and the rollback of a rejected draft, a frame that fails
-(the state rebuilt, the step and the rest on the CPU, the same logits), and a backend
-without the table. `tests/test_cuda_chain.cu` (`make cuda-chain-check CUDA=1`, needs a
-device; `gpu-compile` builds it) checks every op on a real card against the same CPU
-references: buffers and frames, int8 and f32 matmuls at offsets, the four norms, RoPE,
-causal GQA with the gate and a selection list, the convolution in both orders with its
-ring and snapshot, the recurrence at KD 8 and 128 with both gates, every element-wise
-op, and a failed launch marking the device lost.
+state, a verify's three rows and the rollback of a rejected draft, the head's logits
+computed on the card and copied down (a prompt and a verify read in chunks of three and
+two rows), a frame that fails (the state rebuilt, the step and the rest on the CPU, the
+same logits), and a backend without the table. `tests/test_cuda_chain.cu`
+(`make cuda-chain-check CUDA=1`, needs a device; `gpu-compile` builds it) checks every op
+on a real card against the same CPU references: buffers and frames, int8 and f32 matmuls
+at offsets, the four norms, RoPE, causal GQA with the gate and a selection list, the
+convolution in both orders with its ring and snapshot, the recurrence at KD 8 and 128 with
+both gates, every element-wise op, and a failed launch marking the device lost.
 
 **Measured** (RTX 3070 alone, Qwen3.6-35B-A3B int4, the trunk in VRAM by `COLI_PLACE=auto`,
 expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs each):
