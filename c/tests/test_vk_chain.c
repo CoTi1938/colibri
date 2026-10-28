@@ -312,7 +312,7 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     /* chain_attn_flash's operands are f16: its bound where it may have run */
     int fl = vkc_attn_flash_rows();
     double e = relerr(o, ref, (size_t)S * H * hd, 1e-3);
-    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 16 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
     CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
           use_list, vkc_attn_block_rows(), fl, e);
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
@@ -442,7 +442,10 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
     vkc_begin(); int ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p); vkc_submit(1);
     float *o = vkc_ptr(ob);
     double e = relerr(o, ref, (size_t)S * H * vd, 1e-3);
-    CHECK(ok && e < 2e-5, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
+    /* chain_attn_flash's operands are f16: its bound where it may have run */
+    int fl = vkc_attn_flash_rows();
+    double tol = fl > 0 && S >= fl && !kv_pm && vd == hd && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
+    CHECK(ok && e < tol, "attn window S %d pos %d hd %d vd %d win %d ring %d sink %d pm %d: err %.2e",
           S, pos_base, hd, vd, win, ring, sink, kv_pm, e);
     if (S >= 16 && !getenv("COLI_VK_ATTN_SLICE")) {
         size_t bytes = (size_t)S * H * vd * sizeof(float);
@@ -3917,6 +3920,11 @@ int main(int argc, char **argv) {
         setenv("COLI_VK_ATTN_SLICE", "60000", 1);
         test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(130, 3, 4, 2, 64, 0);
         unsetenv("COLI_VK_ATTN_SLICE");
+        /* Flint's: a sliding window and a sink per head, linear and in a ring of the window and
+         * the step's rows, head dims 64 to 256; a window past every position */
+        test_attn_win(40, 0, 32, 4, 128, 128, 16, 0, 1, 0); test_attn_win(90, 900, 32, 4, 128, 128, 129, 230, 1, 0);
+        test_attn_win(70, 300, 16, 2, 256, 256, 100, 0, 1, 0); test_attn_win(33, 0, 8, 8, 64, 64, 20, 0, 1, 0);
+        test_attn_win(200, 0, 32, 4, 128, 128, 513, 0, 1, 0); test_attn_win(48, 260, 32, 4, 128, 128, 0, 0, 1, 0);
         VkcStats s1; vkc_stats(&s1);
         printf("  attention on the matrix units: %llu calls\n", s1.attn_flash - s0.attn_flash);
     }
