@@ -719,11 +719,20 @@ static void frame_reclaim(VkcFrame *f) {
     f->cur_pool = 0;
 }
 /* A frame is milliseconds of work and the thread waiting on it has nothing else to do:
- * poll the fence for up to COLI_VK_CHAIN_SPIN_US (2000 us) before blocking, whose
- * wake-up costs 50 to 150 us per frame, two frames a layer. */
+ * poll the fence for up to COLI_VK_CHAIN_SPIN_US before blocking, whose wake-up costs 50 to
+ * 150 us per frame, two frames a layer. On a discrete card 50 ms, a whole decode step: at 2 ms
+ * the host slept through each step's last frames and woke after the device had run dry
+ * (Qwen3.6 UD-Q4_K_M on an RTX PRO 4000 decoded 76.5 tok/s, 90.7 polling to the end; the
+ * device idle about 1 ms a token between steps). An integrated GPU shares the package's power
+ * with the cores: 2 ms there. */
 static long chain_spin_us(void) {
     static long v = -1;
-    if (v < 0) { const char *e = getenv("COLI_VK_CHAIN_SPIN_US"); v = e && *e ? atol(e) : 2000; if (v < 0) v = 0; }
+    if (v < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_SPIN_US");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        v = e && *e ? atol(e) : pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 50000 : 2000;
+        if (v < 0) v = 0;
+    }
     return v;
 }
 static int frame_wait(VkcFrame *f) {
@@ -2497,6 +2506,10 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
         int t = p->gfmt - 100, kq = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14;
         int wide = kq || (long long)p->K * ((p->I + 63) / 64) >= 128;
         rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
+        /* Q6_K's down at 4 steps: its step's decode wants more lanes a row (an RTX PRO 4000,
+         * D 2048 I 512 K 8: 27.4 -> 20.9 us; D 2560 I 640 K 10 34.1 -> 32.3; the other types
+         * the same or slower) */
+        if (p->dfmt == 114) sd = 4;
     }
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */
