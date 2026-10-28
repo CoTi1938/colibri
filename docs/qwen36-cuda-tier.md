@@ -430,6 +430,25 @@ lane, the activation in shared memory) reads them at 330-418 GB/s, and the devic
 of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
 groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
 
+### Decode after a long prompt
+
+A decode step reads every position's K and V once a layer, and after a long prompt that is
+most of the step's attention. On an RTX PRO 4000 it was the widest gap to the reference
+GGUF engine (decode tok/s after a prompt of 1K / 18K tokens):
+
+| | before | a KV head's heads a block | and float16 mirrors | reference |
+|---|---|---|---|---|
+| Qwen3.6 UD-Q4_K_M | 101.3 / 74.5 | 101.4 / 84.8 | 101.4 / 89.8 | 103.8 / 94.7 |
+| Flint UD-Q3_K_XL | 100.8 / 65.4 | 102.5 / 79.2 | 102.7 / 86.2 | 100.6 / 90.0 |
+
+- `cc_attn_decg_k` (`COLI_CUDA_ATTN_DEC_GQA`): the decode's blocks of positions take the
+  query heads of a KV head at once, each K and V row read once for them (eight times
+  before, at Qwen3.6's and Flint's grouping), four floats a load.
+- Float16 mirrors (`COLI_CUDA_KV16`): the host's cache is float16, and the mirrors held its
+  values as float32. They now hold them as float16, and every attention kernel reads a cache
+  of either type. The numbers are the same, so the greedy answers are the same, in half the
+  VRAM: a window's or sinks' model's tier keeps half the room for them out of its budget.
+
 ### The routed experts in the frame (`COLI_CUDA_CHAIN_MOE`, on by default)
 
 The chain above still ended its frame at every MoE layer: the router's logits down, the
