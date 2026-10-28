@@ -1835,7 +1835,9 @@ static void up_zero(int dev, VkDeviceMemory mem, uint64_t cap) {
 /* The primary device's pools are addressable when bufferDeviceAddress is on (the
  * expert batch's grouped GEMM reads expert weights through an address table). */
 static int pool_bda(const VkWPool *P) { return P->dev == 0 && G.has_bda; }
-/* Block memory for a pool (lock held). */
+/* Block memory for a pool (lock held). A block the driver refuses (vkAllocateMemory or
+ * vkMapMemory) marks its size in P->refused, see pool_suballoc; a failure of calloc or of
+ * COLI_VK_STAGED_FAULT=block, a test's one-off failure, does not. */
 static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     VkBlk *bk = calloc(1, sizeof(*bk));
     if (!bk) return NULL;
@@ -1855,7 +1857,7 @@ static VkBlk *pool_new_block(VkWPool *P, uint64_t cap) {
     if (vkAllocateMemory(dev, &ai, NULL, &bk->mem) != VK_SUCCESS ||
         (!staged && vkMapMemory(dev, bk->mem, 0, cap, 0, (void **)&bk->base) != VK_SUCCESS)) {
         if (bk->mem) vkFreeMemory(dev, bk->mem, NULL);
-        free(bk); return NULL;
+        free(bk); P->refused = cap; return NULL;   /* the driver's no: not asked again (pool_suballoc) */
     }
     if (staged) up_zero(P->dev, bk->mem, cap);
     return bk;
@@ -1898,7 +1900,6 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
             cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
         int ask = vka_pool_can_grow(&P->p, cap) && cap >= req.size && !(P->refused && cap >= P->refused);
         VkBlk *bk = ask ? pool_new_block(P, cap) : NULL;
-        if (ask && !bk) P->refused = cap;
         if (bk) {
             if (vka_pool_add_block(&P->p, cap, bk) < 0) {
                 if (bk->base) vkUnmapMemory(dev, bk->mem);
