@@ -1398,6 +1398,9 @@ static CcBuf *q36cc_dm_tab(Q36CChain *ch, int i, int n, int *part) {
     *part = ch->dm_part[i];
     return ch->dm_tab;
 }
+/* the places the staged layers take in turn: a staged table that writes none (dm_slots 0, a
+ * GGUF's) has one */
+static int q36cc_places(const Q36CChain *ch) { return ch->dm_slots > 1 ? ch->dm_slots : 1; }
 /* whether layer i of a step on table tab stages its experts, and the copy of the skip-th such layer
  * from layer i on (1: the first) into its place in the staging (none: nothing to copy); with one
  * place the calls are fetch, fetch_wait and fetch_done, with two their _at ones */
@@ -1439,8 +1442,8 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     }
     ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || q36cc_fetch_wait(ch, i)) &&
          cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
-    if (ok && stg) ok = q36cc_fetch_done(ch, i) && q36cc_stage_from(ch, m, i + 1, ch->dm_slots);   /* the sum below reads no weights;
-                                                                          * the next layer for this place: dm_slots staged layers on */
+    if (ok && stg) ok = q36cc_fetch_done(ch, i) && q36cc_stage_from(ch, m, i + 1, q36cc_places(ch));   /* the sum below reads no weights;
+                                                                          * the next layer for this place: q36cc_places staged layers on */
     if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
     CcMoe ms = mp; ms.parts = 2; ms.h_off = *v ? 0 : -1;
     ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
@@ -1597,7 +1600,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
          * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
         if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
         if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb)   /* the first staged layers' copies, one for each place */
-            for (int s = 1; s <= ch->dm_slots; s++) if (!q36cc_stage_from(ch, m, 0, s)) goto lost;
+            for (int s = 1; s <= q36cc_places(ch); s++) if (!q36cc_stage_from(ch, m, 0, s)) goto lost;
         int ok = 1, pending = 0, pend_i = -1, dm_ids_defer = 0;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */

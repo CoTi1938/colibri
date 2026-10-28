@@ -660,7 +660,8 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   (`2 * hmax <= n_experts`), so the residents and the chunk size are what they were; the
   memory left for the KV mirrors is one place smaller than with one place (161 MB on the
   T4). The line `stages the host pool's experts in` says how many places and how many
-  experts each.
+  experts each. A staged table that sets no places (a GGUF's, which writes none) has one
+  (`q36cc_places`).
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).

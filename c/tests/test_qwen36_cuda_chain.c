@@ -184,6 +184,10 @@ int main(void) {
     ck(q36cc_stage_slots(91, 256) == 2 && q36cc_stage_slots(128, 256) == 2 && q36cc_stage_slots(129, 256) == 1 &&
        q36cc_stage_slots(190, 256) == 1 && q36cc_stage_slots(256, 256) == 1 && q36cc_stage_slots(0, 256) == 1,
        "the staging has two places where two layers' worth fit in a layer's, else one");
+    static Q36CChain zp;   /* zeroed, as a staged table that writes no places leaves it */
+    ck(q36cc_places(&zp) == 1, "a staged table that sets no places copies its layers in one");
+    zp.dm_slots = 2; ck(q36cc_places(&zp) == 2, "two places stay two");
+    zp.dm_slots = 1; ck(q36cc_places(&zp) == 1, "one place stays one");
     Model ref; build_model(&ref, &w);
     place_trunk(&ref, &w);        /* the reference uses the same resident copies, matrix by matrix */
     Model m; build_model(&m, &w);
