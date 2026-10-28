@@ -127,6 +127,7 @@
 #include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
 #include "serve_budget.h"
+#include "argmax_first.h"   /* serve_sample's greedy pick */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -3275,7 +3276,7 @@ static int sample_prob_desc(const void *a,const void *b){
     return d>0?1:d<0?-1:0;
 }
 static int sample_tok(const float *lo, int V, float temp, float top_p){
-    if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
+    if(temp<=0.f) return argmax_first(lo, V);
     SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
