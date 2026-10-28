@@ -334,6 +334,44 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
     return ok ? t : NULL;
 }
 
+/* COLI_CUDA_CHAIN_BENCH=adec: one decode row's attention over L = 10 layers of caches of their
+ * own, float16 (attn_h; COLI_CUDA_BENCH_KV16=0 float32), COLI_CUDA_BENCH_ADEC "H KVH hd pos"
+ * (Qwen3.6's 16 2 256 18000 by default): the time a layer, the best of five frames */
+static void bench_adec(void) {
+    int H = 16, KVH = 2, hd = 256, pos = 18000, n = 10;
+    const char *sh = getenv("COLI_CUDA_BENCH_ADEC"), *k16 = getenv("COLI_CUDA_BENCH_KV16");
+    if (sh && *sh) sscanf(sh, "%d %d %d %d", &H, &KVH, &hd, &pos);
+    int h16 = !(k16 && *k16 == '0') && T->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h && T->kvh();
+    size_t kv = (size_t)KVH * (pos + 1) * hd;
+    std::vector<float> q = rnd((size_t)H * hd, 5), k = rnd(kv, 6);
+    std::vector<uint16_t> kh(kv);
+    kv16_round(k.data(), (int64_t)kv); kv16_pack(kh.data(), k.data(), (int64_t)kv);
+    CcBuf *qb = up(q), *ob = T->buf((size_t)H * hd * 4, CC_DEV), *kb[10], *vb[10];
+    int ok = qb && ob;
+    for (int l = 0; l < n; l++) {
+        kb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV); vb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV);
+        ok = ok && kb[l] && vb[l] && T->begin() && T->write(kb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) &&
+             T->write(vb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) && T->submit(1);
+    }
+    double best = 1e9;
+    for (int r = 0; r < 5 && ok; r++) {
+        ok = T->begin();
+        for (int l = 0; l < n && ok; l++) {
+            CcAttn a = {1, H, KVH, hd, pos, pos + 1, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
+            ok = h16 ? T->attn_h(qb, kb[l], vb[l], ob, NULL, NULL, &a) : T->attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        ok = T->submit(1) && ok;
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (dt < best) best = dt;
+    }
+    if (ok) printf("bench adec H %d/%d hd %d at %d positions%s: %.1f us a layer (%.1f GB/s of K and V)\n", H, KVH, hd, pos,
+                   h16 ? ", float16" : "", best * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best / 1e9);
+    else printf("bench adec: the frame failed\n");
+    for (int l = 0; l < n; l++) { T->free(kb[l]); T->free(vb[l]); }
+    T->free(qb); T->free(ob);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -342,6 +380,8 @@ int main(void) {
     if (!T) return 1;
     ck(T->init(0), "a context on device 0");
     ck(T->ready() && !T->lost(), "ready, not lost");
+    const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
+    if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
 
     printf("buffers and frames\n");
     {

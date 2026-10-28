@@ -1721,9 +1721,15 @@ static VkPipeline adg_pipe(int hd, int gq) {
     if (KC.nadg == VKC_ADG_MAX) return VK_NULL_HANDLE;
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
     if (((size_t)gq * (hd + 256 + 64) + hd) * 4 > pp.limits.maxComputeSharedMemorySize) return VK_NULL_HANDLE;
-    int32_t sv[3] = {gq, hd, g_kvh};
-    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}};
-    VkSpecializationInfo si = {3, me, sizeof sv, sv};
+    /* two threads a position for the scores at head dims of 256, one below; the same for
+     * either cache, whose bits stay equal. One layer after 18K positions (float16): a Radeon
+     * 780M's 64 lanes of 512-byte rows 1463 -> 1025 us at two, its 128 dims 1241 -> 1452 (one
+     * kept); an RTX PRO 4000 125.5 -> 121.8 us, its 128 dims 131.1 -> 129.6 */
+    const char *te = getenv("COLI_VK_ATTN_DEC_TPP");
+    int tpp = te && (*te == '1' || *te == '2') ? *te - '0' : hd >= 256 ? 2 : 1;
+    int32_t sv[4] = {gq, hd, g_kvh, tpp};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {7, 8, 4}, {2, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof sv, sv};
     VkPipeline p = make_pipe(KC.mod_adec, &si);
     if (!p) return VK_NULL_HANDLE;
     KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_kv[KC.nadg] = g_kvh; KC.adg_gq[KC.nadg++] = gq;
