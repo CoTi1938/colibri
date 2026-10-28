@@ -444,6 +444,12 @@ GGUF engine (decode tok/s after a prompt of 1K / 18K tokens):
 - `cc_attn_decg_k` (`COLI_CUDA_ATTN_DEC_GQA`): the decode's blocks of positions take the
   query heads of a KV head at once, each K and V row read once for them (eight times
   before, at Qwen3.6's and Flint's grouping), four floats a load.
+  Its scores take two threads a position (`COLI_CUDA_ATTN_DEC_TPP`), adjacent lanes reading
+  a K row's float4s in turn against the q rows in shared memory, where a warp's lanes over
+  one row summed each head with five shuffles a position; the join takes each block's weight
+  once into shared memory instead of once a value. One layer after 18K positions in float16
+  (`COLI_CUDA_CHAIN_BENCH=adec` in `tests/test_cuda_chain.cu`): Qwen3.6's 119.5 -> 108.6 us,
+  Flint's 144.5 -> 122.1; after 60K, Qwen3.6's 391 -> 379.
 - Float16 mirrors (`COLI_CUDA_KV16`): the host's cache is float16, and the mirrors held its
   values as float32. They now hold them as float16, and every attention kernel reads a cache
   of either type. The numbers are the same, so the greedy answers are the same, in half the
