@@ -712,7 +712,13 @@ whole words keeps the host's step. The tier keeps the staging out of its expert 
 when not every routed expert fits (`qt_reserve_short`). Taken from the mirrors' room
 instead, a 16K prompt found no memory for the routed experts' buffers and the chain took
 the host's step from then on. Where the mirrors or a step's buffers still lack memory, the
-staging gives its VRAM back.
+staging gives its VRAM back. The room it leaves free for the mirrors to grow into is the
+room the tier left them: a window's or sinks' model's (Flint, Muse Spark), whose chain needs
+its mirrors whole. Another model's mirrors take the staging's memory back when they grow.
+Before, the staging left the mirrors' room at the full context free for every model:
+Qwen3.6 UD-Q4_K_M with 7 GiB free kept 1.3 GB that no one had set aside, found none to stage
+in, and read every prompt at 97 tok/s; 570 / 656 now at 1K / 4K tokens. At 16K its float32
+mirrors take the staging's memory and the prompt keeps the host's step (96 tok/s).
 
 Before, a GGUF's prompt computed its non-resident experts on the CPU while the device
 waited: 1.8 s a 4096-row chunk for the last two layers of Flint on a whole RTX PRO 4000,
@@ -729,6 +735,31 @@ engine on the same card in the last column):
 
 Decode is the same: 111.5 against 111.3 tok/s on the whole card, and 50.9 against 53.3
 with 7 GiB free.
+
+### A GGUF's experts at their own size (`COLI_CUDA_EXACT_SLOTS`, on by default)
+
+A GGUF's layers mix block types (Flint UD-Q4_K_XL: IQ3_S, Q4_K, Q5_K and Q6_K among its
+experts), and the arena gave every expert the room of the largest layer's three matrices.
+On an RTX PRO 4000 that slot was 2.45 MB for an average expert of 1.91 MB: the card held 8140
+of the model's 12032 experts. With qwen36's GGUFs on one card each expert now takes a slot of
+its own layer's matrices, carved from one allocation of the budget as the warm start fills it;
+a freed slot waits for the next expert of its size, and a swap pairs slots of one size. The
+budget counts each expert at its slot. The qwen38 chain reads the arena as slots of one size
+(`qt_chain_arena`) and does not ask for this. Measured on the RTX PRO 4000 (tok/s; prompts of
+1K, 4K and 16K tokens):
+
+| | on the card, 32K context | prompt | on the card, 8K context | decode |
+|---|---|---|---|---|
+| Flint UD-Q4_K_XL, the largest layer's slot | 7591 | 782 / 1925 / 1871 | 8140 | 66.5-73.7 |
+| the layer's own slot | 9861 | 1078 / 2096 / 2066 | 10700 | 89.9 |
+| Flint UD-Q3_K_XL, the largest layer's slot | 11520 | 1567 / 2246 / 2232 | | 105.4 |
+| the layer's own slot | 12032 | 1637 / 2295 / 2239 | | 105.2 |
+
+With 7 GiB free, Flint UD-Q3_K_XL: prompt 528 / 1762 -> 540 / 1725 tok/s at 1K / 4K, decode
+53.3 -> 54.5. Qwen3.6 UD-Q4_K_M (2 sizes, 1.82 to 1.95 MB): 1791 -> 1921 experts on the card,
+decode 46.6 -> 45.6.
+
+`COLI_CUDA_EXACT_SLOTS=0` keeps the largest layer's slot for every expert.
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 

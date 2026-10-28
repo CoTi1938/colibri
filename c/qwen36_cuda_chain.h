@@ -1360,8 +1360,11 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(3 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    /* the room the mirrors still grow into at the context's length stays free */
-    size_t fb = 0, tb = 0, full = q36cc_mirror_at(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
+    /* the room the tier left the mirrors at the context's length stays free (a window's or sinks'
+     * model's, q36cc_mirror_bytes): another model's mirrors take the staging's memory back when
+     * they grow (q36cc_stage_drop). Kept for every model, Qwen3.6 UD-Q4_K_M with 7 GiB free kept
+     * 1.3 GB that no one had set aside and found none to stage in: 97 tok/s for any prompt. */
+    size_t fb = 0, tb = 0, full = q36cc_mirror_bytes(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
     size_t left = full > held ? full - held : 0, need = (size_t)(hmax ? hmax : 1) * stride;
     if (!ch->dm_stage && coli_cuda_mem_info(ch->dev, &fb, &tb) && fb < need + left + ((size_t)256 << 20)) return 0;
     if (!stride || !cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) ||

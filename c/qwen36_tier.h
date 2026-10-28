@@ -88,6 +88,9 @@ void qt_experts_withdraw(const char *why);
  * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
 void qt_reserve(size_t bytes);
 void qt_reserve_short(size_t bytes, size_t experts);   /* out of the expert budget only when fewer than `experts` fit */
+/* A GGUF's arena slots at each layer's own size (one device; not for a chain that reads the arena
+ * as slots of one size, qt_chain_arena). Call before qt_init_gguf. */
+void qt_gguf_exact_slots(int on);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -297,6 +300,7 @@ static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
 static inline void qt_reserve(size_t b){(void)b;}
 static inline void qt_reserve_short(size_t b,size_t e){(void)b;(void)e;}
+static inline void qt_gguf_exact_slots(int on){(void)on;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}

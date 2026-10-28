@@ -151,12 +151,45 @@ static void *G_arena[QT_MAX_DEV];
 static int *G_afree[QT_MAX_DEV], G_anfree[QT_MAX_DEV], G_aslots[QT_MAX_DEV], G_arena_on;
 static size_t G_aslot, G_aoff_u, G_aoff_d;
 static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
+/* Exact slots (qt_gguf_exact_slots, one device): each expert in the room of its own layer's
+ * matrices (G_lsl bytes, up and down at G_lou and G_lod), carved from one allocation of the
+ * budget as the warm start fills it, a freed slot kept for the next expert of its size. A slot
+ * of the largest layer's left Flint UD-Q3_K_XL's average expert 18 % of it unused, UD-Q4_K_XL's
+ * 28 % (2.45 MB slots for 1.91 MB): on an RTX PRO 4000 the card held 8140 of its 12032 experts.
+ * The budget counts each expert at its slot (qt_ebytes); a swap pairs slots of one size. The
+ * qwen38 chain reads the arena as slots of one size (qt_chain_arena): it does not ask for it. */
+static int G_exact_want, G_exact;
+static size_t *G_lsl, *G_lou, *G_lod, G_lsl_min, G_abump;
+static int *G_lcls, G_ncls;                 /* a layer's size class, of G_ncls */
+static size_t **G_cfree; static int *G_cnfree, *G_ccap;   /* a class's freed slots (byte offsets) */
+void qt_gguf_exact_slots(int on){ G_exact_want = on; }
+static size_t qt_ebytes(int layer){ return G_exact ? G_lsl[layer] : G.exp_bytes; }
+static size_t qt_ebytes_min(void){ return G_exact ? G_lsl_min : G.exp_bytes; }
+/* a slot for an expert of layer l in the exact arena: a freed one of its size, else carved; -1 none */
+static long long qt_slot_take(int l){
+    int c = G_lcls[l];
+    if (G_cnfree[c] > 0) return (long long)G_cfree[c][--G_cnfree[c]];
+    if (G_abump + G_lsl[l] > (size_t)G_aslots[0] * 256u) return -1;
+    long long o = (long long)G_abump; G_abump += G_lsl[l];
+    return o;
+}
+static void qt_slot_give(int l, size_t off){
+    int c = G_lcls[l];
+    if (G_cnfree[c] == G_ccap[c]) {
+        int nc = G_ccap[c] ? 2 * G_ccap[c] : 64;
+        size_t *f = realloc(G_cfree[c], (size_t)nc * sizeof *f);
+        if (!f) return;   /* the slot is lost to the arena, not to correctness */
+        G_cfree[c] = f; G_ccap[c] = nc;
+    }
+    G_cfree[c][G_cnfree[c]++] = off;
+}
 /* A swap writes the newcomer into the victim's device buffers: a GGUF's layers of other types
  * have buffers of other sizes, and freeing them for a new upload synchronises the device,
  * which a dense chain's hybrid layer (the device waiting for the host's word, the host's next
  * launch waiting for the free) turns into a deadlock. So without the arena (whose slots take
  * any layer's types in place) a GGUF's swaps pair same-typed layers. */
 static int swap_ok(int cand_layer, int victim_layer){
+    if(G_exact) return G_lsl[cand_layer]==G_lsl[victim_layer];   /* the victim's slot holds the newcomer's matrices */
     return G.wfmt!=QT_GGUF || G_arena_on || (G_gtg[cand_layer]==G_gtg[victim_layer] && G_gtd[cand_layer]==G_gtd[victim_layer]);
 }
 /* bytes of one gate (or up) matrix and of one down matrix as the staging holds them */
@@ -321,6 +354,7 @@ static void *uploader(void *arg){
         int ok=0, inplace=0, aslot=-1;   /* a GGUF's arena slot: the victim's, or a free one */
         if(G_arena_on){
             if(ve>=0){ QSlot *v=qs(vl,ve); aslot=v->aslot-1; v->aslot=0; }
+            else if(G_exact){ long long o=qt_slot_take(layer); aslot = o<0 ? -1 : (int)(o/256); }   /* in 256-byte units */
             else { int hi=home2(layer,eid); if(G_anfree[hi]>0) aslot=G_afree[hi][--G_anfree[hi]]; }
         }
         if(ve>=0){
@@ -360,11 +394,13 @@ static void *uploader(void *arg){
 
         if(!inplace){
             if(G.wfmt==QT_GGUF && G_arena_on){
-                char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*G_aslot;
+                const size_t ou = G_exact ? G_lou[layer] : G_aoff_u, od = G_exact ? G_lod[layer] : G_aoff_d,
+                             sl = G_exact ? G_lsl[layer] : G_aslot;
+                char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*(G_exact ? 256u : G_aslot);
                 ok = aslot>=0
-                  && coli_cuda_tensor_upload_at(&tg, b,            G_aoff_u,            w,      100+G_gtg[layer], G.D,  G.Ih, dv)
-                  && coli_cuda_tensor_upload_at(&tu, b + G_aoff_u, G_aoff_d - G_aoff_u, w+mb,   100+G_gtg[layer], G.D,  G.Ih, dv)
-                  && coli_cuda_tensor_upload_at(&td, b + G_aoff_d, G_aslot - G_aoff_d,  w+2*mb, 100+G_gtd[layer], G.Ih, G.D,  dv);
+                  && coli_cuda_tensor_upload_at(&tg, b,      ou,      w,      100+G_gtg[layer], G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload_at(&tu, b + ou, od - ou, w+mb,   100+G_gtg[layer], G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload_at(&td, b + od, sl - od, w+2*mb, 100+G_gtd[layer], G.Ih, G.D,  dv);
             } else if(G.wfmt==QT_GGUF){
                 ok = coli_cuda_tensor_upload(&tg, w,      NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&tu, w+mb,   NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
@@ -402,10 +438,11 @@ static void *uploader(void *arg){
         QSlot *s=qs(layer,eid);
         if(G_arena_on && aslot>=0){
             if(ok) s->aslot=aslot+1;
+            else if(G_exact) qt_slot_give(layer, (size_t)aslot*256u);
             else { int hi=home2(layer,eid); G_afree[hi][G_anfree[hi]++]=aslot; }   /* the slot back */
         }
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; res_set(s,1); G.uploads++; if(inplace) G.inplace++; }
-        else  { int hd=home2(layer,eid); G.used[hd]-=G.exp_bytes;
+        else  { int hd=home2(layer,eid); G.used[hd]-=qt_ebytes(layer);
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
         G.inflight--;
@@ -741,6 +778,20 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
 
 /* each device's arena: as many slots as its budget holds and its homed experts need */
 static int qt_arena_up(void){
+    if(G_exact && G.ndev != 1) G_exact = 0;
+    if(G_exact){   /* one allocation of the budget (or of every homed expert's slot, if less), carved as it fills */
+        size_t all=0;
+        for(int l=0;l<G.nl;l++) all += (size_t)G.ne*G_lsl[l];
+        size_t bytes = G.budget[0] < all ? G.budget[0] : all;
+        bytes = bytes/256*256;
+        G_aslots[0]=(int)(bytes/256); G_anfree[0]=0; G_abump=0;
+        if(bytes && !(G_arena[0]=coli_cuda_pipe_alloc(G.dev[0], bytes))){ G_aslots[0]=0; G_exact=0; return 0; }
+        fprintf(stderr,"[qtier] dev %d: the GGUF experts' arena, %.2f GB in slots of their layers' sizes (%d sizes, %.2f to %.2f MB; "
+                       "the largest layer's for every expert would hold %.0f%% fewer)\n", G.dev[0], bytes/1073741824.0, G_ncls,
+                G_lsl_min/1048576.0, G_aslot/1048576.0, 100.0*(1.0 - (double)all/G.ne/G.nl/(double)G_aslot));
+        G_arena_on=1;
+        return 1;
+    }
     for(int i=0;i<G.ndev;i++){
         size_t homed=0;
         for(int l=0;l<G.nl;l++) for(int e=0;e<G.ne;e++) if(home2(l,e)==i) homed++;
@@ -912,6 +963,27 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         /* the arena's slot (qt_arena_up below): the matrices back to back, 256-byte aligned */
         G_aoff_u=qt_pad256(mg); G_aoff_d=2*G_aoff_u; G_aslot=G_aoff_d+qt_pad256(md);
         G_arena_on=0;
+        G_exact=0;
+        if(G_exact_want){   /* each layer's own slot, its sizes in classes */
+            free(G_lsl); free(G_lou); free(G_lod); free(G_lcls);
+            G_lsl=calloc((size_t)nl,sizeof(size_t)); G_lou=calloc((size_t)nl,sizeof(size_t)); G_lod=calloc((size_t)nl,sizeof(size_t));
+            G_lcls=calloc((size_t)nl,sizeof(int));
+            size_t *cl=calloc((size_t)nl,sizeof(size_t));
+            if(G_lsl && G_lou && G_lod && G_lcls && cl){
+                G_ncls=0; G_lsl_min=0;
+                for(int l=0;l<nl;l++){
+                    size_t pg=(G_gmb[l]+3*(size_t)Ih)/4*4, pd=(G_gmbd[l]+3*(size_t)D)/4*4;
+                    G_lou[l]=qt_pad256(pg); G_lod[l]=2*G_lou[l]; G_lsl[l]=G_lod[l]+qt_pad256(pd);
+                    if(!G_lsl_min || G_lsl[l]<G_lsl_min) G_lsl_min=G_lsl[l];
+                    int c=0; while(c<G_ncls && cl[c]!=G_lsl[l]) c++;
+                    if(c==G_ncls) cl[G_ncls++]=G_lsl[l];
+                    G_lcls[l]=c;
+                }
+                G_cfree=calloc((size_t)G_ncls,sizeof *G_cfree); G_cnfree=calloc((size_t)G_ncls,sizeof(int)); G_ccap=calloc((size_t)G_ncls,sizeof(int));
+                G_exact = G_cfree && G_cnfree && G_ccap;
+            }
+            free(cl);
+        }
         { const char *ae=getenv("QT_GGUF_ARENA"); if(!(ae && *ae=='0')) G.exp_bytes=G_aslot; }   /* 0: a cudaMalloc a matrix (tests) */
     }
 
@@ -1096,13 +1168,16 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
         G_trunk_bytes[i] = trunk;                 /* by expert-device index, for qt_stats */
         G.budget[i] = G_trunk_only ? 0 : cap_i > trunk ? cap_i - trunk : 0;
-        if(G_reserve_short && G.ndev == 1 && G.budget[i] && G.budget[i]/G.exp_bytes < G_short_experts){
+        /* with exact slots the experts' count at their layers' average slot */
+        size_t per = G.exp_bytes;
+        if(G_exact){ size_t all=0; for(int l=0;l<G.nl;l++) all+=G_lsl[l]; per = all/(size_t)G.nl; }
+        if(G_reserve_short && G.ndev == 1 && G.budget[i] && per && G.budget[i]/per < G_short_experts){
             G.budget[i] = G.budget[i] > G_reserve_short ? G.budget[i] - G_reserve_short : 0;
             fprintf(stderr,"[qtier] dev %d: %.2f GB kept for a prompt chunk's experts from the host pool (fewer than all %zu fit)\n",
                     G.dev[i], G_reserve_short/1073741824.0, G_short_experts);
         }
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
-                G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
+                G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/per,
                 trunk ? " after trunk" : "");
     }
     if(G.wfmt==QT_GGUF && G.exp_bytes==G_aslot && !G_trunk_only && !qt_arena_up()){
@@ -1555,7 +1630,7 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
  * the tier places, swaps and computes none (qt_note*, qt_issue and qt_chain_resident answer
  * nothing), its uploads in flight done first. */
 int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
-    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0]) return 0;
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || G_exact) return 0;   /* slots of one size only */
     *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
     return 1;
 }
@@ -1608,11 +1683,11 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     if(s->resident||s->queued||!s->g4) return 0;
     if(G.qn>=QT_QCAP){ G.q_full_skips++; return 0; }
     int hd=home2(layer,eid);
-    if(!reserved && v_eid<0 && G.used[hd]+G.exp_bytes>G.budget[hd]) return 0;
+    if(!reserved && v_eid<0 && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
     /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales */
     uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
     if(!w||!sc){ free(w); free(sc); return 0; }
-    if(!reserved && v_eid<0) G.used[hd]+=G.exp_bytes;
+    if(!reserved && v_eid<0) G.used[hd]+=qt_ebytes(layer);
     s->queued=1;
     stage(w,sc,layer,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
@@ -1638,7 +1713,7 @@ static void stream_promote_locked(int layer,int eid){
     QSlot *s=qs(layer,eid);
     if(s->resident||s->queued) return;
     int hd=home2(layer,eid);
-    if(G.used[hd]+G.exp_bytes<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
+    if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]){ enqueue_locked(layer,eid,-1,-1,0); return; }
     size_t n=(size_t)G.nl*G.ne; int cold=-1; uint32_t ch=0;
     for(size_t i=0;i<n;i++){
         QSlot *c=&G.slot[i];
@@ -1693,7 +1768,7 @@ int qt_note_wanted(int layer,int eid){
     QSlot *s=qs(layer,eid);
     if(s->resident || s->queued) return 0;
     int hd=home2(layer,eid);
-    if(G.used[hd]+G.exp_bytes<=G.budget[hd]) return 1;
+    if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]) return 1;
     return G_cold_heat[hd]!=0xFFFFFFFFu && tier_should_promote(s->heat+1,G_cold_heat[hd]);
 }
 void qt_note_heat(int layer,int eid){
@@ -1738,11 +1813,11 @@ int qt_fill_next(int *layer,int *eid){
         int gi=G.fill_order[G.fill_cur];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
         QSlot *s=qs(l,e);
-        int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
+        int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+qt_ebytes_min()<=G.budget[i]) full=0;
         if(full){ pthread_mutex_unlock(&G.mx); return 0; }
         G.fill_cur++;
         if(s->resident||s->queued) continue;
-        if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;   /* dieses Device voll */
+        if(G.used[hd]+qt_ebytes(l)>G.budget[hd]) continue;   /* dieses Device voll */
         *layer=l; *eid=e;
         pthread_mutex_unlock(&G.mx);
         return 1;
@@ -1775,15 +1850,15 @@ int qt_plan_fill(int *layers,int *eids,int max){
         G.fill_cur=0;
     }
     while((size_t)G.fill_cur<n && cnt<max){
-        int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+G.exp_bytes<=G.budget[i]) full=0;
+        int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+qt_ebytes_min()<=G.budget[i]) full=0;
         if(full) break;
         int gi=G.fill_order[G.fill_cur++];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
         if(G.off && G.off[l]) continue;   /* a layer with no experts (Flint's dense ones) */
         QSlot *s=qs(l,e);
         if(s->resident||s->queued||s->planned) continue;
-        if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;
-        G.used[hd]+=G.exp_bytes;          /* reserve */
+        if(G.used[hd]+qt_ebytes(l)>G.budget[hd]) continue;
+        G.used[hd]+=qt_ebytes(l);         /* reserve */
         s->planned=1;
         layers[cnt]=l; eids[cnt]=e; cnt++;
     }
@@ -1808,7 +1883,7 @@ void qt_note_planned(int layer,int eid,
          * both keeps the bytes out of the budget for the life of the process
          * and "if(resident||queued||planned) continue" never reconsiders the
          * expert. #1331 was this leak for every expert of an int8 container. */
-        if(s->planned){ G.used[home2(layer,eid)]-=G.exp_bytes; s->planned=0; }
+        if(s->planned){ G.used[home2(layer,eid)]-=qt_ebytes(layer); s->planned=0; }
         pthread_mutex_unlock(&G.mx);
         return;
     }
@@ -1817,7 +1892,7 @@ void qt_note_planned(int layer,int eid,
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     if(!enqueue_locked(layer,eid,-1,-1,1)){
         /* not enqueueable (e.g. already resident): return the reservation */
-        if(s->planned) G.used[home2(layer,eid)]-=G.exp_bytes;
+        if(s->planned) G.used[home2(layer,eid)]-=qt_ebytes(layer);
     }
     s->planned=0;
     if(G_stream) stream_forget(s);
@@ -2163,6 +2238,10 @@ void qt_shutdown(void){
         G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
     }
     G_arena_on=0; G_chain_own=0;
+    if(G_cfree) for(int c=0;c<G_ncls;c++) free(G_cfree[c]);
+    free(G_cfree); G_cfree=NULL; free(G_cnfree); G_cnfree=NULL; free(G_ccap); G_ccap=NULL;
+    free(G_lsl); G_lsl=NULL; free(G_lou); G_lou=NULL; free(G_lod); G_lod=NULL; free(G_lcls); G_lcls=NULL;
+    G_exact=0; G_ncls=0; G_abump=0;
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;
