@@ -372,6 +372,33 @@ static void bench_adec(void) {
     T->free(qb); T->free(ob);
 }
 
+/* COLI_CUDA_CHAIN_BENCH=route: 48 routes in a frame, each its own row (E 256, K 8 by default:
+ * COLI_CUDA_BENCH_ROUTE "E K"), the best of five. RTX PRO 4000: E 256 K 8 4.9 us, E 64 K 8 3.6;
+ * one warp a row with no __syncthreads (as chain_route.comp's few experts) took 6.0 and 5.0 */
+static void bench_route(void) {
+    int E = 256, K = 8, nl = 48;
+    const char *sh = getenv("COLI_CUDA_BENCH_ROUTE");
+    if (sh && *sh) sscanf(sh, "%d %d", &E, &K);
+    std::vector<float> l = rnd((size_t)E * nl, 7, 3.f);
+    CcBuf *lb = up(l), *ib = T->buf((size_t)K * 4 * nl, CC_DEV), *wb = T->buf((size_t)K * 4 * nl, CC_DEV);
+    int ok = lb && ib && wb;
+    double best = 1e9;
+    for (int r = -1; r < 5 && ok; r++) {
+        ok = T->begin();
+        for (int i = 0; i < nl && ok; i++) {
+            CcRoute p = {1, E, K, 0, i * E, E, 0, 0, i * K, K, i * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            ok = T->route(lb, NULL, ib, wb, &p);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        ok = T->submit(1) && ok;
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (r >= 0 && dt < best) best = dt;
+    }
+    if (ok) printf("bench route E %d K %d: %.1f us a route (%d in a frame)\n", E, K, best * 1e6 / nl, nl);
+    else printf("bench route: the frame failed\n");
+    T->free(lb); T->free(ib); T->free(wb);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -382,6 +409,7 @@ int main(void) {
     ck(T->ready() && !T->lost(), "ready, not lost");
     const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
     if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
+    if (be && !strcmp(be, "route")) { bench_route(); return 0; }
 
     printf("buffers and frames\n");
     {
@@ -898,6 +926,10 @@ int main(void) {
             {2, 512, 10, 0, 0, 0, 0, 1, 1.f, 1.f, "softmax, top 10 of 512 (Qwen3.8)"},
             {2, 64, 6, 1, 1, 8, 4, 1, 1.f, 2.5f, "sigmoid, a bias for the pick, 4 of 8 groups, scaled"},
             {1, 100, 4, 2, 2, 0, 0, 2, 0.7f, 1.f, "sqrt(softplus), the bias in the logit, a temperature"},
+            {5, 64, 8, 0, 0, 0, 0, 0, 1.f, 1.f, "softmax, top 8 of 64 (OLMoE)"},
+            {3, 128, 8, 1, 1, 0, 0, 1, 1.f, 2.5f, "sigmoid, a bias for the pick, top 8 of 128, scaled"},
+            {2, 256, 32, 0, 0, 0, 0, 0, 1.f, 1.f, "softmax, top 32 of 256, not normalized"},
+            {2, 200, 6, 0, 2, 0, 0, 1, 1.3f, 1.f, "softmax, the bias in the logit, a temperature, 200 experts"},
         };
         for (auto &cs : cases) {
             CcRoute p = {cs.S, cs.E, cs.K, cs.kind, 5, cs.E + 3, 2, cs.has_bias, 1, cs.K + 2, 3, cs.K + 1, cs.n_group, cs.topk_group, cs.norm, cs.temp, cs.scale, 1e-20f};

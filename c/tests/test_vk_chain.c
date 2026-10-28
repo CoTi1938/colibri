@@ -1725,7 +1725,7 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
                   rid + (size_t)s * K, rw + (size_t)s * K);
     VkcBuf *lb = up(lg, (size_t)S * lrow), *bb = up(bias, (size_t)E + 5);
     VkcBuf *ib = vkc_buf((size_t)(S * irow + 4) * 4, VKC_DEV), *wb = vkc_buf((size_t)(S * wrow + 4) * 4, VKC_DEV);
-    VkcRoute rp = {S, E, K, kind, 1, lrow, 2, has_bias, 3, irow, 1, wrow, ng, tg, norm, temp, scale, eps};
+    VkcRoute rp = {S, E, K, kind, 1, lrow, 2, has_bias, 3, irow, 1, wrow, ng, tg, norm, temp, scale, eps, 0};
     int ok = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
     float *gi = down(ib, 3, (size_t)S * irow), *gw = down(wb, 1, (size_t)S * wrow);
     int same = 1; double worst = 0;
@@ -1738,8 +1738,17 @@ static void test_route(const char *what, int S, int E, int K, int kind, int has_
     CHECK(ok && same && worst < 1e-5, "route %s (S %d E %d K %d): ok %d, ids %s, weights off by %.2e",
           what, S, E, K, ok, same ? "the CPU's" : "DIFFER", worst);
     if (getenv("VKC_TEST_VERBOSE")) printf("route %s: weights %.2e\n", what, worst);
+    /* the workgroup's path (wg 1) against the one-subgroup path few experts take: the same bits */
+    rp.wg = 1;
+    int ok2 = vkc_begin() && vkc_route(lb, bb, ib, wb, &rp) && vkc_submit(1);
+    float *gi2 = down(ib, 3, (size_t)S * irow), *gw2 = down(wb, 1, (size_t)S * wrow);
+    int bits = ok2;
+    for (int s = 0; s < S && bits; s++)
+        bits = !memcmp(gi + (size_t)s * irow, gi2 + (size_t)s * irow, (size_t)K * 4) &&
+               !memcmp(gw + (size_t)s * wrow, gw2 + (size_t)s * wrow, (size_t)K * 4);
+    CHECK(bits, "route %s (S %d E %d K %d): the workgroup's path gives other bits", what, S, E, K);
     vkc_free(lb); vkc_free(bb); vkc_free(ib); vkc_free(wb);
-    free(lg); free(bias); free(rid); free(rw); free(gi); free(gw);
+    free(lg); free(bias); free(rid); free(rw); free(gi); free(gw); free(gi2); free(gw2);
 }
 
 /* ---- the routed experts (chain_moe.comp) ------------------------------------------------ */
@@ -1849,7 +1858,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *tb = vkc_buf((size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4, VKC_DEV);
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
-    VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
+    VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f, 0};
     VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0, 0, 0, 0, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
@@ -3064,7 +3073,7 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0, 0};
         VkcMoeRows rr = {0};
         vkc_moe_set_idot(0);   /* against chain_moe's float form: the grouped GEMMs' sums */
@@ -3138,7 +3147,7 @@ static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) 
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
         VkcMoeRows rr = {0};
         VkcStats s0, s1; vkc_stats(&s0);
@@ -3234,7 +3243,7 @@ static void test_moe_i8(int tg, int td, int S, int K, int E, int D, int I) {
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DOWN);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0, 0};
         VkcStats s0, s1; vkc_stats(&s0);
         vkc_moe_set_idot(1);
@@ -3623,7 +3632,7 @@ static void bench_moe(void) {
         VkcBuf *lb = up(lg, (size_t)S * E * nl), *xb = up(x, (size_t)S * D);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
-        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, !ours, fg, fd, E, 0, 0};   /* block-format experts, or ours */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
         double best = 1e9;
@@ -3795,7 +3804,7 @@ static void bench_rows(void) {
         for (int r = 0; r < 4 && ok; r++) {
             ok = vkc_begin();
             for (int l = 0; l < L && ok; l++) {
-                VkcRoute rp = {S, E, K, 0, l * S * E, E, 0, 0, l * S * K, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+                VkcRoute rp = {S, E, K, 0, l * S * E, E, 0, 0, l * S * K, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
                 VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, l * E, 0, D, l * S * K, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
                 ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_moe_rows(xb, ib, wb, tb, &rr, yb, &mp);
             }
@@ -3846,15 +3855,16 @@ static void bench_kda(void) {
  * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
  * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
 static void bench_route(void) {
-    const char *ee = getenv("COLI_VK_BENCH_E");
+    const char *ee = getenv("COLI_VK_BENCH_E"), *ke = getenv("COLI_VK_BENCH_K");
     int E = ee && atoi(ee) > 0 && atoi(ee) <= VKC_ROUTE_EMAX ? atoi(ee) : 512, K = 10, nl = 48, ok = 1;
+    if (ke && atoi(ke) > 0 && atoi(ke) <= VKC_ROUTE_KMAX && atoi(ke) <= E) K = atoi(ke);
     float *lg = fvec((size_t)E * nl, 3.f);
     VkcBuf *lb = up(lg, (size_t)E * nl), *ib = vkc_buf((size_t)K * 4 * nl, VKC_DOWN), *wb = vkc_buf((size_t)K * 4 * nl, VKC_DEV);
     double best = 1e9;
     for (int r = -1; r < 5 && ok && lb && ib && wb; r++) {   /* r -1 untimed */
         vkc_begin();
         for (int l = 0; l < nl && ok; l++) {
-            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f, 0};
             ok = vkc_route(lb, NULL, ib, wb, &rp);
         }
         double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
@@ -4457,6 +4467,18 @@ int main(int argc, char **argv) {
     test_ew_gate();
     test_vae_ops(5, 7, 3, 0, 0, 5); test_vae_ops(5, 7, 3, 1, 3, 4); test_vae_ops(4, 4, 16, 1, 0, 8);
     printf("vae ops done\n");
+    /* few experts: one subgroup takes a row where E fits four subgroups' lanes (last: their
+     * random rows leave every test before them its data) */
+    if (vkc_route_ready()) {
+        test_route("8 experts, top-2", 3, 8, 2, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
+        test_route("60 experts, top-4, temperature", 4, 60, 4, 0, 0, 1, 1, 0, 0.7f, 1.f, 0.f, 0);
+        test_route("128 experts, sigmoid, bias", 3, 128, 8, 1, 1, 1, 1, 1, 1.f, 2.5f, 0.f, 0);
+        test_route("100 experts, sqrt(softplus)", 3, 100, 6, 2, 1, 1, 1, 2, 1.3f, 1.5f, 1e-20f, 0);
+        test_route("64 experts, top-32", 2, 64, 32, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 0);
+        test_route("256 experts, top-8, no norm", 3, 256, 8, 0, 0, 1, 1, 0, 1.f, 1.f, 0.f, 0);
+        test_route("ties of 128", 2, 128, 8, 0, 0, 1, 1, 1, 1.f, 1.f, 0.f, 1);
+        printf("route few experts done\n");
+    }
     VkcStats st; vkc_stats(&st);
     printf("chain: %llu frames, %llu ops, %llu matmuls (%llu GEMM), %llu barriers\n", st.frames, st.ops, st.matmuls, st.gemms, st.barriers);
     vkc_shutdown();
