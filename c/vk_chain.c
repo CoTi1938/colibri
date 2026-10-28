@@ -719,11 +719,20 @@ static void frame_reclaim(VkcFrame *f) {
     f->cur_pool = 0;
 }
 /* A frame is milliseconds of work and the thread waiting on it has nothing else to do:
- * poll the fence for up to COLI_VK_CHAIN_SPIN_US (2000 us) before blocking, whose
- * wake-up costs 50 to 150 us per frame, two frames a layer. */
+ * poll the fence for up to COLI_VK_CHAIN_SPIN_US before blocking, whose wake-up costs 50 to
+ * 150 us per frame, two frames a layer. On a discrete card 50 ms, a whole decode step: at 2 ms
+ * the host slept through each step's last frames and woke after the device had run dry
+ * (Qwen3.6 UD-Q4_K_M on an RTX PRO 4000 decoded 76.5 tok/s, 90.7 polling to the end; the
+ * device idle about 1 ms a token between steps). An integrated GPU shares the package's power
+ * with the cores: 2 ms there. */
 static long chain_spin_us(void) {
     static long v = -1;
-    if (v < 0) { const char *e = getenv("COLI_VK_CHAIN_SPIN_US"); v = e && *e ? atol(e) : 2000; if (v < 0) v = 0; }
+    if (v < 0) {
+        const char *e = getenv("COLI_VK_CHAIN_SPIN_US");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        v = e && *e ? atol(e) : pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 50000 : 2000;
+        if (v < 0) v = 0;
+    }
     return v;
 }
 static int frame_wait(VkcFrame *f) {
