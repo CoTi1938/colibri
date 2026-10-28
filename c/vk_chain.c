@@ -2226,6 +2226,9 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
      * both sides of the shader's choice stays in bounds (the 256-byte dummy would not) */
     VkcRoute q = *p;
     if (!q.has_bias) q.b_off = q.l_off;
+    static int sg = -1;   /* COLI_VK_ROUTE_SG=0: every row on the workgroup's path */
+    if (sg < 0) { const char *e = getenv("COLI_VK_ROUTE_SG"); sg = !(e && *e == '0'); }
+    if (!sg) q.wg = 1;
     VkcBind bd[4] = {B(logits, 0), B(q.has_bias ? bias : logits, 0), B(ids, 1), B(w, 1)};
     uint32_t gx, gy; grid((uint64_t)q.S, &gx, &gy);
     return record(KC.mpipe[PM_ROUTE], bd, 4, &q, sizeof q, gx, gy, 1);

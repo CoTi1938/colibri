@@ -433,6 +433,7 @@ typedef struct {
     int i_off, i_row, w_off, w_row;
     int n_group, topk_group, norm;
     float temp, scale, norm_eps;
+    int wg;                                    /* 1: the workgroup's path where one subgroup would take the row (tests) */
 } VkcRoute;
 int vkc_route_ready(void);
 int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p);
