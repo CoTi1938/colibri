@@ -4110,6 +4110,15 @@ int main(int argc, char **argv) {
                 CHECK(f1.attn_dec_gqa >= f0.attn_dec_gqa + 4, "attn: %llu of 4 decodes a KV head's query heads a workgroup",
                       f1.attn_dec_gqa - f0.attn_dec_gqa);
         }
+        /* OLMoE's: one query head a KV head, by KV head too (mode 2 at a GQ of 1) */
+        VkcStats o0; vkc_stats(&o0);
+        test_attn_hk(1, 299, 16, 16, 128, 0); test_attn_hk(3, 250, 16, 16, 128, 0);
+        test_attn_win(2, 3000, 16, 16, 128, 128, 0, 0, 0, 0);
+        VkcStats o1; vkc_stats(&o1);
+        if (o1.attn_flash > 0 && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
+            CHECK(o1.attn_dec_gqa >= o0.attn_dec_gqa + 3, "attn: %llu of 3 decodes of one query head a KV head by KV head",
+                  o1.attn_dec_gqa - o0.attn_dec_gqa);
+        test_attn_rows_bits(6, 700, 16, 16, 128);
         test_attn_rows_bits(3, 700, 16, 2, 256); test_attn_rows_bits(6, 700, 16, 2, 256);
         test_attn_rows_bits(6, 125, 16, 2, 128); test_attn_rows_bits(6, 4093, 16, 2, 128);
         VkcStats ad; vkc_stats(&ad);

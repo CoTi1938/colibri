@@ -1716,7 +1716,7 @@ static VkPipeline adec_pipe(void) {
 static VkPipeline adg_pipe(int hd, int gq) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
-    if (!on || gq < 2 || gq > 16 || hd < 1 || hd > 256 || !adec_pipe()) return VK_NULL_HANDLE;
+    if (!on || gq < 1 || gq > 16 || hd < 1 || hd > 256 || !adec_pipe()) return VK_NULL_HANDLE;
     for (int i = 0; i < KC.nadg; i++) if (KC.adg_hd[i] == hd && KC.adg_gq[i] == gq && KC.adg_kv[i] == g_kvh) return KC.adg[i];
     if (KC.nadg == VKC_ADG_MAX) return VK_NULL_HANDLE;
     VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
@@ -1773,7 +1773,7 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
      * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
      * workgroups a KV head: Qwen3.6 after 18K positions on an RTX PRO 4000, 256 positions a
      * block, 279 us a layer; 64 (a workgroup a KV head) 325 us, its join alone 60 */
-    VkPipeline gp = G > 1 && w->a.hd == w->vd && w->a.k_off % 4 == 0 && w->a.v_off % 4 == 0 ? adg_pipe(w->a.hd, G) : VK_NULL_HANDLE;
+    VkPipeline gp = G >= 1 && w->a.hd == w->vd && w->a.k_off % 4 == 0 && w->a.v_off % 4 == 0 ? adg_pipe(w->a.hd, G) : VK_NULL_HANDLE;
     int hc = gp ? 4 * w->a.KVH : w->a.H, nb = 1;
     for (int r = 0; r < S; r++) {   /* the most blocks a row takes, of its window's positions as the shader counts them */
         int nr = w->a.pos_base + r + 1;
@@ -2472,7 +2472,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     }
     /* a decode's attention over its positions' blocks (chain_attn_dec), its join launched on
      * one row of one position */
-    if (ok && pw->attn_hd > 0 && pw->attn_gq > 1) adg_pipe(pw->attn_hd, pw->attn_gq);   /* its grouped mode: made, not run */
+    if (ok && pw->attn_hd > 0 && pw->attn_gq > 0) adg_pipe(pw->attn_hd, pw->attn_gq);   /* its grouped mode: made, not run */
     if (ok && pw->attn_hd > 0 && adec_pipe()) {
         struct { VkcAttnW w; int mode, L, nb; } pc;
         memset(&pc, 0, sizeof pc);
