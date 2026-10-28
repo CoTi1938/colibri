@@ -187,6 +187,9 @@ static void test_routed_fetches(void) {
     for (int j = 0; j < 8 && whole; j++) whole = out[j].src == fr[j].src && out[j].dst == fr[j].dst && out[j].bytes == fr[j].bytes;
     ck(whole, "routes to every expert: the layer's whole copy, as a longer chunk makes it");
     ck(Q36CC_ROUTED_ROWS > Q36CC_STAGE_ROWS, "a chunk the staging takes can be short enough to copy only its routes");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 4) && q36cc_routes_only(Q36CC_ROUTED_ROWS, 4) &&
+       !q36cc_routes_only(Q36CC_ROUTED_ROWS + 1, 4), "a planar chunk copies only its routes up to Q36CC_ROUTED_ROWS rows");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 100), "a GGUF's chunk copies whole layers: no list of its experts' regions");
     ck(Q36CC_DM_ROWS <= Q36CC_STAGE_ROWS,
        "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
 }

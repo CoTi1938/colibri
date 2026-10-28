@@ -1160,6 +1160,10 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * longer overlaps the layer before). A longer chunk routes to nearly all of them and the whole
  * copy, overlapped, is faster (a T4 with 3635 experts in the host pool: 384 rows gained nothing). */
 #define Q36CC_ROUTED_ROWS 256
+/* a chunk of n rows in format fmt copies only its routed experts: a short one on the planar table, whose
+ * dm_frx lists each expert's two regions; a GGUF's (fmt 100 and up) copies whole layers, its staged table
+ * keeping one or three regions an expert and no such list */
+static int q36cc_routes_only(int n, int fmt) { return n <= Q36CC_ROUTED_ROWS && fmt < 100; }
 /* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
  * into the buffers of the coldest residents by this conversation's routes. The chain copies
  * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
@@ -1371,7 +1375,7 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
             ch->dm_stage_off = 1;
             cc_free(ch->dm_stage); ch->dm_stage = NULL;
-        } else if (!ch->dm_routed_said) {
+        } else if (!ch->dm_routed_said && ch->dm_fmt < 100) {   /* the rule where it runs (q36cc_routes_only) */
             ch->dm_routed_said = 1;
             fprintf(stderr, "[chain] qwen36: a prompt chunk copies its layers' host-pool experts over the bus, "
                             "one of up to %d rows only those its rows route to\n", Q36CC_ROUTED_ROWS);
@@ -1605,7 +1609,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         /* the angles to the device once a step: a RoPE that read them where the host wrote them
          * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
         if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
-        ch->dm_routed = n <= Q36CC_ROUTED_ROWS;   /* a short chunk's layers copy after their routers */
+        ch->dm_routed = q36cc_routes_only(n, ch->dm_fmt);   /* a short chunk's layers copy after their routers */
         if (dm && !ch->dm_routed && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1, dm_ids_defer = 0;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
