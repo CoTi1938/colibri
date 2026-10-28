@@ -1125,6 +1125,13 @@ uses it.
 
 ## The dense chain (`vk_chain.c`)
 
+The decode GEMVs' int8 path (`chain_gemv.comp`) and the routed experts' rows
+(`chain_moe_gv.comp`) issue four 16-byte steps' loads before the first is summed: a loop
+that loaded one step and summed it waited for every load in turn. The sums go into the same
+accumulators in the same order, so a row's bits are unchanged (tests/test_vk_chain). An RTX
+3070: int8 8192 x 2048 78 -> 66 us a matrix in `COLI_VK_CHAIN_BENCH=1`, Qwen3.6-35B int4 decode
+18.5 -> 17.5 ms a token; the experts' bench (every expert in VRAM) unchanged.
+
 With the dense matrices on the device one `coli_vk_matmul` at a time, each matrix is
 a submit and a host round trip: about 726 of them per Qwen3.8 decode token. On an
 integrated GPU that made the dense part slower on the device than on the CPU (see
@@ -2455,6 +2462,19 @@ the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and u
 the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
 in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
 that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+**Whether the hybrid pays is measured, not assumed** (`vk_hyb_gate.h`). On an RTX 3070 at
+PCIe 4.0 x16 with Qwen3.6 int4 (2756 of 10240 experts on the card, about 1.4 host pool pairs
+a decode step) the hybrid steps took a token from 18.5 ms to 33 to 50: the CPU's pair cost
+300 to 500 us at one to twelve threads where the device read the same expert over the bus
+in about 130, and a step's three frames and timeline round trip came on top. So the chain
+times its decode forwards with the device's reads for three forwards, then with the hybrid
+steps for three (the first forward of each warms it), keeps the faster (the hybrid where it
+is not slower by a twentieth) and measures again after 1024 forwards; the run's line says
+what it measured and what it kept. `COLI_VK_HYBRID_GATE=0` keeps the steps on, as before.
+The same card had come up without timeline semaphores at all when the build's headers
+predated the cooperative matrix (the feature was asked for inside that extension's block),
+so the steps never ran there; every device is asked now.
+
 The run's line adds `hybrid: N steps,
 P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
 4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
