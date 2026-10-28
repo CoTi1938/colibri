@@ -68,6 +68,7 @@
 #include "../vk_chain.h"
 #include "../vk_tier.h"           /* vkt_host_pairs: the bench's CPU in place */
 #include "../vk_kvsplit.h"        /* the KV cache split between the device and the host */
+#include "../kv16.h"              /* a float16 KV cache's numbers (test_attn_kvh) */
 #include "../delta_attention.h"      /* the KDA step the KDA ops follow */
 #include "../hyper_connections.h"    /* the mHC arithmetic */
 #include "../sparse_index.h"         /* GLM-5.3's k-pooled indexer */
@@ -459,6 +460,48 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
     }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
     free(q); free(kc); free(vc); free(snk); free(ref);
+}
+
+/* A float16 KV cache (vkc_attn_wh): K and V of float16 values in halves give the bits of a
+ * float32 cache of the same values, on the path the call takes (the counters say which) */
+static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int win, int ring, int sink) {
+    int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16;
+    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * hd;
+    float *q = fvec((size_t)S * H * hd, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
+    kv16_round(kc, (int64_t)kn); kv16_round(vc, (int64_t)vn);
+    uint16_t *kh = malloc(kn * 2), *vh = malloc(vn * 2);
+    kv16_pack(kh, kc, (int64_t)kn); kv16_pack(vh, vc, (int64_t)vn);
+    VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
+    VkcBuf *khb = vkc_buf(kn * 2, VKC_DEV), *vhb = vkc_buf(vn * 2, VKC_DEV);
+    VkcBuf *o32 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    vkc_begin(); vkc_write(khb, 0, kh, kn * 2); vkc_write(vhb, 0, vh, vn * 2); vkc_submit(1);
+    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
+                  win, ring, hd, 0, sink, 5};
+    vkc_begin();
+    int ok = vkc_attn_w(qb, kb, vb, o32, NULL, NULL, sink ? sb : NULL, &p) && vkc_attn_wh(qb, khb, vhb, o16, NULL, NULL, sink ? sb : NULL, &p);
+    ok = vkc_submit(1) && ok;
+    size_t bytes = (size_t)S * H * hd * 4;
+    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d win %d ring %d sink %d: "
+          "a float32 cache's bits", S, pos_base, H, KVH, hd, win, ring, sink);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(khb); vkc_free(vhb); vkc_free(o32); vkc_free(o16);
+    free(q); free(kc); free(vc); free(snk); free(kh); free(vh);
+}
+/* vkc_copy_regions_h: a step's K rows into a head-major float16 cache (a grid), and a region alone */
+static void test_copy_regions_h(void) {
+    const int n = 5, KV = 2, kvd = 64, rows = 20, pb = 7;
+    float *src = fvec((size_t)n * KV * kvd, 1.f);
+    VkcRegion rg[11];
+    int nr = 0;
+    for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
+        rg[nr++] = (VkcRegion){((size_t)h * rows + pb + s) * kvd, (size_t)s * KV * kvd + (size_t)h * kvd, (size_t)kvd};
+    rg[nr++] = (VkcRegion){(size_t)KV * rows * kvd - 10, 3, 10};
+    size_t nh = (size_t)KV * rows * kvd;
+    uint16_t *want = calloc(nh, 2);
+    for (int i = 0; i < nr; i++) kv16_pack(want + rg[i].dst, src + rg[i].src, (int64_t)rg[i].n);
+    VkcBuf *sb = up(src, (size_t)n * KV * kvd), *db = vkc_buf(nh * 2, VKC_DOWN);
+    vkc_begin(); vkc_zero(db, 0, nh / 2); int ok = vkc_copy_regions_h(db, sb, rg, nr); ok = vkc_submit(1) && ok;
+    CHECK(ok && memcmp(vkc_ptr(db), want, nh * 2) == 0, "copy_regions_h: a grid of rows and a region alone, each value its float16");
+    vkc_free(sb); vkc_free(db); free(src); free(want);
 }
 
 /* ---- DeltaNet: convolution and recurrence ------------------------------------------ */
@@ -4022,6 +4065,24 @@ int main(int argc, char **argv) {
         test_attn_rows_bits(6, 125, 16, 2, 128); test_attn_rows_bits(6, 4093, 16, 2, 128);
         VkcStats ad; vkc_stats(&ad);
         printf("  decode attentions in blocks of positions: %llu (%llu a KV head's query heads a workgroup)\n", ad.attn_dec, ad.attn_dec_gqa);
+        rng = rng_was;
+    }
+    /* a float16 KV cache on every path: chain_attn (a few rows over few positions), the decode's
+     * blocks a head and by KV head, the matrix units and the blocked shader for a prompt chunk,
+     * a window and sinks, linear and in a ring */
+    if (vkc_kvh_ready()) {
+        unsigned rng_was = rng;
+        VkcStats k0; vkc_stats(&k0);
+        test_attn_kvh(2, 50, 16, 2, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 0, 0, 0); test_attn_kvh(2, 700, 8, 8, 128, 0, 0, 0);
+        test_attn_kvh(70, 33, 16, 2, 256, 0, 0, 0); test_attn_kvh(40, 300, 32, 4, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 200, 236, 1);
+        test_attn_kvh(90, 900, 32, 4, 128, 129, 230, 1);
+        setenv("COLI_VK_CHAIN_FLASH", "0", 1);
+        test_attn_kvh(40, 300, 16, 2, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 16, 0, 1);
+        unsetenv("COLI_VK_CHAIN_FLASH");
+        test_copy_regions_h();
+        VkcStats k1; vkc_stats(&k1);
+        printf("  a float16 cache: %llu on the matrix units, %llu blocked, %llu decodes in blocks\n", k1.attn_flash - k0.attn_flash,
+               k1.attn_blocked - k0.attn_blocked, k1.attn_dec - k0.attn_dec);
         rng = rng_was;
     }
     printf("attn done\n");

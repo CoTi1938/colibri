@@ -143,6 +143,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* A float16 KV cache: vkc_attn and vkc_attn_w over caches of halves (kc, vc and their offsets
+ * in halves; flash's offsets multiples of eight), every path the bits of a float32 cache of the
+ * same values; vkc_copy_regions_h copies float32 regions of src (offsets in floats) into such
+ * a cache (offsets and lengths in halves, even), each value rounded to the nearest float16.
+ * vkc_kvh_ready: 1 when the device takes them. */
+int  vkc_attn_h(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+int  vkc_attn_wh(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, const VkcAttnW *p);
+int  vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
+int  vkc_kvh_ready(void);
 /* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */

@@ -47,6 +47,9 @@ layout(constant_id = 3) const uint SPLIT = 1;  // subgroups a row tile (8 subgro
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };   // K[k_off + (kvh*cap + t)*hd + d]
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };   // V likewise from v_off
+layout(constant_id = 7) const bool KV16 = false;   // K and V float16 (vk_chain.c's vkc_attn_h): eight halves a load, as staged
+layout(std430, binding = 1) readonly buffer KBH { uvec4 kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uvec4 vch[]; };
 layout(std430, binding = 3) buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
 layout(std430, binding = 6) readonly buffer SB { float snk[]; };
@@ -83,13 +86,23 @@ void stage(uint g, uint k0, uint nt, uint tid, bool isv) {
     for (uint e = tid; e < BC * HD / 8u; e += 256u) {
         uint kl = e / (HD / 8u), d8 = e % (HD / 8u);   // consecutive threads: consecutive dims of one key
         uint key = k0 + kl, d = d8 * 8u;
+        uint at = ((kl >> 4u) * NDT + (d8 >> 1u)) * 32u + (kl & 15u) * 2u + (d8 & 1u);
+        if (KV16) {   // the halves as they are (the offsets multiples of eight)
+            uvec4 w = uvec4(0u);
+            if (key < nt) {
+                uint base = (g * uint(p.cap) + (p.ring > 0 ? key % uint(p.ring) : key)) * HD + d;
+                w = isv ? vch[(base + uint(p.v_off)) >> 3u] : kch[(base + uint(p.k_off)) >> 3u];
+            }
+            skv[at] = w;
+            continue;
+        }
         vec4 a = vec4(0.0), b = vec4(0.0);
         if (key < nt) {
             uint base = (g * uint(p.cap) + (p.ring > 0 ? key % uint(p.ring) : key)) * HD + d;
             if (isv) { base += uint(p.v_off); a = vec4(vc[base], vc[base+1u], vc[base+2u], vc[base+3u]); b = vec4(vc[base+4u], vc[base+5u], vc[base+6u], vc[base+7u]); }
             else     { base += uint(p.k_off); a = vec4(kc[base], kc[base+1u], kc[base+2u], kc[base+3u]); b = vec4(kc[base+4u], kc[base+5u], kc[base+6u], kc[base+7u]); }
         }
-        skv[((kl >> 4u) * NDT + (d8 >> 1u)) * 32u + (kl & 15u) * 2u + (d8 & 1u)] = uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
+        skv[at] = uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
     }
 }
 

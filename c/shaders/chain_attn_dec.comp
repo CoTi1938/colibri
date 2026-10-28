@@ -27,12 +27,21 @@ layout(constant_id = 1) const int HDQ = 256;  // mode 2: the head dim
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
 layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
+layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
+layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
+float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) writeonly buffer OB { float o[]; };
 layout(std430, binding = 4) readonly buffer GB { float gt[]; };
 layout(std430, binding = 6) readonly buffer SB { float snk[]; };
 layout(std430, binding = 7) buffer XB { float xs[]; };   // per (row, head, block): m, l, acc[vd]
 layout(std430, binding = 1) readonly buffer KB4 { vec4 kc4[]; };   // mode 2: K and V four floats a load
 layout(std430, binding = 2) readonly buffer VB4 { vec4 vc4[]; };
+layout(std430, binding = 1) readonly buffer KB8 { uvec2 kc8[]; };   // mode 2, KV16: four halves a load
+layout(std430, binding = 2) readonly buffer VB8 { uvec2 vc8[]; };
+vec4 k4(int i) { if (KV16) { uvec2 u = kc8[i]; return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); } return kc4[i]; }
+vec4 v4(int i) { if (KV16) { uvec2 u = vc8[i]; return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); } return vc4[i]; }
 
 layout(push_constant) uniform P {
     int S, H, KVH, hd, pos_base, cap;
@@ -86,7 +95,7 @@ void main() {
             int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
             int kb = p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * p.hd;
             float a = 0.0;
-            for (int d = lane; d < p.hd; d += sgs) a += qs[d] * kc[kb + d];
+            for (int d = lane; d < p.hd; d += sgs) a += qs[d] * kf(kb + d);
             a = subgroupAdd(a);
             if (subgroupElect()) sc[j] = a * p.scale;
         }
@@ -113,7 +122,7 @@ void main() {
             for (int j = 0; j < cnt; j++) {
                 int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
                 int vb = p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * vd;
-                acc += sc[j] * vc[vb + d];
+                acc += sc[j] * vf(vb + d);
             }
             xs[xo + 2 + d] = acc;
         }
@@ -146,7 +155,7 @@ void main() {
             int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
             int kb4 = (p.k_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4;
             vec4 kk[4];
-            for (int i = 0; i < 4; i++) { int c = lane + i * sgs; kk[i] = c < NV ? kc4[kb4 + c] : vec4(0.0); }
+            for (int i = 0; i < 4; i++) { int c = lane + i * sgs; kk[i] = c < NV ? k4(kb4 + c) : vec4(0.0); }
             float a[GQ];
             for (int g = 0; g < GQ; g++) a[g] = 0.0;
             for (int i = 0; i < 4; i++) {
@@ -178,7 +187,7 @@ void main() {
         for (int g = 0; g < GQ; g++) acc[g] = vec4(0.0);
         for (int j = grp; j < cnt; j += NG) {
             int t = first + t0 + j, r = p.ring > 0 ? t % p.ring : t;
-            vec4 v = vc4[(p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4 + c];
+            vec4 v = v4((p.v_off + (p.kv_pm != 0 ? r * p.KVH + kvh : kbase + r) * HDQ) / 4 + c);
             for (int g = 0; g < GQ; g++) acc[g] += sc[g * 256 + j] * v;
         }
         for (int k = NG - 1; k >= 1; k--) {   // the groups' sums into group 0's, the last group first
