@@ -3273,7 +3273,7 @@ __device__ __forceinline__ void hcg_store_x(__half (*Xs)[HCG_LDH], const float4 
 /* WF 100: a GGUF's blocks (cuda_bd.cuh's float form, bdf_decode), the format in gs, the
  * decoders' table in sc: the thread's 16 weights are half of a 32-weight unit, decoded with
  * its scales and mins (weight = s * w - m) and rounded to f16, the scales in the weights */
-template<> struct HcgW<100> { float f[16]; };
+template<> struct HcgW<100> { bd_u32 h[8]; };   /* the 16 weights in f16, two a word */
 template<>
 __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc,
                                                  int gs, int ng, int n, int N, int k0, int K, int planar) {
@@ -3281,7 +3281,7 @@ __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__
     int kq = (threadIdx.x & 3) * 16;
     if (n >= N) {
         #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = 0.f;
+        for (int j = 0; j < 8; j++) r.h[j] = 0u;
         return;
     }
     const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc);
@@ -3289,26 +3289,28 @@ __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__
     bd_u32 B = __ldg(tab + BDT_BLK + t), T = __ldg(tab + BDT_BYTES + t);
     size_t rw = ((size_t)K / B * T + 3) / 4;
     const bd_u32 *Wr = reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw;
-    if (bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, r.f)) return;   /* the common types: their 16, word loads */
-    int wv[32]; float sA, mA, sB, mB;
-    bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
-    if ((kq >> 4) & 1) {
-        #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = sB * (float)wv[16 + j] - mB;
-    } else {
-        #pragma unroll
-        for (int j = 0; j < 16; j++) r.f[j] = sA * (float)wv[j] - mA;
+    if (bd_dec16h(t, Wr, (bd_u32)(k0 + kq), r.h)) return;   /* Q8_0 and the K-quants: their codes to f16 by their bits */
+    float f[16];
+    if (!bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, f)) {   /* the other common types: their 16, word loads */
+        int wv[32]; float sA, mA, sB, mB;
+        bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
+        if ((kq >> 4) & 1) {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) f[j] = sB * (float)wv[16 + j] - mB;
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 16; j++) f[j] = sA * (float)wv[j] - mA;
+        }
     }
+    #pragma unroll
+    for (int j = 0; j < 8; j++) r.h[j] = bd_h2u(__halves2half2(hcg_h(f[2 * j]), hcg_h(f[2 * j + 1])));
 }
 template<>
 __device__ __forceinline__ void hcg_store_w<100>(__half (*Ws)[HCG_LDH], const HcgW<100> &r, int planar) {
     (void)planar;
     int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16;
-    __align__(16) __half v[16];
-    #pragma unroll
-    for (int j = 0; j < 16; j++) v[j] = hcg_h(r.f[j]);
     uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]);
-    dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
+    dst[0] = make_uint4(r.h[0], r.h[1], r.h[2], r.h[3]); dst[1] = make_uint4(r.h[4], r.h[5], r.h[6], r.h[7]);
 }
 #endif
 template<int WF, int NW>
