@@ -32,7 +32,9 @@
  *   - the host pool follows the residents before a prompt chunk of Q36CC_FOLLOW_ROWS rows or
  *     more, not before a smaller one, and a change stales the staged table (q36cc_follow);
  *   - the promotions' brake holds only where the warm start's set came from a history (this
- *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins.
+ *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins;
+ *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
+ *     has no room for both (q36cc_stage_reserve).
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -170,7 +172,7 @@ static int same_logits(const float *a, const float *b, int n, const char *what) 
 static Q36CChain *serve_ch; static Model *serve_m; static int serve_n;
 static int serve_layer1(unsigned v) { return q36cc_dm_serve(serve_ch, serve_m, 1, serve_n, v); }
 
-/* J's tier: planar int4 per 64 as on a Qwen3.6 container (the host pool wants it), eight experts
+/* K's tier: planar int4 per 64 as on a Qwen3.6 container (the host pool wants it), eight experts
  * a layer, half of them on the card (as test_qwen36_tier_host_pool.c's) */
 enum { HE = 8, HI = 64, HMB = D * HI / 2, HSC = 2 * HI * (D / 64) + D * (HI / 64) };
 static unsigned char hp_w[NL][HE][3 * HMB];
@@ -515,9 +517,21 @@ int main(void) {
     printf(" I. the head's logits: computed on the card, then copied to the host\n");
     head_logits_on_the_card(&w, &ref, ids);
 
+    printf(" J. the staging buffer grows without room for a second copy beside it\n");
+    {   /* residents spread over the layers start the staging small and every promotion raises it; on a small card
+         * (room for 400 here) the bigger buffer takes the old one's place, it does not wait beside it */
+        CcBuf *st = NULL;
+        fake_chain_dev_cap = fake_chain_dev_bytes + 400;
+        ck(q36cc_stage_reserve(&st, 320) && cc_bytes(st) >= 320, "a staging buffer of 320");
+        ck(q36cc_stage_reserve(&st, 347) && cc_bytes(st) >= 347, "grown to 347 with room for 400: no second copy beside it");
+        ck(q36cc_stage_reserve(&st, 300) && cc_bytes(st) >= 347, "a smaller ask keeps the buffer");
+        ck(!q36cc_stage_reserve(&st, 500), "an ask over the card's room fails");
+        cc_free(st); fake_chain_dev_cap = 0;
+    }
+
     qt_shutdown();
 
-    printf(" J. the host pool follows the residents before a large prompt chunk only\n");
+    printf(" K. the host pool follows the residents before a large prompt chunk only\n");
     {
         setenv("HEAT_FILE", "", 1); setenv("COLI_PLACE", "off", 1); setenv("QT_UPLOAD_SYNC", "", 1);
         fake_host_reg_ok = 1; fake_planar_rows = 1;
@@ -560,7 +574,7 @@ int main(void) {
         qt_shutdown();
         ck(fake_host_regs - regs0 == fake_host_unregs - unregs0, "the exit releases every page-lock the pool took");
     }
-    printf(" K. the promotions' brake only where the warm start came from a history\n");
+    printf(" L. the promotions' brake only where the warm start came from a history\n");
     unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
     ck(!qt_chain_history() && q36cc_promote_hits() == 0, "no heat file: no history, no brake");
     setenv("COLI_CUDA_CHAIN_PROMOTE_HITS", "60", 1);

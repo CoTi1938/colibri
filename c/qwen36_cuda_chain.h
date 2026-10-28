@@ -1327,6 +1327,15 @@ static void q36cc_promote_settle(Q36CChain *ch) {
     for (int p = 0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, cc_host_up_done(ch->pr_pend[p].tk)); ch->pr_busy[ch->pr_pend[p].slot] = 0; }
     ch->pr_npend = 0;
 }
+/* The staging buffer for a layer's host-pool experts. With the residents spread over the layers hmax (the most
+ * experts one layer has off the card) starts below the layer's 256 and every promotion can raise it; cc_reserve
+ * makes the new buffer before it frees the old one, so each growth wanted both at once. On an 8 GB card the
+ * second allocation failed in the middle of a conversation and the staging stayed off for the process (the
+ * RTX 3070 agent session in docs/experiments). A bigger buffer takes the old one's place: free it first. */
+static int q36cc_stage_reserve(CcBuf **stage, size_t bytes) {
+    if (*stage && cc_bytes(*stage) < bytes) { cc_free(*stage); *stage = NULL; }
+    return cc_reserve(stage, bytes, CC_DEV);
+}
 /* A GGUF layer's expert in the staging: its gate, up and down rows as the file has them, which the
  * device reads in place where a row is whole words (bd_rows_copy pads the others); mg a gate's (or
  * an up's) bytes, md a down's. 0: rows of other widths, the layer's experts the host's. */
@@ -1388,7 +1397,7 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
     size_t fb = 0, tb = 0, full = q36cc_mirror_bytes(m, qwen36_max_ctx()), held = q36cc_mirror_held(ch, m);
     size_t left = full > held ? full - held : 0, need = (size_t)(hmax ? hmax : 1) * stride;
     if (!ch->dm_stage && coli_cuda_mem_info(ch->dev, &fb, &tb) && fb < need + left + ((size_t)256 << 20)) return 0;
-    if (!stride || !cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) ||
+    if (!stride || !q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) ||
         !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV)) return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
@@ -1422,7 +1431,6 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
         ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
-}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     if (ch->dm_fmt >= 100) return q36cc_stage_table_gguf(ch, m);
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
@@ -1448,7 +1456,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
         return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
