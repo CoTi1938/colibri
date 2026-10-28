@@ -664,11 +664,13 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
     return kv > half ? half : kv;
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
- * conversation the chain holds. The mirror grows with the context, as a multiplexed place does
- * (q36c_conv_grow): twice what it held from Q36C_CONV_ROWS, or what the step needs where that
- * is more (a long prompt: doubling to 32768 positions for 17.6K tokens gave the tier 1.2 GiB
- * of Qwen3.6's experts back for nothing), rounded to 1024, at most the context, its rows again
- * from the host. A device without the room takes it from the expert tier (vkt_give_back),
+ * conversation the chain holds. The mirror grows with the context to what the step needs and
+ * an eighth more (1024 at least), rounded to 1024, at most the context, its rows again from
+ * the host. Doubling gave the tier's experts back for positions no step reached: to 32768
+ * positions for a 17.6K-token prompt (1.2 GiB of Qwen3.6's), and to 32768 at the first token
+ * after an 18K prompt (256 MiB of them; decode 55.5 tok/s against 75.5 after 1K tokens on an
+ * RTX PRO 4000). A growth uploads the rows again: 0.8 GB at 20K positions, once every few
+ * thousand tokens. A device without the room takes it from the expert tier (vkt_give_back),
  * which reserved only the start (q36c_late_bytes at Q36C_KV_START). Before, the mirror took
  * the host's whole capacity at the first forward: 2.79 GiB of an 8 GB card for Flint at 64K
  * of context, whose tier then held 1.41 GiB of experts against 3.67 at 8K (decode 43.1
@@ -686,8 +688,8 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
         /* the host's capacity moved: a sliding layer may have turned from its first rows into a
          * ring (q36c_ring), the rest keep theirs */
     } else {
-        cap = cap ? 2 * cap : Q36C_CONV_ROWS;
-        if (cap < need) cap = need;
+        cap = need + (need / 8 > 1024 ? need / 8 : 1024);
+        if (cap < Q36C_CONV_ROWS) cap = Q36C_CONV_ROWS;
         cap = (cap + 1023) / 1024 * 1024;
         if (cap > top) cap = top;
         if (cap < need) { ch->cap = 0; return 0; }

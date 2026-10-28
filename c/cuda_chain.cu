@@ -1510,15 +1510,17 @@ __host__ __device__ static inline int cc_attn_dec_len(int n, int H) {
 #define CC_ATTN_DEC_ROWS 8   /* a decode step's or a verify's rows (every engine's verify) */
 __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
-        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0) {
+        CcAttn p, int mode, int nb, int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0, int ring = 0,
+        int hc = 0) {   /* hc: the blocks' rule's heads (cc_attn_dec_len), 0 = H */
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, h = blockIdx.x, hd = p.hd, stride = hd + 2;
+    if (hc < 1) hc = p.H;
     if (mode == 0) {
         int b = blockIdx.y, s = blockIdx.z, kvh = h / (p.H / p.KVH);
         int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;   /* a window: its last win positions */
-        int L = cc_attn_dec_len(n - first, p.H), t0 = first + b * L, cnt = min(L, n - t0);
+        int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
         size_t xo = ((size_t)(s * p.H + h) * nb + b) * stride;
         if (cnt <= 0) {   /* past the row's positions: an empty block */
             if (tid == 0) { xs[xo] = -3.0e38f; xs[xo + 1] = 0.f; }
@@ -1561,7 +1563,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         return;
     }
     int s = blockIdx.y, n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
-    int L = cc_attn_dec_len(n - first, p.H), nbr = (n - first + L - 1) / L;
+    int L = cc_attn_dec_len(n - first, hc), nbr = (n - first + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
     float M = snk ? snk[sink_off + h] : -3.0e38f;   /* the sink joins the max and the sum, with no value */
     for (int b = 0; b < nbr; b++) M = fmaxf(M, xs[xo + (size_t)b * stride]);
@@ -1575,6 +1577,147 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         v *= inv;
         if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + d]));
         o[ob + d] = v;
+    }
+}
+/* cc_attn_dec_k's mode 0 for the G query heads of a KV head at once: a block a (KV head, block
+ * of positions, row), each K and V row read once for the G heads instead of once a head, four
+ * floats a load (chain_attn_dec.comp's mode 2). Qwen3.6's eight heads a KV head after an 18K
+ * prompt read 74 MB of rows a layer eight times. A K row over a warp's lanes; V a float4 column a
+ * thread, the positions over 256 / (hd / 4) groups of threads, their sums added group by group.
+ * The blocks' rule counts four blocks a KV head (hc); the join is cc_attn_dec_k's mode 1 with
+ * that rule. Dynamic shared memory: the heads' q rows and scores, G * (hd + 256) floats. */
+template <int G>
+__global__ static void __launch_bounds__(256) cc_attn_decg_k(const float *__restrict__ q, const float *__restrict__ kc,
+        const float *__restrict__ vc, float *__restrict__ xs, CcAttn p, int nb, int win, int ring, int hc) {
+    extern __shared__ float4 cc_decg_sm[];
+    __shared__ float red[G * 8];
+    const int hd = p.hd, stride = hd + 2, NV = hd / 4, NG = 256 / NV;
+    float4 *qv = cc_decg_sm;                       /* G * NV: the heads' q rows, then the groups' V sums */
+    float *sc = (float *)(cc_decg_sm + G * NV);    /* G * 256 */
+    int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, kvh = blockIdx.x, b = blockIdx.y, s = blockIdx.z;
+    int n = p.pos_base + s + 1, first = win > 0 && n > win ? n - win : 0;
+    int L = cc_attn_dec_len(n - first, hc), t0 = first + b * L, cnt = min(L, n - t0);
+    size_t xo0 = ((size_t)(s * p.H + kvh * G) * nb + b) * stride, xg = (size_t)nb * stride;   /* head kvh * G + g at xo0 + g * xg */
+    if (cnt <= 0) {
+        if (tid < G) { xs[xo0 + tid * xg] = -3.0e38f; xs[xo0 + tid * xg + 1] = 0.f; }
+        for (int i = tid; i < G * hd; i += 256) xs[xo0 + (i / hd) * xg + 2 + i % hd] = 0.f;
+        return;
+    }
+    int qb = p.q_off + s * p.q_row + kvh * G * p.q_seg;
+    for (int i = tid; i < G * NV; i += 256) {
+        int g = i / NV, c = i - g * NV;
+        const float *x = q + qb + g * p.q_seg + 4 * c;
+        qv[i] = make_float4(x[0], x[1], x[2], x[3]);
+    }
+    __syncthreads();
+    const float4 *kc4 = (const float4 *)(kc + p.k_off), *vc4 = (const float4 *)(vc + p.v_off);
+    int kbase = kvh * p.cap;
+    for (int j = wp; j < cnt; j += 8) {
+        size_t kr = (size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * NV;
+        float4 kk[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) { int c = lane + 32 * i; kk[i] = c < NV ? kc4[kr + c] : make_float4(0.f, 0.f, 0.f, 0.f); }
+        float a[G];
+#pragma unroll
+        for (int g = 0; g < G; g++) a[g] = 0.f;
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            int c = lane + 32 * i;
+            if (c < NV)
+#pragma unroll
+                for (int g = 0; g < G; g++) {
+                    float4 x = qv[g * NV + c];
+                    a[g] += x.x * kk[i].x + x.y * kk[i].y + x.z * kk[i].z + x.w * kk[i].w;
+                }
+        }
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float x = a[g];
+            for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
+            if (lane == 0) sc[g * 256 + j] = x * p.scale;
+        }
+    }
+    __syncthreads();
+    float M[G], e[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) M[g] = -3.0e38f;
+    for (int j = tid; j < cnt; j += 256)
+#pragma unroll
+        for (int g = 0; g < G; g++) M[g] = fmaxf(M[g], sc[g * 256 + j]);
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        float x = M[g];
+        for (int m = 16; m > 0; m >>= 1) x = fmaxf(x, cc_shfl_xor(x, m));
+        if (lane == 0) red[g * 8 + wp] = x;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; g++) { M[g] = red[g * 8]; for (int k = 1; k < 8; k++) M[g] = fmaxf(M[g], red[g * 8 + k]); }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < G; g++) e[g] = 0.f;
+    for (int j = tid; j < cnt; j += 256)
+#pragma unroll
+        for (int g = 0; g < G; g++) { float w = expf(sc[g * 256 + j] - M[g]); sc[g * 256 + j] = w; e[g] += w; }
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        float x = e[g];
+        for (int m = 16; m > 0; m >>= 1) x += cc_shfl_xor(x, m);
+        if (lane == 0) red[g * 8 + wp] = x;
+    }
+    __syncthreads();
+    int c = tid % NV, grp = tid / NV;
+    float4 acc[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) acc[g] = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int j = grp; j < cnt; j += NG) {
+        float4 v = vc4[(size_t)(kbase + (ring ? (t0 + j) % ring : t0 + j)) * NV + c];
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float w = sc[g * 256 + j];
+            acc[g].x += w * v.x; acc[g].y += w * v.y; acc[g].z += w * v.z; acc[g].w += w * v.w;
+        }
+    }
+    for (int k = NG - 1; k >= 1; k--) {   /* the groups' sums into group 0's, the last group first */
+        if (grp == k)
+#pragma unroll
+            for (int g = 0; g < G; g++) {
+                float4 x = qv[g * NV + c];
+                qv[g * NV + c] = k == NG - 1 ? acc[g] : make_float4(x.x + acc[g].x, x.y + acc[g].y, x.z + acc[g].z, x.w + acc[g].w);
+            }
+        __syncthreads();
+    }
+    if (grp == 0)
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float4 v = acc[g];
+            if (NG > 1) { float4 x = qv[g * NV + c]; v = make_float4(v.x + x.x, v.y + x.y, v.z + x.z, v.w + x.w); }
+            float *o = xs + xo0 + g * xg + 2 + 4 * c;
+            o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
+        }
+    if (tid < G) {
+        float l = 0.f;
+        for (int k = 0; k < 8; k++) l += red[tid * 8 + k];
+#pragma unroll
+        for (int g = 0; g < G; g++) if (g == tid) { xs[xo0 + g * xg] = M[g]; xs[xo0 + g * xg + 1] = l; }   /* M[] by a constant index */
+    }
+}
+/* the query heads a KV head cc_attn_decg_k takes (0: none, cc_attn_dec_k a head a block);
+ * COLI_CUDA_ATTN_DEC_GQA=0 never */
+static int cc_decg_heads(int G, int hd) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
+    return on && hd >= 4 && hd <= 256 && hd % 4 == 0 && (G == 2 || G == 4 || G == 8 || G == 16) ? G : 0;
+}
+static void cc_decg_launch(CcCtx *c, int G, const float *q, const float *kc, const float *vc, float *xs, const CcAttn &p, int nb,
+                           int win, int ring, int hc) {
+    dim3 g((unsigned)p.KVH, (unsigned)nb, (unsigned)p.S);
+    size_t sm = (size_t)G * (p.hd + 256) * sizeof(float);
+    switch (G) {
+    case 2: cc_attn_decg_k<2><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
+    case 4: cc_attn_decg_k<4><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
+    case 8: cc_attn_decg_k<8><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
+    default: cc_attn_decg_k<16><<<g, 256, sm, c->stream>>>(q, kc, vc, xs, p, nb, win, ring, hc); break;
     }
 }
 static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
@@ -1622,9 +1765,11 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
             CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
             return cc_attn(q, kc, vc, o, gate, sel, &b);
         }
-        int nb = 1;
+        /* a KV head's query heads a block where cc_attn_decg_k takes them (offsets of whole float4s):
+         * its rule counts four blocks a KV head */
+        int gq = p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;
         for (int r = 0; r < p->S; r++) {
-            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, hc), m = (n + L - 1) / L;
             if (m > nb) nb = m;
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
@@ -1639,10 +1784,11 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
             else { c->adec = nullptr; (void)cudaGetLastError(); }
         }
         if (c->adec) {
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
+            if (gq) cc_decg_launch(c, gq, fp(q), fp(kc), fp(vc), c->adec, *p, nb, 0, 0, hc);
+            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
                 fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc);
             return launched(c, "attn (positions in blocks)");
         }
     }
@@ -1890,9 +2036,9 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
             CcAttnW b = *w; b.a.S -= k; b.a.pos_base += k; b.a.q_off += k * p->q_row; b.a.o_off += k * p->o_row; b.a.g_off += k * p->g_row;
             return cc_attn_w2(q, kc, vc, o, gate, snk, &b, ring);
         }
-        int nb = 1;
+        int gq = p->k_off % 4 == 0 && p->v_off % 4 == 0 ? cc_decg_heads(G, p->hd) : 0, hc = gq ? 4 * p->KVH : p->H, nb = 1;   /* as in cc_attn */
         for (int r = 0; r < p->S; r++) {
-            int n = CC_WPOS(r), L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            int n = CC_WPOS(r), L = cc_attn_dec_len(n, hc), m = (n + L - 1) / L;
             if (m > nb) nb = m;
         }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
@@ -1907,10 +2053,11 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
             else { c->adec = nullptr; (void)cudaGetLastError(); }
         }
         if (c->adec) {
-            cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
+            if (gq) cc_decg_launch(c, gq, fp(q), fp(kc), fp(vc), c->adec, *p, nb, win, ring, hc);
+            else cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
                 fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }
     }

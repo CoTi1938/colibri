@@ -3404,6 +3404,34 @@ static void bench_dn(void) {
     free(cv); free(ab); free(z); free(prm);
 }
 
+/* COLI_VK_CHAIN_BENCH=adec: a decode step's attention over many positions (chain_attn_dec) at
+ * Qwen3.6's shapes, each of n layers its own K and V (a forward's rows come from memory);
+ * COLI_VK_BENCH_ADEC "H KVH hd positions" sets them */
+static void bench_adec(void) {
+    int H = 16, KVH = 2, hd = 256, pos = 18000, n = 10;
+    const char *sh = getenv("COLI_VK_BENCH_ADEC");
+    if (sh && *sh) sscanf(sh, "%d %d %d %d", &H, &KVH, &hd, &pos);
+    size_t kv = (size_t)KVH * (pos + 1) * hd;
+    float *q = fvec((size_t)H * hd, 1.f), *k = fvec(kv, 1.f);
+    VkcBuf *qb = up(q, (size_t)H * hd), *ob = vkc_buf((size_t)H * hd * 4, VKC_DEV), *kb[10], *vb[10];
+    for (int l = 0; l < n; l++) { kb[l] = up(k, kv); vb[l] = up(k, kv); }
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 5 && ok; r++) {
+        vkc_begin();
+        for (int l = 0; l < n && ok; l++) {
+            VkcAttn a = {1, H, KVH, hd, pos, pos + 1, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
+            ok = vkc_attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (dt < best) best = dt;
+    }
+    VkcStats st; vkc_stats(&st);
+    if (ok) printf("bench adec H %d/%d hd %d at %d positions: %.1f us a layer (%.1f GB/s of K and V; %llu by KV head of %llu)\n",
+                   H, KVH, hd, pos, best * 1e6 / n, 2.0 * kv * 4 * n / best / 1e9, st.attn_dec_gqa, st.attn_dec);
+    for (int l = 0; l < n; l++) { vkc_free(kb[l]); vkc_free(vb[l]); }
+    vkc_free(qb); vkc_free(ob); free(q); free(k);
+}
+
 /* COLI_VK_CHAIN_BENCH=moe: the routed experts in the frame (vkc_route + vkc_moe) at
  * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
  * "122 142" sets them), random blocks, S rows of K = 10 experts of 256, each layer of the
@@ -3848,6 +3876,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "adec")) bench_adec();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
@@ -3976,9 +4005,23 @@ int main(int argc, char **argv) {
         test_attn_hk(3, 250, 16, 2, 256, 0); test_attn_hk(1, 299, 4, 2, 128, 0);
         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
+        /* Flint's: full layers with a sink, a window with a sink, linear and in a ring; in blocks
+         * where the device has the matrix units */
+        VkcStats f0; vkc_stats(&f0);
+        test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(3, 5000, 32, 4, 128, 128, 128, 0, 1, 0);
+        test_attn_win(1, 4000, 32, 4, 128, 128, 200, 236, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
+        VkcStats f1; vkc_stats(&f1);
+        if (f1.attn_flash > 0) {
+            CHECK(f1.attn_dec >= f0.attn_dec + 4, "attn: a window's or a sink's decode in blocks (%llu of 4)", f1.attn_dec - f0.attn_dec);
+            const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
+            if (!(ge && *ge == '0'))
+                CHECK(f1.attn_dec_gqa >= f0.attn_dec_gqa + 4, "attn: %llu of 4 decodes a KV head's query heads a workgroup",
+                      f1.attn_dec_gqa - f0.attn_dec_gqa);
+        }
         test_attn_rows_bits(3, 700, 16, 2, 256); test_attn_rows_bits(6, 700, 16, 2, 256);
         test_attn_rows_bits(6, 125, 16, 2, 128); test_attn_rows_bits(6, 4093, 16, 2, 128);
-        VkcStats ad; vkc_stats(&ad); printf("  decode attentions in blocks of positions: %llu\n", ad.attn_dec);
+        VkcStats ad; vkc_stats(&ad);
+        printf("  decode attentions in blocks of positions: %llu (%llu a KV head's query heads a workgroup)\n", ad.attn_dec, ad.attn_dec_gqa);
         rng = rng_was;
     }
     printf("attn done\n");

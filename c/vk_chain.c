@@ -49,6 +49,7 @@ static const char *const pipe_file[P_NPIPE] = {
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
 #define VKC_FA_MAX 8   /* chain_attn_flash pipelines, a (head dim, query heads a KV head) each */
+#define VKC_ADG_MAX 8  /* chain_attn_dec's grouped pipelines (mode 2), a (head dim, query heads a KV head) each */
 #define VKC_FA_ROWS 64 /* chain_attn_flash's query rows a workgroup (its R) */
 #define VKC_FA_SLICE 16 /* chain_attn_flash's units of COLI_VK_ATTN_SLICE's budget to chain_attnb's one */
 #define VKC_FRAMES 16
@@ -145,6 +146,7 @@ typedef struct {
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkPipeline adg[VKC_ADG_MAX]; int adg_hd[VKC_ADG_MAX], adg_gq[VKC_ADG_MAX], nadg;   /* its grouped mode's */
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
@@ -1577,7 +1579,7 @@ int vkc_attn_block_rows(void) {
  * then followed the drafts' count). COLI_VK_ATTN_DEC=0 keeps chain_attn. */
 #define VKC_ATTN_DEC_MIN 128
 #define VKC_ATTN_DEC_ROWS 8
-static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len */
+static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len, H the workgroups of a block */
     int L = 64, nb = (n + L - 1) / L;
     while (L < 256 && (int64_t)H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
     return L;
@@ -1589,6 +1591,25 @@ static VkPipeline adec_pipe(void) {
     KC.adec_tried = 1;
     if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
     return KC.adec;
+}
+/* chain_attn_dec's grouped pipeline (mode 2) for gq query heads a KV head of head dim hd, made
+ * on first use; NULL where the shared memory it takes (the heads' q rows, scores and sums) is
+ * past the device's, or COLI_VK_ATTN_DEC_GQA=0 */
+static VkPipeline adg_pipe(int hd, int gq) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC_GQA"); on = !(e && *e == '0'); }
+    if (!on || gq < 2 || gq > 16 || hd < 1 || hd > 256 || !adec_pipe()) return VK_NULL_HANDLE;
+    for (int i = 0; i < KC.nadg; i++) if (KC.adg_hd[i] == hd && KC.adg_gq[i] == gq) return KC.adg[i];
+    if (KC.nadg == VKC_ADG_MAX) return VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+    if (((size_t)gq * (hd + 256 + 64) + hd) * 4 > pp.limits.maxComputeSharedMemorySize) return VK_NULL_HANDLE;
+    int32_t sv[2] = {gq, hd};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof sv, sv};
+    VkPipeline p = make_pipe(KC.mod_adec, &si);
+    if (!p) return VK_NULL_HANDLE;
+    KC.adg[KC.nadg] = p; KC.adg_hd[KC.nadg] = hd; KC.adg_gq[KC.nadg++] = gq;
+    return p;
 }
 /* the blocks' scratch, at least `bytes`: a smaller one goes with the open frame (freed when
  * the frame comes back), so a call never waits on the frames before it */
@@ -1615,21 +1636,33 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
     /* Only where a prompt chunk of this attention would take chain_attn_flash (f16, so a
      * row's bits already depend on how a forward is cut into steps): elsewhere the prompt's
      * chain_attnb gives a row the bits chain_attn gives it alone, and a prefix resumed must
-     * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py) */
+     * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py).
+     * Windows, rings and sinks too, since the flash shader takes them: Flint's decode after a
+     * 17K prompt read its full layers' positions a workgroup a head, 15.4 tok/s on an
+     * RTX PRO 4000 */
     int G = w->a.H / w->a.KVH;
-    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->win && !w->ring && !w->kv_pm && !w->sink && w->vd == w->a.hd &&
+    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->kv_pm && w->vd == w->a.hd &&
           w->a.hd % 64 == 0 && VKC_FA_ROWS % G == 0 && fa_pipe(w->a.hd, G))) return 0;
     if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
-    int L = attn_dec_len(n, w->a.H), nb = 1;
-    for (int r = 0; r < S; r++) {   /* the most blocks a row takes */
-        int nr = w->a.pos_base + r + 1, Lr = attn_dec_len(nr, w->a.H), m = (nr + Lr - 1) / Lr;
+    /* a KV head's query heads in one workgroup a block (mode 2), each K and V row read once
+     * for them, four floats a load (the offsets whole vec4s). Its blocks' rule counts four
+     * workgroups a KV head: Qwen3.6 after 18K positions on an RTX PRO 4000, 256 positions a
+     * block, 279 us a layer; 64 (a workgroup a KV head) 325 us, its join alone 60 */
+    VkPipeline gp = G > 1 && w->a.hd == w->vd && w->a.k_off % 4 == 0 && w->a.v_off % 4 == 0 ? adg_pipe(w->a.hd, G) : VK_NULL_HANDLE;
+    int hc = gp ? 4 * w->a.KVH : w->a.H, nb = 1;
+    for (int r = 0; r < S; r++) {   /* the most blocks a row takes, of its window's positions as the shader counts them */
+        int nr = w->a.pos_base + r + 1;
+        if (w->win > 0 && nr > w->win) nr = w->win;
+        int Lr = attn_dec_len(nr, hc), m = (nr + Lr - 1) / Lr;
         if (m > nb) nb = m;
     }
     VkcBuf *xs = adec_scratch((size_t)S * w->a.H * nb * (w->vd + 2) * 4);
     if (!xs) return 0;
-    struct { VkcAttnW w; int mode, L, nb; } pc = {*w, 0, L, nb};
+    struct { VkcAttnW w; int mode, L, nb; } pc = {*w, gp ? 2 : 0, hc, nb};
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(NULL, 0), B(snk, 0), B(xs, 1)};
-    int ok = record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)nb, (uint32_t)S);
+    int ok = gp ? record(gp, bd, 8, &pc, sizeof pc, (uint32_t)w->a.KVH, (uint32_t)nb, (uint32_t)S)
+                : record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)nb, (uint32_t)S);
+    KC.st.attn_dec_gqa += ok && gp;
     pc.mode = 1;
     bd[7].written = 0;
     ok = ok && record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)S, 1);
@@ -2305,6 +2338,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     }
     /* a decode's attention over its positions' blocks (chain_attn_dec), its join launched on
      * one row of one position */
+    if (ok && pw->attn_hd > 0 && pw->attn_gq > 1) adg_pipe(pw->attn_hd, pw->attn_gq);   /* its grouped mode: made, not run */
     if (ok && pw->attn_hd > 0 && adec_pipe()) {
         struct { VkcAttnW w; int mode, L, nb; } pc;
         memset(&pc, 0, sizeof pc);
@@ -3266,6 +3300,8 @@ void vkc_shutdown(void) {
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
     for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);
+    for (int i = 0; i < KC.nadg; i++) vkDestroyPipeline(KC.dev, KC.adg[i], NULL);
+    KC.nadg = 0;
     if (KC.mod_fa) vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL);
     if (KC.pl) vkDestroyPipelineLayout(KC.dev, KC.pl, NULL);
     if (KC.dsl) vkDestroyDescriptorSetLayout(KC.dev, KC.dsl, NULL);
