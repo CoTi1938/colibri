@@ -188,6 +188,7 @@ static void hp_route(int l, int a, int b) {   /* a row's routes, the misses offe
     int ids[2] = {a, b};
     qt_chain_count(l, ids, 2);
     for (int k = 0; k < 2; k++) if (!qt_is_resident(l, ids[k])) hp_note(l, ids[k], 2);
+}
 
 /* the reference's resident copies, matrix by matrix (sections G and H write the same lines out) */
 static void share_trunk(Model *to, const Model *from) {
