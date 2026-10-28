@@ -368,6 +368,20 @@ static float g_nuc  = 0.95f;  /* NUCLEUS env overrides */
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "matmul_f16.h"   /* the same product with W kept as half (FP16 needs F16C, BF16 runs anywhere): bit-identical, half the bytes */
+#include "kv16.h"
+
+/* ---- the KV cache's numbers (kv16.h) ------------------------------------------------
+ * Each K and V value is clamped to +-65504 and rounded to the nearest float16 as a step
+ * computes it, before anything reads it (attention(), and the Vulkan chain's rows alike).
+ * The cache stays float32 arrays holding float16's values, so the chain's mirror keeps
+ * them in float16 (olc_kvh) with the same numbers: half a decode step's reads. KV16=0:
+ * float32's. An argv run against a .json reference (the tiny oracle) keeps float32
+ * unless KV16 is set. */
+static int g_olm_kv16 = -1;
+static inline int olm_kv16(void) {
+    if (g_olm_kv16 < 0) { const char *e = getenv("KV16"); g_olm_kv16 = !(e && *e == '0'); }
+    return g_olm_kv16;
+}
 
 /* matmul for a RESIDENT f32 matrix W [O,I], with *vk caching its device copy:
  * on Vulkan when the device is up, the CPU's matmul otherwise. The backend has one
@@ -1562,6 +1576,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos = m->mux_rows ? m->mux_rows[s].pos : pos_base + s;
         for (int hh = 0; hh < H; hh++) { rope_head(q + (int64_t)s*D + hh*hd, pos, c); rope_head(k + (int64_t)s*D + hh*hd, pos, c); }
     }
+    if (olm_kv16()) { kv16_round(k, (int64_t)S*D); kv16_round(vv, (int64_t)S*D); }   /* the cache's numbers, before anything reads them */
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 (in un passo
      * multiplexato: ogni riga alla sua, nella cache della sua conversazione) */
     const OlmRow *mr = m->mux_rows;
@@ -3254,6 +3269,7 @@ int main(int argc, char **argv) {
     }
 
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+    if (!(getenv("KV16") && *getenv("KV16"))) g_olm_kv16 = 0;   /* the oracle's reference: float32 unless asked */
 
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
