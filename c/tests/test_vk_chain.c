@@ -2929,7 +2929,8 @@ static void test_kvs_cold(void) {
  * hybrid steps, the faster kept, measured again after VKC_HYB_REPROBE forwards. */
 static void test_hyb_gate(void) {
     VkcHybGate g; vkc_hyb_gate_init(&g, 1);
-    CHECK(!g.use && g.phase == 0, "hyb gate: the device's reads first");
+    CHECK(g.use && g.phase == 3, "hyb gate: the hybrid until an engine reports a forward");
+    CHECK(!vkc_hyb_gate_forward(&g, 25.0) && !g.use && g.phase == 0, "hyb gate: the first report starts the probe, the device's reads first");
     int decided = 0;
     for (int i = 0; i < VKC_HYB_PROBE + 1; i++) decided += vkc_hyb_gate_forward(&g, 20.0);   /* warm + 3 at 20 ms */
     CHECK(!decided && g.use && g.phase == 1, "hyb gate: then the hybrid steps");
