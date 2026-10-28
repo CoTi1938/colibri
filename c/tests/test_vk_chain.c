@@ -3483,19 +3483,22 @@ static void bench_adec(void) {
     float *q = fvec((size_t)H * hd, 1.f), *k = fvec(kv, 1.f);
     VkcBuf *qb = up(q, (size_t)H * hd), *ob = vkc_buf((size_t)H * hd * 4, VKC_DEV), *kb[10], *vb[10];
     for (int l = 0; l < n; l++) { kb[l] = up(k, kv); vb[l] = up(k, kv); }
+    /* COLI_VK_BENCH_KV16=1: the cache in float16 (vkc_attn_h), its buffers half the size */
+    const char *k16 = getenv("COLI_VK_BENCH_KV16");
+    int h16 = k16 && *k16 == '1' && vkc_kvh_ready();
     double best = 1e9; int ok = 1;
     for (int r = 0; r < 5 && ok; r++) {
         vkc_begin();
         for (int l = 0; l < n && ok; l++) {
             VkcAttn a = {1, H, KVH, hd, pos, pos + 1, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
-            ok = vkc_attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
+            ok = h16 ? vkc_attn_h(qb, kb[l], vb[l], ob, NULL, NULL, &a) : vkc_attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
         }
         double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
         if (dt < best) best = dt;
     }
     VkcStats st; vkc_stats(&st);
-    if (ok) printf("bench adec H %d/%d hd %d at %d positions: %.1f us a layer (%.1f GB/s of K and V; %llu by KV head of %llu)\n",
-                   H, KVH, hd, pos, best * 1e6 / n, 2.0 * kv * 4 * n / best / 1e9, st.attn_dec_gqa, st.attn_dec);
+    if (ok) printf("bench adec H %d/%d hd %d at %d positions%s: %.1f us a layer (%.1f GB/s of K and V; %llu by KV head of %llu)\n",
+                   H, KVH, hd, pos, h16 ? ", float16" : "", best * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best / 1e9, st.attn_dec_gqa, st.attn_dec);
     for (int l = 0; l < n; l++) { vkc_free(kb[l]); vkc_free(vb[l]); }
     vkc_free(qb); vkc_free(ob); free(q); free(k);
 }
