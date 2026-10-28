@@ -41,7 +41,8 @@ namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     int device, up, lost, in_frame;
-    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
+    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7, cc_attn_f2's from 8 */
+    int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
@@ -389,6 +390,221 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
             o[p.o_off + tk * p.o_row + h * HD + d] = v;
         }
     }
+#endif
+}
+/* A prompt chunk's causal attention in one pass on the tensor cores' m16n8k16 f16 MMA (sm_80
+ * and later), FlashAttention-2's online softmax. A block of NW warps takes 16 * NW query rows:
+ * 16 * NW / GQ tokens x the GQ query heads of one kv head, warp w rows 16w .. 16w + 15, so each
+ * key block of BC keys is staged once for all of them (K and V rounded to f16 as they are
+ * staged, rows of HD + 8 halves). A warp's scores stay in its registers: per row the running
+ * max m and sum l rescale its output fragments as the blocks go by, and P = exp(s - m) goes
+ * from the score fragments straight into the A operand of P V (the accumulator's layout is
+ * the A operand's, two key tiles a k-step). Q is scaled before its f16 rounding and held in
+ * registers (QREG), or read from shared memory each block (HD 256: the registers hold O).
+ * Keys: t <= pos_base + token(r), with a window t > pos_base + token(r) - win, none past nt;
+ * a warp skips the blocks none of its rows sees. A sink joins the denominator from the start
+ * (m = sink, l = 1); key t of the cache at row t % ring with a ring. cc_attn_fk took 9.6 s of
+ * a 16K prompt on Flint (RTX PRO 4000): 16 rows a block re-read K and V from L2 for every 16
+ * rows, twice. Not bit-identical to cc_attn_fk (one pass, the sums in another order).
+ * Grid: x = ceil(S / (16 * NW / GQ)) token groups, y = kv heads; dynamic shared memory
+ * cc_f2_smem_bytes. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define CC_F2_BODY 1
+__device__ __forceinline__ void cc_f2_mma(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void cc_f2_ldm(uint32_t *r, const __half *p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ void cc_f2_ldmt(uint32_t *r, const __half *p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ uint32_t cc_f2_pack(float a, float b) {
+    __half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<uint32_t *>(&h);
+}
+/* four floats as four halves at d (8-byte aligned) */
+__device__ __forceinline__ void cc_f2_put(__half *d, float4 v, float s) {
+    uint2 u = make_uint2(cc_f2_pack(v.x * s, v.y * s), cc_f2_pack(v.z * s, v.w * s));
+    *reinterpret_cast<uint2 *>(d) = u;
+}
+#else
+#define CC_F2_BODY 0
+#endif
+template<int HD, int NW, int BC, bool QREG>
+static constexpr size_t cc_f2_smem_bytes() { return ((size_t)2 * BC * (HD + 8) + (QREG ? 0 : (size_t)16 * NW * (HD + 8))) * 2; }
+template<int HD, int NW, int BC, bool QREG>
+__global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__restrict__ q, const float *__restrict__ kc,
+        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
+        int win, const float *__restrict__ snk, int sink_off, int ring) {
+#if CC_F2_BODY
+    constexpr int LD = HD + 8, BR = 16 * NW, NT = 32 * NW, NKT = BC / 8, NDT = HD / 8, KS = HD / 16;
+    static_assert(!QREG || BR <= 2 * BC, "Q is staged where K and V go");
+    extern __shared__ __align__(16) unsigned char cc_f2_sm[];
+    __half *sK = reinterpret_cast<__half *>(cc_f2_sm), *sV = sK + BC * LD, *sQ = QREG ? sK : sV + BC * LD;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int TPB = BR / GQ, g = blockIdx.y, t0 = blockIdx.x * TPB, S = p.S, pb = p.pos_base, nt = pb + S;
+    const int tlast = min(t0 + TPB, S) - 1;
+    for (int e = tid; e < BR * HD / 4; e += NT) {   /* Q, scaled, row r = (token t0 + r / GQ, head g * GQ + r % GQ) */
+        int r = e / (HD / 4), d = (e - r * (HD / 4)) * 4, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+        float4 v = tk < S ? *reinterpret_cast<const float4 *>(q + p.q_off + (size_t)tk * p.q_row + (size_t)h * p.q_seg + d)
+                          : make_float4(0.f, 0.f, 0.f, 0.f);
+        cc_f2_put(sQ + r * LD + d, v, p.scale);
+    }
+    __syncthreads();
+    const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ac = (lane >> 4) * 8;   /* an A operand's ldmatrix row and column */
+    const int br = (lane & 7) + ((lane >> 4) << 3), bc = ((lane >> 3) & 1) * 8;  /* K's: two key tiles, two halves of a k-step */
+    const int vr = (lane & 7) + (((lane >> 3) & 1) << 3), vcol = (lane >> 4) << 3; /* V's (transposed): two halves of 16 keys, two dim tiles */
+    uint32_t qa[QREG ? KS : 1][4];
+    if (QREG) {
+        #pragma unroll
+        for (int ks = 0; ks < KS; ks++) cc_f2_ldm(qa[ks], sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+        __syncthreads();   /* sQ is where the first K block goes */
+    }
+    const int r0 = warp * 16 + gid, r1 = r0 + 8;
+    const int qp0 = pb + min(t0 + r0 / GQ, S - 1), qp1 = pb + min(t0 + r1 / GQ, S - 1);
+    const int wlo = pb + min(t0 + (warp * 16) / GQ, S - 1), whi = pb + min(t0 + (warp * 16 + 15) / GQ, S - 1);
+    float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+    if (snk) {   /* the sink: m = its logit, and one term of l (on one lane of the four that share a row) */
+        m0 = snk[sink_off + g * GQ + r0 % GQ]; m1 = snk[sink_off + g * GQ + r1 % GQ];
+        if (tig == 0) { l0 = 1.f; l1 = 1.f; }
+    }
+    float oa[NDT][4];
+    #pragma unroll
+    for (int dt = 0; dt < NDT; dt++) oa[dt][0] = oa[dt][1] = oa[dt][2] = oa[dt][3] = 0.f;
+    const int kb_lo = win > 0 && pb + t0 - win + 1 > 0 ? (pb + t0 - win + 1) / BC : 0, kb_hi = (pb + tlast) / BC;
+    for (int kb = kb_lo; kb <= kb_hi; kb++) {
+        const int k0 = kb * BC;
+        for (int e = tid; e < BC * HD / 4; e += NT) {   /* K and V of keys k0 .. k0 + BC - 1, zero past nt */
+            int kl = e / (HD / 4), d = (e - kl * (HD / 4)) * 4, key = k0 + kl;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
+            if (key < nt) {
+                size_t at = (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d;
+                kv = *reinterpret_cast<const float4 *>(kc + p.k_off + at);
+                vv = *reinterpret_cast<const float4 *>(vc + p.v_off + at);
+            }
+            cc_f2_put(sK + kl * LD + d, kv, 1.f);
+            cc_f2_put(sV + kl * LD + d, vv, 1.f);
+        }
+        __syncthreads();
+        /* none of this warp's rows sees a key of the block: past its last row, or before its
+         * first row's window */
+        if (k0 <= whi && (win <= 0 || k0 + BC - 1 + win > wlo)) {
+            float sc[NKT][4];
+            #pragma unroll
+            for (int j = 0; j < NKT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
+            #pragma unroll
+            for (int ks = 0; ks < KS; ks++) {
+                uint32_t a[4];
+                if (QREG) { a[0] = qa[ks][0]; a[1] = qa[ks][1]; a[2] = qa[ks][2]; a[3] = qa[ks][3]; }
+                else cc_f2_ldm(a, sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+                #pragma unroll
+                for (int j = 0; j < NKT; j += 2) {
+                    uint32_t b[4];
+                    cc_f2_ldm(b, sK + (j * 8 + br) * LD + ks * 16 + bc);
+                    cc_f2_mma(sc[j], a, b[0], b[1]);
+                    cc_f2_mma(sc[j + 1], a, b[2], b[3]);
+                }
+            }
+            /* the masks only where a row's position or window cuts the block */
+            const bool edge = !(k0 + BC - 1 <= wlo && (win <= 0 || k0 + win > whi));
+            float x0 = -1e30f, x1 = -1e30f;
+            #pragma unroll
+            for (int j = 0; j < NKT; j++)
+                #pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    if (edge) {
+                        int key = k0 + j * 8 + tig * 2 + u;
+                        if (key > qp0 || (win > 0 && key + win <= qp0)) sc[j][u] = -1e30f;
+                        if (key > qp1 || (win > 0 && key + win <= qp1)) sc[j][2 + u] = -1e30f;
+                    }
+                    x0 = fmaxf(x0, sc[j][u]); x1 = fmaxf(x1, sc[j][2 + u]);
+                }
+            x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 1)); x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 2));
+            x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 1)); x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 2));
+            const float n0 = fmaxf(m0, x0), n1 = fmaxf(m1, x1), c0 = __expf(m0 - n0), c1 = __expf(m1 - n1);
+            m0 = n0; m1 = n1; l0 *= c0; l1 *= c1;
+            #pragma unroll
+            for (int dt = 0; dt < NDT; dt++) { oa[dt][0] *= c0; oa[dt][1] *= c0; oa[dt][2] *= c1; oa[dt][3] *= c1; }
+            uint32_t pa[BC / 16][4];
+            #pragma unroll
+            for (int j = 0; j < NKT; j++) {
+                float p0 = sc[j][0] > -1e29f ? __expf(sc[j][0] - m0) : 0.f, p1 = sc[j][1] > -1e29f ? __expf(sc[j][1] - m0) : 0.f;
+                float p2 = sc[j][2] > -1e29f ? __expf(sc[j][2] - m1) : 0.f, p3 = sc[j][3] > -1e29f ? __expf(sc[j][3] - m1) : 0.f;
+                l0 += p0 + p1; l1 += p2 + p3;
+                pa[j >> 1][(j & 1) * 2] = cc_f2_pack(p0, p1);
+                pa[j >> 1][(j & 1) * 2 + 1] = cc_f2_pack(p2, p3);
+            }
+            #pragma unroll
+            for (int kk = 0; kk < BC / 16; kk++)
+                #pragma unroll
+                for (int dt = 0; dt < NDT; dt += 2) {
+                    uint32_t b[4];
+                    cc_f2_ldmt(b, sV + (kk * 16 + vr) * LD + dt * 8 + vcol);
+                    cc_f2_mma(oa[dt], pa[kk], b[0], b[1]);
+                    cc_f2_mma(oa[dt + 1], pa[kk], b[2], b[3]);
+                }
+        }
+        __syncthreads();   /* sK and sV are rewritten next block */
+    }
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int r = half ? r1 : r0, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+        if (tk >= S) continue;
+        const float inv = half ? i1 : i0;
+        float *orow = o + p.o_off + (size_t)tk * p.o_row + (size_t)h * HD;
+        const float *grow = gt + p.g_off + (size_t)tk * p.g_row + (size_t)h * p.g_seg;
+        #pragma unroll
+        for (int dt = 0; dt < NDT; dt++) {
+            const int d = dt * 8 + tig * 2;
+            float v0 = oa[dt][half * 2] * inv, v1 = oa[dt][half * 2 + 1] * inv;
+            if (p.has_gate) { v0 *= 1.f / (1.f + __expf(-grow[d])); v1 *= 1.f / (1.f + __expf(-grow[d + 1])); }
+            orow[d] = v0; orow[d + 1] = v1;
+        }
+    }
+#endif
+}
+/* cc_attn_f2 for a prompt chunk where it applies (1: launched): sm_80 and later, head dim 64,
+ * 128 or 256, the query heads of a kv head dividing 64, rows and caches at float4 offsets;
+ * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
+static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
+                         int win, const float *sk, int so, int ring) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
+    if (!on || c->major < 8 || 64 % G || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
+        (p->q_off | p->q_row | p->q_seg | p->k_off | p->v_off) % 4) return 0;
+    dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
+    if (p->hd == 64) {
+        cc_attn_f2<64, 4, 64, true><<<fg, 128, cc_f2_smem_bytes<64, 4, 64, true>(), c->stream>>>(
+            fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    } else if (p->hd == 128) {
+        cc_attn_f2<128, 4, 64, true><<<fg, 128, cc_f2_smem_bytes<128, 4, 64, true>(), c->stream>>>(
+            fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    } else {
+        const size_t sm = cc_f2_smem_bytes<256, 4, 32, false>();
+        if (!c->f2_big) {
+            int optin = 0;
+            c->f2_big = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, c->device) == cudaSuccess &&
+                        (size_t)optin >= sm &&
+                        cudaFuncSetAttribute(cc_attn_f2<256, 4, 32, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm) == cudaSuccess
+                        ? 1 : -1;
+            (void)cudaGetLastError();
+        }
+        if (c->f2_big < 0) return 0;
+        cc_attn_f2<256, 4, 32, false><<<fg, 128, sm, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+    }
+    return 1;
+#else
+    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring;
+    return 0;
 #endif
 }
 /* one thread per channel, the rows in order, the channel's ring in registers */
@@ -1174,21 +1390,50 @@ static int cc_grid_of(const CcRegion *r, int n, CcGrid *g) {
     *g = CcGrid{d0, s0, dh, sh, dq, sq, (int)L, per, n};
     return 1;
 }
+/* How many of the regions from r[0] make one grid, in whole rows of it. A list that is not one
+ * grid is often a few: the rows a step writes into a ring break where the ring wraps (on Flint
+ * each sliding layer's prompt step wrote 2 x 1538 regions a cudaMemcpyAsync each, 862400 calls
+ * and about 15 s of host time in a 16K prompt on an RTX PRO 4000), and each side is a grid. */
+static int cc_grid_run(const CcRegion *r, int n) {
+    if (n < 2) return n;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].n == L && (long long)r[per].dst - (long long)r[per - 1].dst == dh &&
+           (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (per == n) return n;
+    long long dq = (long long)r[per].dst - d0, sq = (long long)r[per].src - s0;
+    int Q = 1;
+    for (; (Q + 1) * per <= n; Q++) {
+        int ok = 1;
+        for (int h = 0; h < per && ok; h++) {
+            const CcRegion *x = &r[Q * per + h];
+            ok = (long long)x->n == L && (long long)x->dst == d0 + Q * dq + h * dh && (long long)x->src == s0 + Q * sq + h * sh;
+        }
+        if (!ok) break;
+    }
+    return Q * per;
+}
 static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     CcCtx *c = live();
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
     CcGrid g;
-    if (dst != src && dst->d && src->d && cc_grid_of(r, n, &g)) {   /* one kernel for the grid */
-        long long tot = (long long)g.n * g.len;
-        cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
-        return launched(c, "copy regions (grid)");
-    }
-    for (int i = 0; i < n; i++) {
-        if (!r[i].n) continue;
-        if (!cc_ok(c, cudaMemcpyAsync(dst->d + r[i].dst, src->d + r[i].src, r[i].n * 4, cudaMemcpyDefault, c->stream), "copy regions"))
+    const int grids = dst != src && dst->d && src->d;
+    for (int i = 0; i < n; ) {
+        int k = grids ? cc_grid_run(r + i, n - i) : 1;
+        if (k >= 2 && cc_grid_of(r + i, k, &g)) {   /* one kernel for each grid */
+            long long tot = (long long)g.n * g.len;
+            cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
+            if (!launched(c, "copy regions (grid)")) return 0;
+            i += k;
+            continue;
+        }
+        if (r[i].n && !cc_ok(c, cudaMemcpyAsync(dst->d + r[i].dst, src->d + r[i].src, r[i].n * 4, cudaMemcpyDefault, c->stream),
+                             "copy regions"))
             return 0;
+        i++;
     }
     g_st.ops++;
     return 1;
@@ -1344,6 +1589,8 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     int G = p->H / p->KVH;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    if (fl > 0 && p->S >= fl && p->sel_row <= 0 && cc_attn_f2_go(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
+        return launched(c, "attn (tensor cores, one pass)");
     if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
         if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
@@ -1620,6 +1867,8 @@ static int cc_attn_w2(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcB
     int G = p->H / p->KVH, fk = 0;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
+    if (fl > 0 && p->S >= fl && cc_attn_f2_go(c, q, kc, vc, o, gate, p, G, win, sk, so, ring))
+        return launched(c, "attn (tensor cores, one pass, window, sinks)");
     if (fk && p->S >= fl) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
         if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);

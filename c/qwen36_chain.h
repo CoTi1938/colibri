@@ -592,14 +592,15 @@ static void q36c_place(Model *m) {
 /* Prompt rows per chunk (vkc_chunk_rows): the chain's scratch a row, counted from the
  * reservations themselves, and the routed experts' outputs (the tier's rows, the
  * CPU's contributions, and the host's sum) for it. */
-static int q36c_chunk_rows(Q36Chain *ch, Model *m) {
+static size_t q36c_chunk_row_bytes(Q36Chain *ch, Model *m) {
     g_q36c_count = 0; q36c_bufs(ch, m, 1); long long b1 = g_q36c_count;
     g_q36c_count = 0; q36c_bufs(ch, m, 2); long long b2 = g_q36c_count;
     g_q36c_count = -1;
     size_t row = (size_t)(b2 - b1) + (size_t)(m->c.n_experts > 0 ? 2 * m->c.topk + 1 : 0) * m->c.hidden * sizeof(float);
     if (ch->ks.on) row += (long long)m->c.q_heads * (3 * (m->c.head_dim + 2) + m->c.q_head_dim) * sizeof(float);
-    return vkc_chunk_rows("qwen36", row);
+    return row;
 }
+static int q36c_chunk_rows(Q36Chain *ch, Model *m) { return vkc_chunk_rows("qwen36", q36c_chunk_row_bytes(ch, m)); }
 
 /* the scratch buffers for `rows` rows */
 static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
@@ -664,12 +665,14 @@ static size_t q36c_late_bytes(Model *m, int ctx) {
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk: positions [0, need) of the one
  * conversation the chain holds. The mirror grows with the context, as a multiplexed place does
- * (q36c_conv_grow): twice what it held, from Q36C_CONV_ROWS, rounded to 1024, at most the
- * context, its rows again from the host. A device without the room takes it from the
- * expert tier (vkt_give_back), which reserved only the start (q36c_late_bytes at
- * Q36C_KV_START). Before, the mirror took the host's whole capacity at the first forward:
- * 2.79 GiB of an 8 GB card for Flint at 64K of context, whose tier then held 1.41 GiB of
- * experts against 3.67 at 8K (decode 43.1 against 49.4 tok/s on an RTX PRO 4000 at 7.4 GB). */
+ * (q36c_conv_grow): twice what it held from Q36C_CONV_ROWS, or what the step needs where that
+ * is more (a long prompt: doubling to 32768 positions for 17.6K tokens gave the tier 1.2 GiB
+ * of Qwen3.6's experts back for nothing), rounded to 1024, at most the context, its rows again
+ * from the host. A device without the room takes it from the expert tier (vkt_give_back),
+ * which reserved only the start (q36c_late_bytes at Q36C_KV_START). Before, the mirror took
+ * the host's whole capacity at the first forward: 2.79 GiB of an 8 GB card for Flint at 64K
+ * of context, whose tier then held 1.41 GiB of experts against 3.67 at 8K (decode 43.1
+ * against 49.4 tok/s on an RTX PRO 4000 at 7.4 GB). */
 #define Q36C_KV_MARGIN ((size_t)256 << 20)
 static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     Cfg *c = &m->c; int KV = c->kv_heads;
@@ -684,7 +687,7 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
          * ring (q36c_ring), the rest keep theirs */
     } else {
         cap = cap ? 2 * cap : Q36C_CONV_ROWS;
-        while (cap < need) cap *= 2;
+        if (cap < need) cap = need;
         cap = (cap + 1023) / 1024 * 1024;
         if (cap > top) cap = top;
         if (cap < need) { ch->cap = 0; return 0; }
@@ -696,17 +699,34 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     int leq = nf + (nr ? (int)(((size_t)nr * m->kv_ring + cap - 1) / cap) : 0);
     size_t held = 0;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i] && ch->kc[i]) held += (size_t)ch->kv_rows[i] * row;
-    /* the full layers' rows past Q36C_KV_START come out of the tier: the memory free beside
-     * a mirror of that start (keep, measured at the first) stays free, so a long
-     * conversation's prompt chunks are the size a short one's are */
+    /* the full layers' rows past Q36C_KV_START come out of the tier where the device lacks
+     * them, so a long conversation's prompt chunks are the size a short one's are: once the
+     * prompt scratch exists, what it lacks for a chunk of the most rows stays free (and a
+     * margin); before that, the memory free beside a mirror of that start (keep, measured at
+     * the first). Keeping all of it took 512 MiB of Qwen3.6's experts for 240 MiB of mirror at
+     * 4K on an RTX PRO 4000 whose budget left 2.36 GiB unused (1805 against 773 tok/s) */
     size_t want = (size_t)nf * cap * row, more = want > held ? want - held : 0;
     if (!ch->keep) {
         const size_t start = (size_t)nf * (top < Q36C_KV_START ? top : Q36C_KV_START) * row, av = vkc_dev_avail() + held;
         ch->keep = av > start + Q36C_KV_MARGIN ? av - start : Q36C_KV_MARGIN;
     }
+    size_t keep = ch->keep;
+    if (ch->rows > 0) {
+        const int rmax = q36c_chunk_rows(ch, m);
+        keep = (rmax > ch->rows ? (size_t)(rmax - ch->rows) * q36c_chunk_row_bytes(ch, m) : 0) + Q36C_KV_MARGIN;
+    }
+    /* a mirror that cannot split (a sliding window, sinks: Flint) must fit the plan's room
+     * whole (vkc_kv_plan_need: four fifths of the free memory and what the mirror holds):
+     * past it the chain stops, and the prompt's rest takes the per-matrix path (Flint with
+     * 7 GiB free, a 17K-token prompt: 16256 of 17408 positions fit, 32.8 tok/s) */
+    size_t target = more + keep;
+    if (c->attn_sinks || c->win_layer) {
+        const size_t whole = (size_t)leq * cap * row / 8 * 10 + ((size_t)1 << 20);
+        if (whole > held && whole - held > target) target = whole - held;
+    }
     size_t took = 0;
     const size_t av0 = vkc_dev_avail();
-    if (more && av0 < more + ch->keep) took = vkt_give_back(more + ch->keep - av0);
+    if (more && av0 < target) took = vkt_give_back(target - av0);
     if (ch->cap && cap != ch->cap)
         fprintf(stderr, "[VK] qwen36 chain: the KV mirror grows from %d to %d positions (%.1f MiB more, %.1f MiB of them from the "
                         "expert tier)\n", ch->cap, cap, more / 1048576.0, took / 1048576.0);

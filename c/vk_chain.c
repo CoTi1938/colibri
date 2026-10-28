@@ -1053,6 +1053,28 @@ static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g) {
     *g = (VkcCp2){(uint32_t)d0, (uint32_t)s0, (int32_t)dh, (int32_t)sh, (int32_t)dq, (int32_t)sq, (uint32_t)L, (uint32_t)per, (uint32_t)n};
     return 1;
 }
+/* how many of the regions from r[0] make one grid, in whole rows of it (cuda_chain.cu's
+ * cc_grid_run): a ring's rows break where the ring wraps, and each side is a grid */
+static int cp2_run(const VkcRegion *r, int n) {
+    if (n < 2) return n;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].n == L && (long long)r[per].dst - (long long)r[per - 1].dst == dh &&
+           (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (per == n) return n;
+    long long dq = (long long)r[per].dst - d0, sq = (long long)r[per].src - s0;
+    int Q = 1;
+    for (; (Q + 1) * per <= n; Q++) {
+        int ok = 1;
+        for (int h = 0; h < per && ok; h++) {
+            const VkcRegion *x = &r[Q * per + h];
+            ok = (long long)x->n == L && (long long)x->dst == d0 + Q * dq + h * dh && (long long)x->src == s0 + Q * sq + h * sh;
+        }
+        if (!ok) break;
+    }
+    return Q * per;
+}
 int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
     VkcFrame *f = open_frame();
     if (!f || KC.lost) return 0;
@@ -1063,17 +1085,28 @@ int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
         }
     VkcCp2 g;
     const char *e = getenv("COLI_VK_COPY_GRID");   /* 0: every list through the copy command */
-    if (dst != src && !(e && *e == '0') && cp2_grid(r, n, &g) && cp2_pipe()) {
-        KC.kind = PK_COPY;
-        VkcBind bd[2] = {B(src, 0), B(dst, 1)};
-        uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
-        if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) return 0;
-        KC.st.copy_grids++;
-        return 1;
+    const int grids = dst != src && !(e && *e == '0') && n >= VKC_CP2_MIN && cp2_pipe();
+    VkBufferCopy *c = NULL;
+    int nc = 0;
+    for (int i = 0; i < n; ) {   /* each grid of VKC_CP2_MIN regions or more in a launch, the rest in one copy */
+        int k = grids ? cp2_run(r + i, n - i) : n - i;
+        if (grids && k >= VKC_CP2_MIN && cp2_grid(r + i, k, &g)) {
+            KC.kind = PK_COPY;
+            VkcBind bd[2] = {B(src, 0), B(dst, 1)};
+            uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
+            if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) { free(c); return 0; }
+            KC.st.copy_grids++;
+            i += k;
+            continue;
+        }
+        if (!c && !(c = malloc((size_t)(n - i) * sizeof *c))) return 0;
+        for (int j = i; j < i + k; j++) c[nc++] = (VkBufferCopy){r[j].src * 4, r[j].dst * 4, r[j].n * 4};
+        i += k;
     }
-    VkBufferCopy *c = malloc((size_t)n * sizeof *c);
-    if (!c) return 0;
-    for (int i = 0; i < n; i++) c[i] = (VkBufferCopy){r[i].src * 4, r[i].dst * 4, r[i].n * 4};
+    if (!nc) { free(c); return 1; }
+    n = nc;
+    f = open_frame();   /* a launch above may have closed the frame */
+    if (!f) { free(c); return 0; }
     VkBuffer rb = src->buf, wb = dst->buf;
     hazard(f, &rb, 1, &wb, 1);
     vkCmdCopyBuffer(f->cmd, src->buf, dst->buf, (uint32_t)n, c);
@@ -1513,9 +1546,11 @@ static VkPipeline fa_pipe(int hd, int gq) {
     KC.fa[KC.nfa] = p; KC.fa_hd[KC.nfa] = hd; KC.fa_gq[KC.nfa++] = gq;
     return p;
 }
-/* From COLI_VK_CHAIN_FLASH rows (16; 0 = never) a plain causal attention (no list,
- * window, ring, sink or second V width, head dim a multiple of 64) takes
- * chain_attn_flash where the device has it, ahead of the blocked shader. */
+/* From COLI_VK_CHAIN_FLASH rows (16; 0 = never) a causal attention without a selection
+ * list, position-major rows or a second V width (head dim a multiple of 64; a window, a
+ * ring and sinks as chain_attnb takes them) takes chain_attn_flash where the device has it,
+ * ahead of the blocked shader: Flint's (sliding layers with sinks, the others with sinks)
+ * took chain_attnb for 100.2 of a 16K prompt's 106 s of device time on an RTX PRO 4000. */
 int vkc_attn_flash_rows(void) {
     const char *e = getenv("COLI_VK_CHAIN_FLASH");
     int v = e && *e ? atoi(e) : 16;
@@ -1605,10 +1640,10 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     if (w.a.hd > 256 || w.vd > 256 || w.a.H % w.a.KVH || w.win < 0 || w.ring < 0 || (w.sink && !snk)) return 0;
     VkcBind bd[7] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(sel, 0), B(snk, 0)};
     int G = w.a.H / w.a.KVH, blk = vkc_attn_block_rows(), fl = vkc_attn_flash_rows();
-    /* a prompt chunk's plain causal attention on the matrix units (chain_attn_flash),
-     * 16 / G rows a workgroup; else the blocked shader, else chain_attn */
-    VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
-                    !w.sink && w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
+    /* a prompt chunk's causal attention on the matrix units (chain_attn_flash), 16 / G rows a
+     * workgroup; else the blocked shader, else chain_attn */
+    VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.kv_pm &&
+                    w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
     int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
     /* a decode's or a verify's rows over many positions: split over them; a verify across
      * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
