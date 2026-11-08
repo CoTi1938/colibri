@@ -1,3 +1,44 @@
+## This fork: CoTi1938's work on colibri
+
+My pull requests to [JustVugg/colibri](https://github.com/JustVugg/colibri): 27 merged and 18 open, as of
+8 November 2026. They cover the Qwen3.6 and Qwen3.8 engines on CUDA, Vulkan, Apple Silicon (Metal) and the CPU, and
+the RAM planner. Benchmark records for the results below are in `docs/experiments/` (for the open PRs, on their
+branches).
+
+**Merged**
+
+| PR | GPU | workload | result | cost |
+|---|---|---|---|---|
+| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 512-token prompt after a 64-token one and 32 decoded tokens | 180.18 → 440.11 tok/s (+144.3%) | moving experts first takes 58 ms, included; outputs change after a large chunk |
+| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 8-turn agent session, replayed teacher-forced | 71.6 → 43.1 s | 365 ms of expert moves, included |
+| [#2453](https://github.com/JustVugg/colibri/pull/2453) | Colab T4 | 8192-token prompt, first in a process | 593.79 → 898.76 tok/s (+51.36%) | NLL +0.12% (s.e. 0.10%) over the next 1024 tokens; more registers and shared memory |
+| [#2421](https://github.com/JustVugg/colibri/pull/2421) | RTX PRO 4000 | Qwen3.6 decode after a 64-token prompt, all experts in VRAM | 74.748 → 145.064 tok/s (+94.1%) | 970 KiB of VRAM per logit row; L4 decode −0.6…−0.7%; the size of the gain depends on that host |
+| [#2418](https://github.com/JustVugg/colibri/pull/2418) | RTX PRO 4000 | Qwen3.8 UD-Q2_K_XL, 1628-token prompt, all experts in the RAM pool | 216.2 → 424 tok/s (+96%) | chain reserve 1.59 → 2.51 GiB, fewer resident experts; decode −0.5…−3.1%; 150-token prompts −3.9% and −5.7% |
+| [#2422](https://github.com/JustVugg/colibri/pull/2422) | A100 80 GB, Vulkan | Qwen3.8 int4, 64-token prompt and 256 teacher-forced tokens | 20.46 → 43.12 tok/s | VRAM 41,254 → 69,711 MiB; a 2.3-2.4 s probe at every start; outputs change (NLL 2.4113 → 2.3988) |
+
+**Open**
+
+| PR | GPU | workload | result | cost |
+|---|---|---|---|---|
+| [#2433](https://github.com/JustVugg/colibri/pull/2433) | Colab T4 | 64-token prompt after a 512-token one, on the stack | 99.23 → 211.71 tok/s (+113.3%) | ready 19.88 → 22.80 s; pinned RAM 6.00 → 16.88 GB (the same pages); NLL 2.6919 → 2.6942; first step up to about 2 ms slower |
+| [#2428](https://github.com/JustVugg/colibri/pull/2428) | Colab T4 | 64-token prompt, first in a process, on the stack | 92.45 → 146.44 tok/s (+58.4%) | 52.2 KiB of host RAM; chat turn-2 decode −0.2% |
+| [#2424](https://github.com/JustVugg/colibri/pull/2424) | Colab T4 | 512-token prompt alone, on top of #2423 | 519.29 → 657.25 tok/s (+26.6%) | 161 MB more staging VRAM (computed), 161 MB less room for KV mirrors; decode −0.3…−1.3%, within noise |
+| [#2425](https://github.com/JustVugg/colibri/pull/2425) | L4, Vulkan | Qwen3.6 tier initialization | did not finish within 300 s → 18.1-23.2 s | decode −1.1% (A100), −3.1…−7.0% (RTX 4090); memory other processes free later is not taken back |
+
+[#2434](https://github.com/JustVugg/colibri/pull/2434), the prompt attention with 16-byte loads (+29.07% on an
+8192-token prompt, measured before #2453), now matters only on sm_70 or with `COLI_CUDA_CHAIN_FLASH2=0`.
+The Metal series ([#2015](https://github.com/JustVugg/colibri/pull/2015),
+[#2016](https://github.com/JustVugg/colibri/pull/2016),
+[#2298](https://github.com/JustVugg/colibri/pull/2298)-[#2308](https://github.com/JustVugg/colibri/pull/2308)) runs
+Qwen3.6 on the GPU of Apple Silicon, GGUF files included; #2298-#2308 did not apply on `dev` when last checked
+(28 October).
+
+Each result compares the builds and configuration in its benchmark record; "on the stack" means `dev` with other PRs
+of this fork on top, as the record lists them. Colab T4 is the high-RAM runtime. The project's licence and notices
+apply (Apache 2.0, `LICENSE`, `NOTICE`); my changes are contributed under the same licence.
+
+---
+
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì: tiny engine, immense model">
 </p>
