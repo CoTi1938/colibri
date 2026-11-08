@@ -66,39 +66,23 @@ changes numerically and what they depend on.
 
 [Have a look at the Metal work · PR #2298](https://github.com/JustVugg/colibri/pull/2298)
 
-<details>
-<summary><b>Every measured result, with its costs</b></summary>
+### More results
 
 **Merged**
 
-| PR | GPU | workload | result | cost |
-|---|---|---|---|---|
-| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 512-token prompt after a 64-token one and 32 decoded tokens | 180.18 → 440.11 tok/s (+144.3%) | moving experts first takes 58 ms, included; outputs change after a large chunk |
-| [#2416](https://github.com/JustVugg/colibri/pull/2416) | Colab T4 | 8-turn agent session, replayed teacher-forced | 71.6 → 43.1 s | 365 ms of expert moves, included |
-| [#2453](https://github.com/JustVugg/colibri/pull/2453) | Colab T4 | 8192-token prompt, first in a process | 593.79 → 898.76 tok/s (+51.36%) | NLL +0.12% (s.e. 0.10%) over the next 1024 tokens; more registers and shared memory |
-| [#2421](https://github.com/JustVugg/colibri/pull/2421) | RTX PRO 4000 | Qwen3.6 decode after a 64-token prompt, all experts in VRAM | 74.748 → 145.064 tok/s (+94.1%) | 970 KiB of VRAM per logit row; L4 decode −0.6…−0.7%; the size of the gain depends on that host |
-| [#2418](https://github.com/JustVugg/colibri/pull/2418) | RTX PRO 4000 | Qwen3.8 UD-Q2_K_XL, 1628-token prompt, all experts in the RAM pool | 216.2 → 424 tok/s (+96%) | chain reserve 1.59 → 2.51 GiB, fewer resident experts; decode −0.5…−3.1%; 150-token prompts −3.9% and −5.7% |
-| [#2422](https://github.com/JustVugg/colibri/pull/2422) | A100 80 GB, Vulkan | Qwen3.8 int4, 64-token prompt and 256 teacher-forced tokens | 20.46 → 43.12 tok/s | VRAM 41,254 → 69,711 MiB; a 2.3-2.4 s probe at every start; outputs change (NLL 2.4113 → 2.3988) |
+- **[#2453](https://github.com/JustVugg/colibri/pull/2453)**: the prompt's attention in one pass on the T4: an 8192-token prompt is 51% faster (NLL +0.12%).
+- **[#2418](https://github.com/JustVugg/colibri/pull/2418)**: Qwen3.8 reads prompts in blocks of 2048 rows: a 1628-token prompt is twice as fast on the RTX
+  PRO 4000 (short prompts 4-6% slower).
 
-**Open**
+**Open, under review** (measured on top of my other open PRs)
 
-| PR | GPU | workload | result | cost |
-|---|---|---|---|---|
-| [#2433](https://github.com/JustVugg/colibri/pull/2433) | Colab T4 | 64-token prompt after a 512-token one, on the stack | 99.23 → 211.71 tok/s (+113.3%) | ready 19.88 → 22.80 s; pinned RAM 6.00 → 16.88 GB (the same pages); NLL 2.6919 → 2.6942; first step up to about 2 ms slower |
-| [#2428](https://github.com/JustVugg/colibri/pull/2428) | Colab T4 | 64-token prompt, first in a process, on the stack | 92.45 → 146.44 tok/s (+58.4%) | 52.2 KiB of host RAM; chat turn-2 decode −0.2% |
-| [#2424](https://github.com/JustVugg/colibri/pull/2424) | Colab T4 | 512-token prompt alone, on top of #2423 | 519.29 → 657.25 tok/s (+26.6%) | 161 MB more staging VRAM (computed), 161 MB less room for KV mirrors; decode −0.3…−1.3%, within noise |
-| [#2425](https://github.com/JustVugg/colibri/pull/2425) | L4, Vulkan | Qwen3.6 tier initialization | did not finish within 300 s → 18.1-23.2 s | decode −1.1% (A100), −3.1…−7.0% (RTX 4090); memory other processes free later is not taken back |
+- **[#2433](https://github.com/JustVugg/colibri/pull/2433)**: a short prompt right after a long one is 2.1 times faster on the T4 (start-up 3 s longer,
+  more pinned RAM).
+- **[#2428](https://github.com/JustVugg/colibri/pull/2428)**: the first short prompt in a process is 58% faster on the T4 (tiny costs: 52 KiB of RAM).
+- **[#2424](https://github.com/JustVugg/colibri/pull/2424)**: a 512-token prompt on its own is 27% faster on the T4 (161 MB more VRAM).
+- **[#2425](https://github.com/JustVugg/colibri/pull/2425)**: Vulkan on the L4 starts in about 20 s, where it didn't finish in 300 s (decode 1-7% slower).
 
-[#2434](https://github.com/JustVugg/colibri/pull/2434), the prompt attention with 16-byte loads (+29.07% on an
-8192-token prompt, measured before #2453), now matters only on sm_70 or with `COLI_CUDA_CHAIN_FLASH2=0`.
-The Metal series ([#2015](https://github.com/JustVugg/colibri/pull/2015),
-[#2016](https://github.com/JustVugg/colibri/pull/2016),
-[#2298](https://github.com/JustVugg/colibri/pull/2298)-[#2308](https://github.com/JustVugg/colibri/pull/2308)) runs
-Qwen3.6 on the GPU of Apple Silicon, GGUF files included; #2298-#2308 did not apply on `dev` when last checked
-(28 October).
-
-
-</details>
+Every PR page lists the full numbers and all the costs.
 
 ### How to read the numbers
 
