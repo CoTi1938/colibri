@@ -28,8 +28,9 @@ The engine was sending the model's output scores from the GPU to the CPU in lots
 writes them into GPU memory and copies them over in one go.
 
 With all of Qwen3.6's experts in VRAM, decode went from **74.7 to 145.1 tokens/s** on that machine, with the same
-results before and after. To be fair, the gain depends on the host: on the L4 I tried it was 0.6-0.7% slower, and it
-takes a little extra VRAM (970 KiB per row of scores).
+results before and after; with the MTP draft head on, from **59.9 to 157.7 tokens/s**, 2.6 times faster. To be fair,
+the gain depends on the host: on the L4 I tried it was 0.6-0.7% slower, and it takes a little extra VRAM (970 KiB per
+row of scores).
 
 Merged · [PR #2421](https://github.com/JustVugg/colibri/pull/2421) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/qwen36-cuda-lmhead-device-2026-10-27)
 
@@ -68,19 +69,12 @@ changes numerically and what they depend on.
 
 ### More results
 
-**Merged**
-
-- **[#2453](https://github.com/JustVugg/colibri/pull/2453)**: the prompt's attention in one pass on the T4: an 8192-token prompt is 51% faster (NLL +0.12%).
-- **[#2418](https://github.com/JustVugg/colibri/pull/2418)**: Qwen3.8 reads prompts in blocks of 2048 rows: a 1628-token prompt is twice as fast on the RTX
-  PRO 4000 (short prompts 4-6% slower).
-
-**Open, under review** (measured on top of my other open PRs)
-
-- **[#2433](https://github.com/JustVugg/colibri/pull/2433)**: a short prompt right after a long one is 2.1 times faster on the T4 (start-up 3 s longer,
-  more pinned RAM).
-- **[#2428](https://github.com/JustVugg/colibri/pull/2428)**: the first short prompt in a process is 58% faster on the T4 (tiny costs: 52 KiB of RAM).
-- **[#2424](https://github.com/JustVugg/colibri/pull/2424)**: a 512-token prompt on its own is 27% faster on the T4 (161 MB more VRAM).
-- **[#2425](https://github.com/JustVugg/colibri/pull/2425)**: Vulkan on the L4 starts in about 20 s, where it didn't finish in 300 s (decode 1-7% slower).
+- **[#2433](https://github.com/JustVugg/colibri/pull/2433)**, open: a short prompt right after a long one is 2.1 times faster on the T4 (start-up 3 s longer,
+  more pinned RAM; measured on top of my other open PRs).
+- **[#2418](https://github.com/JustVugg/colibri/pull/2418)**, merged: Qwen3.8 reads prompts in blocks of 2048 rows, so a 1628-token prompt is twice as fast
+  on the RTX PRO 4000 (short prompts 4-6% slower).
+- **[#2453](https://github.com/JustVugg/colibri/pull/2453)**, merged: the prompt's attention in one pass on the T4, so an 8192-token prompt is 51% faster
+  (NLL +0.12%).
 
 Every PR page lists the full numbers and all the costs.
 
