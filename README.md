@@ -1,9 +1,73 @@
-## This fork: CoTi1938's work on colibri
+## Hi, I'm CoTi1938 👋
 
-My pull requests to [JustVugg/colibri](https://github.com/JustVugg/colibri): 27 merged and 18 open, as of
-8 November 2026. They cover the Qwen3.6 and Qwen3.8 engines on CUDA, Vulkan, Apple Silicon (Metal) and the CPU, and
-the RAM planner. Benchmark records for the results below are in `docs/experiments/` (for the open PRs, on their
-branches).
+I work on making [colibri](https://github.com/JustVugg/colibri), the open-source inference engine by Vincenzo Fornaro, faster and lighter on the
+hardware people already have: NVIDIA GPUs, Vulkan, Apple Silicon and plain CPUs.
+
+So far **27 of my pull requests are merged upstream and 18 are still open** (8 November 2026). This fork collects the
+code, the numbers and the evidence behind them.
+
+[Merged](https://github.com/JustVugg/colibri/pulls?q=is%3Apr+author%3ACoTi1938+is%3Amerged) · [Open](https://github.com/JustVugg/colibri/pulls?q=is%3Apr+author%3ACoTi1938+is%3Aopen) · [The original project](https://github.com/JustVugg/colibri)
+
+### From not starting at all to 21 seconds, with Vulkan
+
+On some GPUs the driver lets the engine map only part of the card's memory (on the L4, 9.75 of 22.5 GiB). colibri
+already had a copied-upload path for that case, but it didn't pick it on its own. Now it checks how big the mapped
+window is and switches by itself.
+
+On a Colab L4, Qwen3.6 with Vulkan used to get stuck starting up: four tries, still not ready after 900 seconds. Now
+it starts in about **21 seconds**. On an A100 80 GB, the first answer to a 512-token prompt went from **98 seconds to
+under 1 second**, and decode from **20.5 to 43.1 tokens/s**. The price: more experts sit on the card, so VRAM in use
+goes from 40 to 68 GiB; each start spends 2.3-2.4 s probing the driver; and the results shift a little (NLL 2.4113 →
+2.3988, the same as the copied path gives on its own).
+
+Merged · [PR #2422](https://github.com/JustVugg/colibri/pull/2422) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/vulkan-staged-small-window-2026-10-27)
+
+### Almost twice the decode speed on the RTX PRO 4000 I tested
+
+The engine was sending the model's output scores from the GPU to the CPU in lots of tiny writes over the bus. Now it
+writes them into GPU memory and copies them over in one go.
+
+With all of Qwen3.6's experts in VRAM, decode went from **74.7 to 145.1 tokens/s** on that machine, with the same
+results before and after. To be fair, the gain depends on the host: on the L4 I tried it was 0.6-0.7% slower, and it
+takes a little extra VRAM (970 KiB per row of scores).
+
+Merged · [PR #2421](https://github.com/JustVugg/colibri/pull/2421) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/qwen36-cuda-lmhead-device-2026-10-27)
+
+### About 40% less time in an agent session
+
+During a conversation, the experts the model leans on move between RAM and GPU memory. The RAM pool that feeds the
+GPU wasn't keeping up with those moves, so later prompts sent part of the work back to the CPU. Now the pool follows
+them.
+
+On a Colab T4, a replayed eight-turn agent session (the answers fed back in, teacher-forced) went from **71.6 to 43.1
+seconds**, extra copies included. A 512-token prompt after a short exchange got **2.4 times faster** (180 → 440
+tokens/s). After a large prompt chunk the results can shift a little; the record has the details.
+
+Merged · [PR #2416](https://github.com/JustVugg/colibri/pull/2416) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26)
+
+### More breathing room on an 8 GB Mac
+
+Two small changes, one on top of the other. The engine used to load and convert the whole token-embedding table even
+though it only ever needs one row at a time: now it reads just the rows it needs. And it used to convert the dense
+matrices at every start: now they're converted once, into a file it reads straight away.
+
+On an 8 GB MacBook Air M1, the first one took peak memory from **6.37 to 4.97 GB** and the time to get ready from
+**5.78 to 4.35 s**; the second, on top of it, from **4.72 to 3.48 GB** and from **4.40 to 3.58 s**. Same tokens, same
+results.
+
+Merged · [PR #2013](https://github.com/JustVugg/colibri/pull/2013) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/qwen36-embedding-in-place-2026-10-07) ·
+[PR #2014](https://github.com/JustVugg/colibri/pull/2014) · [measurements](https://github.com/JustVugg/colibri/tree/0a5504a1dc64f86fcd0fe7db298b0448c730e7e6/docs/experiments/qwen36-canonical-dense-2026-10-07)
+
+### In progress: Qwen3.6 on the Mac's GPU
+
+The Metal series brings kernels, an expert cache and a whole GPU path to Apple Silicon, keeping on disk whatever
+doesn't fit in memory. It's a bigger piece of work and still under review; the PRs explain what they measure, what
+changes numerically and what they depend on.
+
+[Have a look at the Metal work · PR #2298](https://github.com/JustVugg/colibri/pull/2298)
+
+<details>
+<summary><b>Every measured result, with its costs</b></summary>
 
 **Merged**
 
@@ -33,11 +97,19 @@ The Metal series ([#2015](https://github.com/JustVugg/colibri/pull/2015),
 Qwen3.6 on the GPU of Apple Silicon, GGUF files included; #2298-#2308 did not apply on `dev` when last checked
 (28 October).
 
-Each result compares the builds and configuration in its benchmark record; "on the stack" means `dev` with other PRs
-of this fork on top, as the record lists them. Colab T4 is the high-RAM runtime. The project's licence and notices
-apply (Apache 2.0, `LICENSE`, `NOTICE`); my changes are contributed under the same licence.
+
+</details>
+
+### How to read the numbers
+
+Each result belongs to one model, one machine and one setup, and I keep results from different hardware apart. The
+records hold the before-and-after runs, the commands, the repeats, and the costs and regressions too.
 
 ---
+
+## The original project: colibri
+
+Below is the README of Vincenzo Fornaro's project, as it is upstream. Everything above is about this fork.
 
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì: tiny engine, immense model">
