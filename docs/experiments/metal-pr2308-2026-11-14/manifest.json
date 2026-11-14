@@ -1,0 +1,183 @@
+[
+  {
+    "file": "provenance.json",
+    "bytes": 74045,
+    "sha256": "1846b8cd95aebdce127c0b75f1bdb7b559b93b642761be35d1fc3bd926477980",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "qualification-logs.json",
+    "bytes": 76756,
+    "sha256": "6d4893d7b68b5c8828b505361cd063a27aa9160ab64e24d1a39277dfcafd155c",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "checkpoint-aggregate.json",
+    "bytes": 265477,
+    "sha256": "3c429796592e391b571a71fe473f356c7040f9dc062d393fb715c8a942fc9cda",
+    "source": "measurements-checkpoint/aggregate.json",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "checkpoint-samples.csv",
+    "bytes": 50598,
+    "sha256": "0322638ddf89f0294918269aeca19d5b0621f37b2f83bd7e9a1804b1b0360836",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "checkpoint-measurement-logs.json",
+    "bytes": 496746,
+    "sha256": "1a55ef0cb8baa71f924dc2f98d639e7d8084ab9a1401943e3249d790215973fe",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "checkpoint-binary-proof-manifest.json",
+    "bytes": 8054,
+    "sha256": "b782e3ded8328736003c9c6259cd53df15d9b6dcf6c3a398db9bde99b62d1811",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "checkpoint-functional-logs.json",
+    "bytes": 95373,
+    "sha256": "b7f2da9be7f2f576f00b08fcd4eb50f71a49d228d7f9c63a7a4786ee4754394c",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "gguf-aggregate.json",
+    "bytes": 224196,
+    "sha256": "e4b942da48d20dfd26d4d740abcb682df4aaa6909317c6b1daa6b910e8fa6d53",
+    "source": "measurements-gguf/aggregate.json",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "gguf-samples.csv",
+    "bytes": 42365,
+    "sha256": "ad05249b1354aa86c78e6c2ae0db01ce0dc8c04fbf93a700b7869e46d9d47a59",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "gguf-measurement-logs.json",
+    "bytes": 458323,
+    "sha256": "24e6a0adc5931a70068414044ae3d9a7e17c09cfcceda4f3cf0509c0bddc7046",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "gguf-binary-proof-manifest.json",
+    "bytes": 7617,
+    "sha256": "3a9c1208f055e0ac5034fe0f74c33bfa0279286fb1e7ba2a58ff63dade6575d7",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "gguf-functional-logs.json",
+    "bytes": 147269,
+    "sha256": "0cc860f1323a9a3d701b60f372729d5bd52b50a7d2c609ebd1db7a8860d17c11",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "check_stateful.py",
+    "bytes": 5725,
+    "sha256": "07b31305fcafcf8b5211790989b65af32fe6fd5d6396f4a3847eafb019e6974d",
+    "source": "check_stateful.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "check_gguf.py",
+    "bytes": 8457,
+    "sha256": "14c69d9fb0e9538e25b73f016a1259ae75680e18ff24b17e056682dc6afac31b",
+    "source": "check_gguf.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "summarize_measurements.py",
+    "bytes": 5984,
+    "sha256": "1508796b1248a415efa67f91c2b571675b04a6c18975ac01fc9ee422d0bd9b8e",
+    "source": "summarize_measurements.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "audit_measurements.py",
+    "bytes": 3032,
+    "sha256": "203d0e8793a87abed1a084fcaf2b82aba93802e6c044fc4279c76757d86acf3e",
+    "source": "audit_measurements.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "run_measurements.py",
+    "bytes": 3428,
+    "sha256": "92e6be215378a28114b1ca101e1026a46c2c15b4f6ffd7d1dffd0ebf7b7f4b50",
+    "source": "run_measurements.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "run_rechecks.py",
+    "bytes": 2893,
+    "sha256": "8f8532eb9d3e38aa8d9e2aa472ba71fa43c046a97cadac50c0ea062576944bcf",
+    "source": "run_rechecks.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "run_ready_probe.py",
+    "bytes": 2090,
+    "sha256": "00f295c5f797d3ff1b623d3ddd65b11061158d67357a5e2e3f01424f30e7ee70",
+    "source": "run_ready_probe.py",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "harness__qwen36_bench.c",
+    "bytes": 43234,
+    "sha256": "ca1bd9cc3d240c28bd7173b82efacf05e656c25ddc1d5b6e461ffb08b83e2649",
+    "source": "harness/qwen36_bench.c",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "harness__bench",
+    "bytes": 72619,
+    "sha256": "f0ef19f95a82c7bba41441af79df8374466948e4c56749cd326ee8f13d49d2d4",
+    "source": "harness/bench",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "harness__promessi_sposi.txt",
+    "bytes": 1329139,
+    "sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+    "source": "harness/promessi_sposi.txt",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "harness__testi__codice.txt",
+    "bytes": 69605,
+    "sha256": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+    "source": "harness/testi/codice.txt",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "harness__testi__chat.txt",
+    "bytes": 6900,
+    "sha256": "d77e4d25d43fa554459d85996f69e8573038376cbe2b2fe2725bb12a98fe1960",
+    "source": "harness/testi/chat.txt",
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "environment.json",
+    "bytes": 1356,
+    "sha256": "c38c77652a2fc5c98db4b2a49a043610ff48e8fda3707a584202027c0c731169",
+    "source": null,
+    "redaction": "Local campaign/home paths replaced with placeholders"
+  },
+  {
+    "file": "README.md",
+    "bytes": 22556,
+    "sha256": "e510a06a70db1c1d0846e5d8fad0192ff945b821649d5066c382c812c7f29c65",
+    "source": "Reviewed campaign summaries and fixed protocols"
+  }
+]

@@ -1,0 +1,1256 @@
+#!/usr/bin/env python3
+"""bench: build an engine's harness, run it the way antirez's ds4 rules ask, read the result.
+
+  bench build <commit|dir> <out> [--cuda] [--engine qwen36] [--repo <git dir>] [--make VAR=VAL]
+  bench run <out> <version> [<version>] [options]          (bench run -h lists them)
+  bench report <out>
+  bench manifest <out> --metric prompt|decode --commit <sha> --hypothesis "..." --evidence <file> [--quality "..."]
+
+A version is [label=]<harness binary|commit|source dir>[,VAR=VAL...]: two binaries, or one binary with and
+without a variable, or two commits that `bench run` builds first. The defaults are the measuring rules of
+docs/guida-benchmark.md: the first 64 and 512 tokens of I Promessi Sposi, 32 teacher-forced tokens after
+each, a warm-up run that does not count, then 3 runs (4 per version with two, in ABBA order: a machine that
+slows as it heats weighs the same on both), each a new process after the machine is cool and a 60 s rest.
+
+The driver knows nothing of a model's insides: it runs a harness that prints the CSV contract of README.md,
+on macOS (Metal) or Linux (CUDA). What depends on the system is in host_state(), cool() and time_cmd(); what
+depends on the engine is a line of ENGINES. Python 3 standard library only."""
+import argparse, contextlib, fcntl, hashlib, json, os, platform, re, shlex, shutil, statistics, subprocess, sys, \
+    threading, time
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SYSTEM = os.environ.get("BENCH_SYSTEM", platform.system())   # BENCH_SYSTEM=Linux: the tests' fake Linux
+FAKE = os.environ.get("BENCH_FAKE_HOST")                      # a directory of sample outputs, for the tests
+TEXTS = {"prose": HERE / "promessi_sposi.txt", "code": HERE / "testi/codice.txt", "chat": HERE / "testi/chat.txt"}
+ENGINES = {
+    "qwen36": {
+        "source": "qwen36_bench.c", "binary": "qwen36-bench", "target": "qwen36", "engine_c": "qwen36.c",
+        "model": {"Darwin": "${HOME}/Models/qwen36_i4_gs64"},
+        # The normal mode on a card: the owner's Usage in docs/qwen36-cuda-tier.md (the engine sizes its threads).
+        "env": {"Linux": ["COLI_CUDA=1", "COLI_GPUS=0", "CUDA_EXPERT_GB=auto", "OMP_WAIT_POLICY=ACTIVE",
+                          "OMP_PROC_BIND=close"]},
+        # The accelerated mode of the guide: our PRs 10-14, so only builds that have them (Metal, for now).
+        "accel": {"Darwin": ("${HOME}/Models/qwen36_i4_gs64_mtp",
+                             ["QWEN36_FAST_EXPERTS=5", "QWEN36_FAST_GUESSED=4", "QWEN36_PREFETCH=1"])},
+        "session": HERE / "sessioni/agente.sess", "photo": True,
+        "argv": True,   # off the Metal graph only: the harness says so there
+    },
+    # Lengths only (no --photo, no --session). No default model or variables: a measure gives them (--model,
+    # --env, --argv) as coli runs the engine on that machine (docs: misure-release-20261029/piano.md).
+    "qwen38": {
+        "source": "qwen38_bench.c", "binary": "qwen38-bench", "target": "qwen38", "engine_c": "qwen38.c",
+        "model": {}, "env": {}, "accel": {}, "argv": True,
+    },
+    "glm53": {
+        "source": "glm53_bench.c", "binary": "glm53-bench", "target": "glm53", "engine_c": "glm53.c",
+        "model": {}, "env": {}, "accel": {}, "argv": True,
+    },
+}
+COLS = ["ctx_tokens", "prefill_tokens", "prefill_s", "prefill_tps", "gen_tokens", "gen_first_ms", "gen_steady_tps",
+        "fingerprint", "tokens"]                              # the contract's required columns
+# some optional ones: their name in the tables, decimals. expert_miss counts the experts read from the model's file
+# into RAM; on a card the experts that cost go from RAM to the card, bus_mb (a CUDA build's)
+OPT_COLS = {"expert_miss": ("experts read from the file", 0), "disk_s": ("reads' s", 2),
+            "bus_mb": ("MB to the card", 1)}
+SWEEP_MAX = 65536   # the context sweep's highest frontier (guida-benchmark.md)
+NVIDIA_HOT = 0x8 | 0x20 | 0x40 | 0x80   # nvmlClocksEventReasons: HW slowdown, SW/HW thermal, power brake
+NVIDIA_POWER_CAP = 0x4                   # held under its power limit (the T4's 70 W, often)
+WATCH_MS = 1000     # how often the card is read while a run runs
+# Linux: where the threads are, printed by the OpenMP runtime at its first team in every run's .err
+OMP_SHOW = ["OMP_DISPLAY_AFFINITY=TRUE", "OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A"]
+# Variables read by a runtime, not by the engine: the check that the binary names each variable skips them
+RUNTIME_ENV = ("OMP_", "GOMP_", "KMP_", "MTL_", "METAL_", "CUDA_VISIBLE_DEVICES", "CUDA_LAUNCH_BLOCKING",
+               "CUDA_DEVICE_ORDER", "CUDA_MODULE_LOADING", "LD_LIBRARY_PATH")
+# «every run faster» below 4 runs a side is noise: one run each says it of two equal binaries every time, 2 + 2 runs
+# by chance once in 3 cells. With 4 + 4 (the guide's) chance alone gives it in 1 cell out of 35.
+MIN_VERDICT = 4
+LOCK = Path.home() / ".bench-run.lock"   # one measurement at a time on a machine, for its whole length
+GPU = "0"           # the card nvidia-smi reads (--gpu): the one the engine uses
+
+
+def die(msg):
+    sys.exit(f"bench: {msg}")
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw).stdout
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------------------------- the machine
+def fake(name):
+    return (Path(FAKE) / name).read_text() if FAKE and (Path(FAKE) / name).exists() else None
+
+
+REASONS = None   # nvidia-smi's field of the clock-event reasons, found once ("" without nvidia-smi)
+
+
+def reasons_field():
+    """nvidia-smi's field of the clock-event reasons (renamed by newer drivers); None without nvidia-smi."""
+    global REASONS
+    if REASONS is None:
+        REASONS = ""
+        names = ("clocks_event_reasons.active", "clocks_throttle_reasons.active")
+        for f in names if shutil.which("nvidia-smi") else ():
+            out = sh(["nvidia-smi", f"--query-gpu={f}", "--format=csv,noheader,nounits"])
+            if out.strip() and "Field" not in out:
+                REASONS = f
+                break
+    return REASONS or None
+
+
+def num(x, base=10):
+    """A number nvidia-smi printed; None for its [N/A] or [Not Supported]."""
+    try:
+        return int(x, base)
+    except ValueError:
+        return None
+
+
+def gpus():
+    """Linux: how many cards nvidia-smi sees (0 without it)."""
+    out = fake("nvidia-smi.csv")
+    if out is None:
+        out = sh(["nvidia-smi", "-L"]) if shutil.which("nvidia-smi") else ""
+    return len([l for l in out.split("\n") if l.strip()])
+
+
+def gpu():
+    """Linux: card GPU's name, temperature, SM clock, clock-event reasons, memory used (None for a field the card
+    does not report); None without nvidia-smi."""
+    out = fake("nvidia-smi.csv")
+    if out is None:
+        if not reasons_field():
+            return None
+        out = sh(["nvidia-smi", "-i", GPU, f"--query-gpu=name,temperature.gpu,clocks.sm,{reasons_field()},memory.used",
+                  "--format=csv,noheader,nounits"])
+    lines = out.strip().split("\n")   # -i gives one line; the tests' fake file has a line a card
+    f = [x.strip() for x in lines[int(GPU) if FAKE else 0].split(",")]
+    return {"name": f[0], "temp": num(f[1]), "sm": f[2], "reasons": num(f[3], 16), "mem_mib": f[4]}
+
+
+@contextlib.contextmanager
+def watch(path, err):
+    """Linux: nvidia-smi reads the card every WATCH_MS (temperature, SM clock, utilization, clock-event reasons) into
+    path, from the harness's «ready in» line in err (the model loaded: before it the card takes copies at a low
+    clock) to the run's end. The checks before and after a run see an idle card: a brake inside a run shows only
+    here. It costs a process that wakes once a second, the same for every version."""
+    f = reasons_field() if SYSTEM == "Linux" and not FAKE else None
+    if not f:
+        yield
+        return
+    stop = threading.Event()
+
+    def sample():
+        while "ready in" not in (err.read_text(errors="replace") if err.exists() else ""):
+            if stop.wait(0.2):
+                return
+        with open(path, "w") as o:
+            p = subprocess.Popen(["nvidia-smi", "-i", GPU, f"--query-gpu=temperature.gpu,clocks.sm,utilization.gpu,{f}",
+                                  "--format=csv,noheader,nounits", "-lms", str(WATCH_MS)], stdout=o,
+                                 stderr=subprocess.DEVNULL)
+            stop.wait()
+            p.terminate()
+            p.wait()
+
+    th = threading.Thread(target=sample)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join()
+
+
+def card_while_running(path):
+    """A run's samples (the model loaded): the hottest °C; over those with a kernel running (utilization above 0),
+    the median SM clock, the share under the power cap, the hot brakes seen (a mask) and their share. Without such
+    samples, how many lines the file has: the files before 29/10 have no utilization and start at the load."""
+    rows, lines = [], [l for l in path.read_text().split("\n") if l.strip()]
+    for l in lines:
+        f = [x.strip() for x in l.split(",")]
+        if len(f) == 4 and all(x.isdigit() for x in f[:3]) and f[3].startswith("0x"):
+            rows.append((int(f[0]), int(f[1]), int(f[2]), int(f[3], 16)))
+    work = [r for r in rows if r[2] > 0]
+    if not work:
+        return {"n": 0, "lines": len(lines)}
+    hot = [r[3] & NVIDIA_HOT for r in work if r[3] & NVIDIA_HOT]
+    mask = 0
+    for h in hot:
+        mask |= h
+    return {"temp": max(r[0] for r in rows), "sm": statistics.median(r[1] for r in work),
+            "power": sum(bool(r[3] & NVIDIA_POWER_CAP) for r in work) / len(work), "hot": mask,
+            "hot_share": len(hot) / len(work), "n": len(work)}
+
+
+def cpu_cores():
+    """Linux: each logical CPU's core, as 'cpu package:core' lines (two CPUs on one core are SMT siblings)."""
+    lines = []
+    for d in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        t = d / "topology"
+        if (t / "core_id").exists():
+            pkg, core = ((t / x).read_text().strip() for x in ("physical_package_id", "core_id"))
+            lines.append(f"{d.name[3:]} {pkg}:{core}")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def cpu_set(s):
+    """An OpenMP CPU set, '0,6' or '0-3,8', as a list."""
+    out = []
+    for part in s.split(","):
+        a, _, b = part.partition("-")
+        out += list(range(int(a), int(b or a) + 1))
+    return out
+
+
+def threads(paths, cores):
+    """The run's OpenMP team (OMP_SHOW) from its .err, or its .csv (libomp prints it on stdout): how many threads,
+    the CPUs they are bound to, how many cores; None for the cores when a thread may run on more than one core
+    (no OMP_PROC_BIND: each thread has every CPU of the process), and then the CPUs once each."""
+    text = "".join(p.read_text() for p in paths if p.exists())
+    team = {}
+    for n, cpus in re.findall(r"omp-thread:(\d+):cpus:([0-9,-]+)", text):
+        team.setdefault(int(n), cpu_set(cpus))
+    if not team:
+        return None
+    cpus = [c for n in sorted(team) for c in team[n]]
+    if any(len({cores.get(c, f"cpu{c}") for c in team[n]}) > 1 for n in team):
+        return len(team), sorted(set(cpus)), None
+    return len(team), cpus, len({cores.get(c, f"cpu{c}") for c in cpus})
+
+
+def meminfo():
+    text = fake("meminfo.txt") or Path("/proc/meminfo").read_text()
+    return {k: int(v.split()[0]) for k, v in (l.split(":", 1) for l in text.strip().split("\n"))}
+
+
+def swap():
+    """What is in the swap, and the pages the system has written to it since boot (16 KiB on macOS, 4 on Linux)."""
+    if SYSTEM == "Darwin":
+        used = sh(["sysctl", "-n", "vm.swapusage"]).split()[5]
+        outs = re.search(r"Swapouts:\s+(\d+)", sh(["vm_stat"])).group(1)
+        return f"swap_used={used} swapouts={outs}"
+    m = meminfo()
+    vmstat = fake("vmstat.txt") or Path("/proc/vmstat").read_text()
+    outs = re.search(r"^pswpout (\d+)", vmstat, re.M)
+    return f"swap_used={(m['SwapTotal'] - m['SwapFree']) / 1024:.2f}M swapouts={outs.group(1) if outs else 0}"
+
+
+def chrome():
+    if SYSTEM != "Darwin":
+        return 0
+    return sum("Google Chrome" in l for l in (fake("ps.txt") or sh(["ps", "-axo", "comm"])).split("\n"))
+
+
+def thermal():
+    """macOS: the thermal state (0 nominal, 1 fair, 2 serious, 3 critical). Linux: the card's state as one word."""
+    if SYSTEM == "Darwin":
+        return sh(["osascript", "-l", "JavaScript", "-e",
+                   'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState']).strip()
+    g = gpu()
+    if not g:
+        return "no-gpu"
+    if g["temp"] is None or g["reasons"] is None:   # nothing to wait for: the report says so
+        return "no-temp"
+    return f"temp={g['temp']} sm={g['sm']} reasons=0x{g['reasons']:x}"
+
+
+def is_cool(state, max_temp=None):
+    """macOS's state 0, or a card without a hot clock-event reason (and under max_temp, when waiting for it)."""
+    m = re.match(r"temp=(\d+) sm=\S+ reasons=0x([0-9a-f]+)", state)
+    if not m:
+        return state in ("0", "no-gpu", "no-temp")
+    return not int(m.group(2), 16) & NVIDIA_HOT and (max_temp is None or int(m.group(1)) < max_temp)
+
+
+def cool(max_temp, limit=900):
+    """Wait until the machine is cool, at most `limit` seconds: the MacBook Air has no fan, a card slows when hot."""
+    waited = 0
+    while not is_cool(thermal(), max_temp) and waited < limit:
+        time.sleep(10)
+        waited += 10
+    return waited
+
+
+def host_state():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if SYSTEM == "Darwin":
+        free = sh(["memory_pressure", "-Q"]).strip().split("\n")[-1]
+        return f"{now} chrome={chrome()} {free} {swap()}"
+    m = meminfo()
+    out = f"{now} mem_available={m['MemAvailable'] / 2**20:.2f}GiB"
+    limit = fake("memory.max") or (Path("/sys/fs/cgroup/memory.max").read_text()
+                                   if Path("/sys/fs/cgroup/memory.max").exists() else None)
+    if limit and limit.strip() != "max":   # in a container the cgroup is the real ceiling, not /proc/meminfo
+        used = fake("memory.current") or Path("/sys/fs/cgroup/memory.current").read_text()
+        out += f" cgroup_max={int(limit) / 2**30:.2f}GiB cgroup_used={int(used) / 2**30:.2f}GiB"
+    g = gpu()
+    if g:
+        out += f" gpu={g['name'].replace(' ', '_')} temp={g['temp']} sm={g['sm']} " \
+               f"reasons={'?' if g['reasons'] is None else hex(g['reasons'])} gpu_mem_used={g['mem_mib']}MiB"
+    return f"{out} {swap()}"
+
+
+def time_cmd():
+    """The process's peak memory: /usr/bin/time -l on macOS, -v on Linux when it is there."""
+    if SYSTEM == "Darwin":
+        return ["/usr/bin/time", "-l"]
+    return ["/usr/bin/time", "-v"] if os.path.exists("/usr/bin/time") else []
+
+
+def busy(binary_names):
+    """Another measurement or a build would steal the machine: refuse to start (and before every run: the lock keeps
+    out another bench run, not a harness started by hand)."""
+    for name in ["make", "clang", "gcc", "nvcc"] + binary_names:
+        if sh(["pgrep", "-x", name]).strip():
+            return name
+    return None
+
+
+def unread(binary, env):
+    """The variables of env the binary never names: getenv's names are NUL-ended strings in it. A typo, or a mode
+    this build does not have, would run as the base and print «same results»."""
+    data = Path(binary).read_bytes()
+    names = dict.fromkeys(x.split("=", 1)[0] for x in env)
+    return [n for n in names if not n.startswith(RUNTIME_ENV) and n.encode() + b"\0" not in data]
+
+
+def hardware():
+    if SYSTEM == "Darwin":
+        cpu = f"{sh(['sysctl', '-n', 'machdep.cpu.brand_string']).strip()} ({sh(['sysctl', '-n', 'hw.model']).strip()})"
+        ram = f"{int(sh(['sysctl', '-n', 'hw.memsize'])) / 2**30:.0f} GB"
+        disk = re.search(r"Device / Media Name:\s*(.+)", sh(["diskutil", "info", "/"]))
+        osv = f"macOS {sh(['sw_vers', '-productVersion']).strip()} ({sh(['sw_vers', '-buildVersion']).strip()})"
+        return {"cpu": cpu, "ram": ram, "storage": disk.group(1).strip() if disk else "unknown", "os": osv}
+    cpu = re.search(r"model name\s*:\s*(.+)", Path("/proc/cpuinfo").read_text())
+    osr = re.search(r'PRETTY_NAME="(.+)"', Path("/etc/os-release").read_text())
+    g = gpu()
+    hw = {"cpu": cpu.group(1) if cpu else platform.processor(), "ram": f"{meminfo()['MemTotal'] / 2**20:.0f} GiB",
+          "storage": sh(["df", "-h", "--output=source,size", "/"]).strip().split("\n")[-1],
+          "os": f"{osr.group(1) if osr else 'Linux'}, kernel {platform.release()}"}
+    if g:
+        hw["gpu"] = g["name"]
+    return hw
+
+
+# ---------------------------------------------------------------------------------------------------- build
+def git_repo(arg):
+    if arg:
+        return Path(arg)
+    for d in (Path.cwd(), HERE):
+        top = sh(["git", "-C", str(d), "rev-parse", "--show-toplevel"]).strip()
+        if top:
+            return Path(top)
+    die("no git repository: pass --repo")
+
+
+def build(target, out, engine, cuda=False, repo=None, make_args=(), serve_model=None):
+    """The harness against one version of the engine: a commit (exported with git archive) or a source directory
+    used as it is. The objects come from the engine's own Makefile; the link is the line `make` would run for the
+    engine, with the harness in place of the engine's main file, without -MMD/-MP and the qpack path (a CPU
+    conversion the harness never calls: as in every record so far)."""
+    e = ENGINES[engine]
+    out = Path(out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    if Path(target).is_dir():
+        src = Path(target).resolve()
+        src = src / "c" if (src / "c").is_dir() else src
+        head = sh(["git", "-C", str(src), "rev-parse", "HEAD"]).strip()
+        dirty = sh(["git", "-C", str(src), "status", "--porcelain", "--", "."]).strip()
+        version = f"source {src} at {head[:8] or '?'}{' + uncommitted changes' if dirty else ''}"
+    else:
+        repo = git_repo(repo)
+        head = sh(["git", "-C", str(repo), "rev-parse", "--verify", f"{target}^{{commit}}"]).strip()
+        if not head:
+            die(f"{target}: not a commit of {repo}, nor a directory")
+        shutil.rmtree(out / "src", ignore_errors=True)
+        (out / "src").mkdir()
+        tar = subprocess.run(["git", "-C", str(repo), "archive", head, "c"], capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", str(out / "src")], input=tar, check=True)
+        src = out / "src/c"
+        version = f"commit {head}"
+    flags = ["CUDA=1"] if cuda else ["METAL=1"] if SYSTEM == "Darwin" else []
+    flags += list(make_args)
+    if serve_model:   # a session through SERVE=1 (serve_session): the engine's own main, the one the server runs
+        art = sh([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import openai_server as o; "
+                  "print(o.resolve_model(sys.argv[2]).descriptor.engine_artifact)", str(src), str(serve_model)]).strip()
+        if not art:
+            die(f"{serve_model}: the server of {src} names no engine for it")
+        r = subprocess.run(["make", "-s", art] + flags, cwd=src, capture_output=True, text=True)
+        (out / "build.txt").write_text(f"{version}\nmake flags: {' '.join(flags) or 'none'}\nmake {art}, run through "
+                                       f"SERVE=1\n{r.stderr}")
+        if r.returncode:
+            die(f"make {art} failed:\n{r.stderr[-3000:]}")
+        (out / "version.txt").write_text(f"{version}; the engine's main {art} through SERVE=1{'; CUDA' if cuda else ''}\n")
+        print(f"built {src / art} ({version})")
+        return src / art
+    dry = sh(["make", "-n", "-W", e["engine_c"], e["target"]] + flags, cwd=src)
+    line = next((l for l in dry.split("\n")
+                 if f" {e['engine_c']} " in f" {l} " and re.search(rf"-o {e['target']}(\.exe)?\b", l)), None)
+    if not line:
+        die(f"make -n {e['target']} {' '.join(flags)} printed no link line for {e['engine_c']}")
+    words = [w for w in shlex.split(line) if w not in ("-MMD", "-MP", "-DQWEN36_QPACK")
+             and not w.startswith(("qwen36_qpack", "qpack"))]
+    objects = [w for w in words if w.endswith(".o")]
+    vulkan = "-DCOLI_VULKAN" in words
+    if vulkan:   # VK=1: the shaders are the engine's prerequisites, not the objects'; -B lists them all
+        every = sh(["make", "-n", "-B", e["target"]] + flags, cwd=src)
+        spv = sorted(set(re.findall(r"-o (shaders/\S+\.spv)", every)))
+        if not spv:
+            die(f"make -n -B {e['target']} {' '.join(flags)} printed no shader: Vulkan would not start")
+        objects += spv
+    if objects:
+        r = subprocess.run(["make", "-s"] + objects + flags, cwd=src, capture_output=True, text=True)
+        if r.returncode:
+            die(f"make {' '.join(objects)} failed:\n{r.stderr[-3000:]}")
+    i = words.index(e["engine_c"])
+    words[i:i + 1] = [f"-I{src}", str(HERE / e["source"])]
+    o = words.index("-o")
+    words[o + 1] = str(out / e["binary"])
+    r = subprocess.run(words, cwd=src, capture_output=True, text=True)
+    (out / "build.txt").write_text(f"{version}\nmake flags: {' '.join(flags) or 'none'}\n"
+                                   f"harness: {e['source']} sha256 {sha256(HERE / e['source'])}\n"
+                                   f"cd {src} && {shlex.join(words)}\n{r.stderr}")
+    if r.returncode:
+        die(f"the harness did not build:\n{r.stderr[-3000:]}")
+    if vulkan:   # the engine looks for shaders/ next to its binary (coli_vk_shader_path), as make lays them out
+        link = out / "shaders"
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(src / "shaders")
+    warnings = r.stderr.count("warning:")
+    (out / "version.txt").write_text(f"{version}; harness {e['source']} {sha256(HERE / e['source'])[:12]}"
+                                     f"{'; CUDA' if cuda else ''}{'; Vulkan' if vulkan else ''}\n")
+    print(f"built {out / e['binary']} ({version}; {warnings} warnings)")
+    return out / e["binary"]
+
+
+# ------------------------------------------------------------------------------------------------------ run
+def parse_version(spec, out, a, engine):
+    head, *env = spec.split(",")
+    label, _, target = head.partition("=") if "=" in head and not head.startswith(("/", ".")) else ("", "", head)
+    for v in env:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", v):
+            die(f"{spec}: '{v}' is not VAR=VAL")
+    if label and not re.fullmatch(r"[A-Za-z0-9_.-]+", label):   # setup.txt's readers take a label as one word
+        die(f"{spec}: a label is letters, digits, _ . -")
+    p = Path(target)
+    if p.is_file():
+        binary = p.resolve()
+        version = (p.parent / "version.txt").read_text().strip() if (p.parent / "version.txt").exists() else "?"
+        label = label or re.sub(r"[^A-Za-z0-9_.-]", "_", p.parent.name)
+    else:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", label or (p.name if p.is_dir() else target[:8]))
+        d = Path(out) / f"bin-{name}"   # build() writes version.txt here, also when the binary is the tree's (SERVE=1)
+        binary = build(target, d, engine, a.cuda, a.repo, a.make, getattr(a, "serve_model", None))
+        version = (d / "version.txt").read_text().strip()
+        label = label or name
+    return {"label": label, "binary": binary, "env": env, "version": version}
+
+
+SESSION_COLS = ("ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,"
+                "disk_s,fingerprint,tokens,nll,top1,reused,kv_len,rss_gb,greedy_prefix,tool_calls,tool_calls_ok,stop_ok,"
+                "serve")   # qwen36_bench.c's session columns, and serve = 1
+
+
+def serve_session(a):
+    """The harness of a session through SERVE=1, for any engine the server runs (bench run --session <x.json>).
+    The engine starts as openai_server.py starts it (its Engine, next to the binary); every turn is the
+    conversation before an assistant message, rendered as the server renders a request that sets neither thinking
+    nor effort; each SUBMIT asks pin=1, the state after its prompt photographed, so the next turn, whose prompt
+    carries the transcript's answer, resumes from the photo: the answers are forced, read with the next prompt
+    instead of one token at a time as qwen36_bench.c does. The CSV of qwen36_bench.c's sessions on stdout (nll and
+    top1 nan: SERVE gives no logits; fingerprint and tokens a hash of the answer's text), the engine's stderr in
+    the run's .err. SERVE says no reuse (DONE's cache_hit_percent is the expert cache's hit rate, qwen38.c
+    q38_cache_hit_percent): reused is -1 and read the whole prompt, the times say what the photo saved; run checks
+    the photos in the .err (photos())."""
+    c = Path(a.engine_bin).resolve().parent
+    sys.path.insert(0, str(c))
+    import openai_server as osv
+    family = osv.resolve_model(a.model).descriptor
+    osv.ARCH, osv.CHAT_FLAVOR = family.id, osv.detect_chat_flavor(family.id, a.model)
+    # the server's defaults for a request that sets neither (openai_server.py, anthropic_messages)
+    think = (osv.chat_flavor() in ("qwen38", "lfm3") or osv.ARCH == "mimo") and \
+        not (osv.ARCH == "olmoe" or osv.chat_flavor() == "qwen3_coder")
+    effort = ("xhigh" if osv.chat_flavor() == "qwen38" else "high") if think else None
+    data = json.loads(Path(a.session).read_text(encoding="utf-8"))
+    msgs, tools = data["messages"], data.get("tools")
+    turns = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    if not turns:
+        die(f"{a.session}: no assistant message, no turn")
+    prompts = [osv.render_chat_for_arch(msgs[:i], think, effort, tools, None, add_generation_prompt=True,
+                                        preserve_thinking=not think) for i in turns]
+    print(f"[bench] session {Path(a.session).name} through SERVE=1: {len(turns)} turns, family {family.id}"
+          f"{f', template {osv.CHAT_FLAVOR}' if osv.CHAT_FLAVOR else ''}, thinking {'on (' + effort + ')' if think else 'off'}, "
+          f"{a.gen} words a turn, pin=1 on every turn", file=sys.stderr, flush=True)
+    eng = osv.Engine(str(a.engine_bin), a.model, None, a.gen, dict(os.environ), 1, family)
+    print(SESSION_COLS, flush=True)
+    steps = open(a.steps, "w") if a.steps else None
+    prev_p = None
+    for k, p in enumerate(prompts):
+        got, at = [], []
+
+        def on_text(t):
+            at.append(time.perf_counter())
+            got.append(t)
+
+        t0 = time.perf_counter()
+        st = eng.generate(p, a.gen, 0.0, 1.0, on_text, pin=True)
+        n, np_ = st["completion_tokens"], st["prompt_tokens"]
+        first = at[0] - t0 if at else time.perf_counter() - t0
+        h = hashlib.sha256("".join(got).encode()).hexdigest()[:16]
+        print(f"{np_},{np_},{first:.3f},{np_ / first if first > 0 else 0:.2f},{n},"
+              f"{(at[1] - at[0]) * 1e3 if len(at) > 1 else 0:.1f},{st['tokens_per_second']:.3f},0,0.00,{h},{h},nan,nan,"
+              f"-1,{np_ + n},{st['rss_gb']:.2f},0,0,0,{0 if st['length_limited'] else 1},1", flush=True)
+        if steps:   # the step file's contract (read_steps): the prompt as step -1, then a line a word after the first
+            steps.write(f"{k + 1} -1 0 0.00 {first * 1e3:.1f}\n" + "".join(
+                f"{k + 1} {i - 1} 0 0.00 {(at[i] - at[i - 1]) * 1e3:.1f}\n" for i in range(1, len(at))))
+        print(f"[bench] turn {k + 1}: prompt {np_} tokens, first word after {first:.2f} s, answer {n} tokens at "
+              f"{st['tokens_per_second']:.2f} tok/s (the engine's), RSS {st['rss_gb']:.2f} GB", file=sys.stderr, flush=True)
+        if prev_p is not None and not p.startswith(prev_p):
+            print(f"[bench] turn {k + 1}: the server renders turn {k}'s prompt otherwise inside this one (the template "
+                  f"rewrites the history): no photo can match, the turn reads what changed", file=sys.stderr)
+        prev_p = p
+    eng.close()
+    if steps:
+        steps.close()
+
+
+def photos(err):   # the photos an engine took through SERVE=1: each says «[PIN] scatto a N token» on stderr
+    return err.read_text(errors="replace").count("[PIN] scatto a ")
+
+
+def last_line(err):   # what a failed run said last, for the line that names the failure
+    lines = [l for l in err.read_text(errors="replace").splitlines() if l.strip()]
+    return lines[-1][:200] if lines else "nothing"
+
+
+def harness_args(a, model, steps):
+    if a.session:
+        args = ["--session", str(a.session)]
+    else:
+        args = ["--text", str(a.text), "--lengths", a.lengths, "--gen", str(a.gen)]
+        args += ["--photo"] * a.photo + ["--teacher"] * (not a.free)
+    if a.pause:
+        args += ["--pause", str(a.pause)]
+    if a.argv:
+        args += ["--argv", a.argv]
+    return ["--model", model] + args + ["--steps", steps]
+
+
+def run(a):
+    global GPU
+    e = ENGINES[a.engine]
+    out = Path(a.out).resolve()
+    if out.exists() and any(out.glob("*.csv")):
+        die(f"{out} already holds a measurement")
+    if SYSTEM == "Darwin" and chrome() and not a.chrome_ok:
+        die("Chrome is open: close it (or --chrome-ok for a test that measures nothing)")
+    lock = open(LOCK, "w")   # held to the end of the process: another measurement waiting for the cool or resting
+    try:                     # between two runs has no process to see
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        die(f"another bench run holds {LOCK}: a measurement needs the machine alone")
+    b = busy([e["binary"]])
+    if b:
+        die(f"{b} is running: a measurement needs the machine alone")
+    if SYSTEM == "Linux":
+        if gpus() > 1 and a.gpu is None:
+            die(f"{gpus()} cards: --gpu names the one the engine uses (the bench reads that one)")
+        GPU = str(a.gpu or 0)
+    for x in a.env:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", x):
+            die(f"--env {x}: not VAR=VAL")
+    a.serve = isinstance(a.session, str) and a.session.endswith(".json")   # a transcript: any engine, through SERVE=1
+    if a.serve and sys.version_info < (3, 10):   # serve_session imports the tree's openai_server.py (slots dataclasses)
+        die(f"--session {a.session}: the server's code wants Python 3.10 or later, this is {platform.python_version()}: "
+            f"run bench with python3.12")
+    for asked, key, what in ((a.session and not a.serve, "session", "--session"), (a.photo or a.sweep, "photo", "--photo and --sweep"),
+                             (a.argv, "argv", "--argv")):
+        if asked and not e.get(key):
+            die(f"{what}: the {a.engine} harness does not take it")
+    if a.argv and not re.fullmatch(r"[0-9A-Za-z_.-]+(,[0-9A-Za-z_.-]+)*", a.argv):
+        die(f"--argv {a.argv}: the engine's positional arguments, separated by commas")
+    if a.sweep:
+        # the top is chosen with the user after the memory check (guida-benchmark.md); the step is the smallest of
+        # 1024, 2048, 4096 that keeps the frontiers within 16, and the sweep starts at its step
+        if a.lengths:
+            die("--sweep chooses the lengths: drop --lengths")
+        if not a.ctx_max:
+            die("--sweep needs --ctx-max: the guide wants it chosen with the user, after the memory check")
+        if a.ctx_max > SWEEP_MAX:
+            die(f"--ctx-max {a.ctx_max}: the sweep goes to {SWEEP_MAX} at most")
+        a.step = a.step or next(s for s in (1024, 2048, 4096) if a.ctx_max // s <= 16)
+        lens = list(range(a.ctx_start or a.step, a.ctx_max + 1, a.step))
+        if not lens:
+            die(f"--ctx-max {a.ctx_max} is under the sweep's first frontier, {a.ctx_start or a.step}")
+        if len(lens) > 16:
+            die(f"the sweep has {len(lens)} frontiers: 16 at most")
+        a.lengths, a.photo = ",".join(map(str, lens)), True
+    a.lengths = a.lengths or "64,512,64"
+    if not re.fullmatch(r"\d+(,\d+)*", a.lengths):
+        die(f"--lengths {a.lengths}: numbers separated by commas")
+    if a.gen is None:
+        a.gen = 128 if a.sweep else 32   # ds4-bench's 128 at each frontier; 32 for the base
+    lens = [int(x) for x in a.lengths.split(",")] if not a.session else []
+    if a.photo and any(y <= x for x, y in zip(lens, lens[1:])):
+        die("--photo: each length continues the previous one, so they must grow")
+    if a.session:
+        a.session = Path(e["session"] if a.session is True else a.session).resolve()
+    if a.text in TEXTS:
+        a.text = TEXTS[a.text]
+    a.text = Path(a.text).resolve()
+    # --env-only: the variables coli gives the engine (/proc/<pid>/environ) and nothing of the owner's usage
+    model, env = a.model or e["model"].get(SYSTEM), [] if a.env_only else e["env"].get(SYSTEM, [])
+    if SYSTEM == "Linux":
+        # the owner's OMP_PROC_BIND=close alone binds a thread to a logical CPU: on Colab's VMs the team lands on SMT
+        # siblings, half the cores; cores gives each thread a core of its own
+        env += ["OMP_PLACES=cores"] * (a.threads == "cores") + OMP_SHOW
+    elif a.threads != "owner":
+        die("--threads: Linux only (macOS does not bind threads)")
+    env += a.env
+    if a.accel:
+        if SYSTEM not in e["accel"]:
+            die(f"--accel: no accelerated mode for {a.engine} on {SYSTEM}")
+        model = a.model or e["accel"][SYSTEM][0]
+        env = e["accel"][SYSTEM][1] + env
+    if not model:
+        die("--model: no default model on this system")
+    out.mkdir(parents=True, exist_ok=True)
+    a.serve_model = model if a.serve else None
+    versions = [parse_version(v, out, a, a.engine) for v in a.versions]
+    if len({v["label"] for v in versions}) < len(versions):
+        die("two versions with the same label: name them, label=...")
+    for v in versions:
+        v["unread"] = unread(v["binary"], env + v["env"])
+        if v["unread"] and not a.unread_ok:
+            die(f"{v['label']}: the binary never names {' '.join(v['unread'])}: a typo, or a build without that "
+                f"mode? (--unread-ok runs it anyway, and the summary says so)")
+    runs = a.runs or (4 if len(versions) == 2 else 3)
+    keep = ["PATH=/usr/bin:/bin", f"HOME={os.environ.get('HOME', '/tmp')}"]
+    for k in ("LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES") if SYSTEM == "Linux" else ():
+        if k in os.environ:
+            keep.append(f"{k}={os.environ[k]}")
+
+    def command(v, name):   # env keeps the last of a name: a version's own variables win over every default
+        if a.serve:   # the engine's main through SERVE=1, driven by this file (serve_session)
+            return ["env", "-i"] + keep + env + v["env"] + time_cmd() + \
+                [sys.executable, str(Path(__file__).resolve()), "serve-session", str(v["binary"]), "--model", model,
+                 "--session", str(a.session), "--gen", str(a.gen), "--steps", str(out / f"{name}.steps")]
+        return ["env", "-i"] + keep + env + v["env"] + time_cmd() + [str(v["binary"])] + \
+            harness_args(a, model, str(out / f"{name}.steps"))
+
+    what = (f"session {Path(a.session).name}{' through SERVE=1, pin=1 a turn, ' + str(a.gen) + ' words a turn' if a.serve else ''}" if a.session else
+            f"text {a.text.name} (sha256 {sha256(a.text)[:16]}); lengths {a.lengths}; gen {a.gen}; "
+            f"{'free (most likely token, never the end)' if a.free else 'teacher-forced'}"
+            f"{'; photo: each length continues the previous one' if a.photo else ''}"
+            f"{f'; pause {a.pause} s' if a.pause else ''}")
+    hw = hardware()
+    setup = [f"bench {sha256(Path(__file__))[:12]}; engine {a.engine}; {SYSTEM} ({hw['cpu']}"
+             f"{', ' + hw['gpu'] if 'gpu' in hw else ''}); {datetime.now():%Y-%m-%d %H:%M}",
+             f"model {model}; {what}{'; accelerated' if a.accel else ''}",
+             f"runs: a warm-up of v0 (does not count), then {runs} per version"
+             f"{', the order turning at every round (ABBA)' if len(versions) == 2 else ''}; before every run: "
+             f"{'no wait' if a.no_wait_cool else 'wait until cool (at most 900 s)'}"
+             f"{f', the card under {a.max_temp} °C' if SYSTEM == 'Linux' else ''}, then {a.rest} s of rest"]
+    if SYSTEM == "Linux":
+        bind = [x for x in env if x.startswith(("OMP_PROC_BIND=", "OMP_PLACES="))]
+        setup.append(f"while running: card {GPU} read every {WATCH_MS} ms (<run>.gpu.txt); threads: {a.threads} "
+                     f"({' '.join(bind) or 'not bound: no OMP_PROC_BIND or OMP_PLACES'})")
+    setup.append(f"hardware: {json.dumps(hw, ensure_ascii=False)}")   # bench manifest's, from the measuring machine
+    for i, v in enumerate(versions):
+        setup.append(f"v{i} {v['label']}: {v['binary']} ({v['version']}); env: {' '.join(env + v['env']) or 'none'}")
+        setup.append(f"   command: {shlex.join(command(v, f'v{i}-runN'))}")
+    for i, v in enumerate(versions):
+        if v["unread"]:
+            setup.append(f"warning: v{i} {v['label']}: the binary never names {' '.join(v['unread'])}")
+    if runs % 2 and len(versions) == 2:
+        setup.append("warning: an odd number of rounds does not cancel a drift")
+    if runs < MIN_VERDICT and len(versions) == 2:
+        setup.append(f"warning: {runs} run{'s' * (runs > 1)} a version: a check, not a measure (no verdicts)")
+    (out / "setup.txt").write_text("\n".join(setup) + "\n")
+    print("\n".join(setup))
+    (out / "host-before.txt").write_text(host_state() + "\n")
+    if SYSTEM == "Linux" and not FAKE:
+        (out / "cpus.txt").write_text(cpu_cores())
+
+    def one(i, name):
+        waited = 0 if a.no_wait_cool else cool(a.max_temp)
+        time.sleep(a.rest)
+        b = busy([e["binary"]])
+        if b:
+            die(f"{b} is running before {name}: a measurement needs the machine alone")
+        state = thermal()
+        if SYSTEM == "Darwin":
+            (out / f"{name}.power-before.txt").write_text(sh(["pmset", "-g", "batt"]))
+        (out / f"{name}.thermal-before.txt").write_text(
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}\n{state}\n{swap()}\nwaited until cool: {waited}s\n")
+        if not is_cool(state, a.max_temp):
+            die(f"{name}: NOT COOL ({state}), after {waited} s: stopped before timing; preserve this attempt")
+        with open(out / f"{name}.csv", "w") as o, open(out / f"{name}.err", "w") as er, \
+                watch(out / f"{name}.gpu.txt", out / f"{name}.err"):
+            rc = subprocess.run(command(versions[i], name), stdout=o, stderr=er).returncode
+        (out / f"{name}.thermal-after.txt").write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n{thermal()}\n{swap()}\n")
+        if SYSTEM == "Darwin":
+            (out / f"{name}.power-after.txt").write_text(sh(["pmset", "-g", "batt"]))
+        print(f"{name}: exit {rc}", flush=True)
+        if rc:
+            (out / "host-after.txt").write_text(host_state() + "\n")
+            die(f"{name} failed ({out / f'{name}.err'}): {last_line(out / f'{name}.err')}")
+        if a.serve:   # pin=1 kept: every engine says each photo it takes (qwen36.c pin_save, qwen38.c, olmoe.c)
+            got = photos(out / f"{name}.err")
+            turns = sum(1 for l in (out / f"{name}.csv").read_text().splitlines() if l[:1].isdigit())
+            if got < turns:
+                die(f"{name}: {got} photos for {turns} turns: the engine did not keep the state after each prompt "
+                    f"(pin=1, «[PIN] scatto a» in {out / f'{name}.err'})")
+
+    one(0, "warmup")
+    for r in range(1, runs + 1):
+        for i in (range(len(versions)) if r % 2 else reversed(range(len(versions)))):
+            one(i, f"v{i}-run{r}")
+    (out / "host-after.txt").write_text(host_state() + "\n")
+    report(out)
+
+
+# --------------------------------------------------------------------------------------------------- report
+def read_csv(path):
+    # without the lines of OMP_SHOW: libomp (an engine built with clang) prints them on stdout
+    lines = [l for l in path.read_text().strip().split("\n") if l and not l.startswith("omp-thread:")]
+    if not lines:
+        return []
+    head = lines[0].split(",")
+    missing = [c for c in COLS if c not in head]
+    if missing:
+        die(f"{path}: not the CSV contract, missing {missing}")
+    return [dict(zip(head, l.split(","))) for l in lines[1:]]
+
+
+def read_steps(path):
+    """A step file: '<length|turn> <step> <reads> <reads' s> <ms> [<MB to the card>]' a line (the MB on CUDA), the
+    prompt as step -1. A length met again (64,512,64: the 64 after the 512 and its words) starts at its prompt line
+    and takes row_keys' key."""
+    out, seen, key = {}, {}, {}
+    for l in path.read_text().split("\n"):
+        if l.strip():
+            n, g, miss, disk, ms, *bus = l.split()
+            n, g = int(n), int(g)
+            if g == -1:
+                seen[n] = seen.get(n, 0) + 1
+                key[n] = n if seen[n] == 1 else f"{n}#{seen[n]}"
+            out.setdefault(key.get(n, n), {})[g] = (int(miss), float(disk), float(ms), float(bus[0]) if bus else None)
+    return out
+
+
+def row_keys(rows):
+    """Each CSV row's key: its length, or "<n>#<k>" for the k-th time a length comes back; and its label in the
+    tables, "64 after 512" for one that comes back ("16 after 100 #3" if that label is taken)."""
+    seen, keys = {}, []
+    for i, r in enumerate(rows):
+        n = int(r["ctx_tokens"])
+        seen[n] = seen.get(n, 0) + 1
+        label = f"{n} after {rows[i - 1]['ctx_tokens']}" if seen[n] > 1 else str(n)
+        if label in (l for _, l in keys):
+            label += f" #{seen[n]}"
+        keys.append((n if seen[n] == 1 else f"{n}#{seen[n]}", label))
+    return keys
+
+
+def run_names(out):
+    names = {}
+    for p in out.glob("v*-run*.csv"):
+        m = re.match(r"(v\d+)-run(\d+)$", p.stem)
+        if m:
+            names.setdefault(m.group(1), []).append((int(m.group(2)), p.stem))
+    return {v: [n for _, n in sorted(r)] for v, r in sorted(names.items())}
+
+
+def err_numbers(err):
+    text = err.read_text() if err.exists() else ""
+    foot = re.search(r"(\d+)\s+peak memory footprint", text)
+    rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", text)
+    gb = re.search(r"\[bench\] peak RSS ([\d.]+) GB", text)
+    ready = re.search(r"ready in ([\d.]+) s", text)
+    mib = int(foot.group(1)) / 2**20 if foot else int(rss.group(1)) / 1024 if rss else \
+        float(gb.group(1)) * 1024 if gb else None
+    return mib, float(ready.group(1)) if ready else None
+
+
+def cell(xs, d):
+    return f"{statistics.median(xs):.{d}f} ({min(xs):.{d}f}–{max(xs):.{d}f})"
+
+
+def verdict(a, b, higher_better=True):
+    """Medians' change, positive = faster, and whether every run of b beats (or loses to) every run of a; below
+    MIN_VERDICT runs a side, no verdict."""
+    ma, mb = statistics.median(a), statistics.median(b)
+    if ma <= 0 or mb <= 0:
+        return "-"
+    pct = 100 * ((mb / ma if higher_better else ma / mb) - 1)
+    if min(len(a), len(b)) < MIN_VERDICT:
+        return f"{pct:+.1f}%, too few runs for a verdict"
+    better = min(b) > max(a) if higher_better else max(b) < min(a)
+    worse = max(b) < min(a) if higher_better else min(b) > max(a)
+    return f"{pct:+.1f}%, {'every run faster' if better else 'every run slower' if worse else 'ranges overlap'}"
+
+
+def blocks(gen):
+    """Steps 2..gen in blocks that double (2-32, 33-64, 65-128, ...), as 0-based step indices."""
+    out, lo = [], 1
+    for hi in (31, 63, 127, 255, 511, 1023, 2047, 4095):
+        if lo > gen - 1:
+            break
+        out.append((lo, min(hi, gen - 1)))
+        lo = hi + 1
+    return out
+
+
+def labels(out):
+    lab = {}
+    for l in (out / "setup.txt").read_text().split("\n") if (out / "setup.txt").exists() else []:
+        m = re.match(r"(v\d+) (\S+): ", l) or re.match(r"(v\d+): (\S+)", l)
+        if m:
+            lab[m.group(1)] = m.group(2) if not m.group(2).startswith("/") else Path(m.group(2)).parent.name
+    return lab
+
+
+def report(out):
+    out = Path(out)
+    names, lab = run_names(out), labels(out)
+    if not names:
+        die(f"{out}: no runs")
+    data = {v: {r: read_csv(out / f"{r}.csv") for r in rs} for v, rs in names.items()}
+    steps = {v: {r: read_steps(out / f"{r}.steps") for r in rs if (out / f"{r}.steps").exists()}
+             for v, rs in names.items()}
+    for v, rs in data.items():                  # every step file is its run's
+        for r, rows in rs.items():
+            st = steps[v].get(r)
+            if not rows:
+                die(f"{r}.csv: no rows")
+            keys = None if "reused" in rows[0] else row_keys(rows)
+            for i, row in enumerate(rows):
+                key = i + 1 if keys is None else keys[i][0]
+                if st is None or "expert_miss" not in row:
+                    continue
+                s = st.get(key)
+                if not s or sum(x[0] for x in s.values()) != int(row["expert_miss"]):
+                    die(f"{r}.steps: the reads of {key} do not add up to the CSV's expert_miss")
+                if abs(s[-1][2] - float(row["prefill_s"]) * 1e3) > 2.0:
+                    die(f"{r}.steps: the prompt time of {key} is not the CSV's prefill_s")
+    session = "reused" in next(iter(next(iter(data.values())).values()))[0]
+    if not session:   # a run cut short (a VM gone, a Ctrl-C) would drop its rows from every table
+        rows_n = {r: len(rows) for rs in data.values() for r, rows in rs.items()}
+        if len(set(rows_n.values())) > 1:
+            die("the runs do not all have the same rows, one was cut short: " +
+                ", ".join(f"{r} {n}" for r, n in rows_n.items()))
+    setup = (out / "setup.txt").read_text() if (out / "setup.txt").exists() else ""
+    head, warn = [f"# bench: {out.name}", ""], []
+    for l in setup.split("\n")[:3] + [l for l in setup.split("\n")[3:] if re.match(r"v\d+[ :]", l)]:
+        head.append("- " + re.sub(r"(/[^\s;()]+/)+", "", l))   # what ran, without local directories
+    warn += [l[len("warning: "):] for l in setup.split("\n") if l.startswith("warning: ")]
+    planned = re.search(r"then (\d+) per version", setup)
+    for v in sorted(set(lab) | set(names)):
+        if planned and len(names.get(v, [])) < int(planned.group(1)):
+            warn.append(f"INCOMPLETE: {v} {lab.get(v, '')} has {len(names.get(v, []))} of the "
+                        f"{planned.group(1)} runs planned")
+    md = []
+    (session_report if session else lengths_report)(out, md, names, lab, data, steps)
+    warm = out / "warmup.csv"
+    if warm.exists() and not session:
+        md += ["", "warm-up (does not count): " + "; ".join(
+            f"{r['ctx_tokens']} tokens: prompt {float(r['prefill_tps']):.2f} tok/s, decode "
+            f"{float(r['gen_steady_tps']):.3f} tok/s" for r in read_csv(warm))]
+    hot, notemp = [], []
+    top = re.search(r"the card under (\d+) °C", setup)   # before a run a card must be under it too
+    for p in sorted(out.glob("*.thermal-*.txt")):
+        state, before = p.read_text().split("\n")[1], p.name.endswith("before.txt")
+        if not is_cool(state, (int(top.group(1)) if top else 70) if before else None):
+            hot.append(f"{p.name.split('.thermal')[0]} ({p.name.split('-')[-1][:-4]}: {state})")
+        if state == "no-temp":
+            notemp.append(p.name.split(".thermal")[0])
+    card, team, blind, backend = {}, {}, [], {}
+    cores = {int(c): k for c, k in (l.split() for l in (out / "cpus.txt").read_text().split("\n") if l.strip())} \
+        if (out / "cpus.txt").exists() else {}
+    for v, rs in names.items():
+        for r in rs:
+            c = card_while_running(out / f"{r}.gpu.txt") if (out / f"{r}.gpu.txt").exists() else None
+            if c and not c["n"]:
+                blind.append(f"{r} ({c['lines']} lines)")
+            elif c:
+                card.setdefault(v, []).append(c)
+                if c["hot"]:
+                    hot.append(f"{r} (while running: 0x{c['hot']:x} in {c['hot_share']:.0%} of the samples with a "
+                               f"kernel, up to {c['temp']} °C)")
+            t = threads([out / f"{r}.err", out / f"{r}.csv"], cores)
+            if t:
+                team.setdefault(v, []).append(t)
+            m = re.search(r"\[bench\] (.+?) ready in", (out / f"{r}.err").read_text(errors="replace")) \
+                if (out / f"{r}.err").exists() else None
+            backend.setdefault(v, set()).add(m.group(1) if m else "?")
+    if hot:
+        warn.append("runs not cool (below)")
+    if notemp:
+        warn.append(f"the card reported no temperature before or after {', '.join(sorted(set(notemp)))}: "
+                    f"nothing was waited for")
+    if len(set().union(*backend.values())) > 1:
+        warn.append("the runs did not all run on one backend (below)")
+    if any(b != {"?"} for b in backend.values()):
+        md.append("backend: " + "; ".join(f"{v} {lab.get(v, '')} {', '.join(sorted(b))}" for v, b in backend.items()))
+    md.append(f"runs not cool: {', '.join(hot) if hot else 'none'}")
+    if blind:
+        md.append(f"the card while running: no samples with a kernel running in {', '.join(blind)} (older files "
+                  f"have no utilization column)")
+    if card:
+        md.append("the card while running (samples with a kernel running; median, min–max of the runs): " + "; ".join(
+            f"{v} {lab.get(v, '')} SM {cell([c['sm'] for c in cs], 0)} MHz, under the power cap "
+            f"{cell([100 * c['power'] for c in cs], 0)} % of the samples, up to {max(c['temp'] for c in cs)} °C, "
+            f"{cell([c['n'] for c in cs], 0)} samples"
+            for v, cs in card.items()))
+    if team:
+        md.append("threads: " + "; ".join(
+            f"{v} {lab.get(v, '')} " + ", ".join(f"{n} on {k} cores (CPUs {','.join(map(str, cpus))})" if k else
+                                                f"{n} not bound (each may run on CPUs {','.join(map(str, cpus))})"
+                                                for n, cpus, k in sorted(set((n, tuple(c), k) for n, c, k in ts),
+                                                                         key=str))
+            for v, ts in team.items()))
+    outs = lambda f: int(m.group(1)) if (out / f).exists() and (m := re.search(r"swapouts=(\d+)",
+                                                                              (out / f).read_text())) else None
+    if None not in (outs("host-before.txt"), outs("host-after.txt")):
+        runs = [outs(f"{r}.thermal-after.txt") - outs(f"{r}.thermal-before.txt") for rs in names.values() for r in rs
+                if None not in (outs(f"{r}.thermal-before.txt"), outs(f"{r}.thermal-after.txt"))]
+        md.append(f"pages written to swap during the measurement: {outs('host-after.txt') - outs('host-before.txt')}"
+                  + (f", {sum(runs)} of them in the runs that count" if runs else ""))
+    text = "\n".join(head + [f"- **warning**: {w}" for w in warn] + [""] + md) + "\n"
+    (out / "summary.md").write_text(text)
+    print(text)
+    files = sorted(p for p in out.rglob("*") if p.is_file() and p.name != "sha256.txt" and   # a build's sources: no
+                   (not p.relative_to(out).parts[0].startswith("bin-") or len(p.relative_to(out).parts) == 2))
+    (out / "sha256.txt").write_text("".join(f"{sha256(p)}  {p.relative_to(out)}\n" for p in files))
+
+
+def results(x, y, teacher):
+    """The same logits in every run of both versions (the fingerprints), or the same words. A teacher-forced text
+    gives both versions the text's words: there only the logits and the nll can tell."""
+    if len(x["fp"]) == 1 and x["fp"] == y["fp"]:
+        return "same results"
+    if teacher:
+        return "logits differ"
+    if len(x["words"]) == 1 and x["words"] == y["words"]:
+        return "same words, logits differ"
+    return "RESULTS DIFFER"
+
+
+def nll_change(a, b):
+    return f"{100 * (b / a - 1):+.2f}%" if a > 0 else "-"
+
+
+def lengths_report(out, md, names, lab, data, steps):
+    med, label_of = {}, {}
+    for v, rs in data.items():
+        runs = list(rs.values())
+        first = runs[0]
+        opt = [c for c in OPT_COLS if c in first[0]]
+        teacher = "nll" in first[0] and float(first[0]["nll"]) > 0
+        mem = [err_numbers(out / f"{r}.err") for r in rs]
+        head = ["tokens", "new", "prompt tok/s", "first step ms", "decode tok/s"] + \
+            [OPT_COLS[c][0] for c in opt] + ["nll", "top1"] * teacher + ["fingerprint"]
+        md += [f"## {v} {lab.get(v, '')}: {len(runs)} run{'s' * (len(runs) > 1)} (median, min–max)", "",
+               "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+        keys = row_keys(first)
+        for i, r0 in enumerate(first):
+            col = lambda k: [float(rows[i][k]) for rows in runs]
+            fps = {rows[i]["fingerprint"] for rows in runs}
+            n, label = keys[i]
+            label_of[n] = label
+            med[(v, n)] = {"prefill_tps": col("prefill_tps"), "gen_first_ms": col("gen_first_ms"),
+                           "gen_steady_tps": col("gen_steady_tps"), "fp": fps,
+                           "words": {rows[i]["tokens"] for rows in runs},
+                           "nll": statistics.median(col("nll")) if teacher else None,
+                           "top1": statistics.median(col("top1")) if teacher else None}
+            g = int(r0["gen_tokens"])   # no decode speed below 2 words, no first step without one
+            md.append(f"| {label} | {r0['prefill_tokens']} | {cell(col('prefill_tps'), 2)} | "
+                      f"{cell(col('gen_first_ms'), 0) if g else '-'} | "
+                      f"{cell(col('gen_steady_tps'), 3) if g > 1 else '-'} | " +
+                      "".join(f"{statistics.median(col(c)):.{OPT_COLS[c][1]}f} | " for c in opt) +
+                      (f"{statistics.median(col('nll')):.4f} | {statistics.median(col('top1')):.3f} | "
+                       if teacher else "") +
+                      (f"{next(iter(fps))} |" if len(fps) == 1 else f"DIFFERENT between runs: {sorted(fps)} |"))
+        foot = [m[0] for m in mem if m[0]]
+        ready = [m[1] for m in mem if m[1]]
+        md.append("")
+        if foot:
+            md.append(f"peak memory {statistics.median(foot):.0f} MiB" +
+                      (f", model ready in {statistics.median(ready):.2f} s" if ready else "") + " (medians)")
+        if steps[v] and len(steps[v]) == len(rs):
+            gen = int(first[0]["gen_tokens"])
+            bus = steps_bus(steps[v])
+            md += ["", f"decode by steps (step 1 gives the second new word; medians of {len(runs)} runs):", "",
+                   f"| tokens | steps | {OPT_COLS['expert_miss'][0]} | decode tok/s | reads' s |" +
+                   " MB to the card |" * bus, "|---|---|---|---|---|" + "---|" * bus]
+            for n, label in keys:
+                for lo, hi in blocks(gen) + ([(1, gen - 1)] if len(blocks(gen)) > 1 else []):
+                    b = block_stats(steps[v], n, lo, hi)
+                    med.setdefault(("steps", v, n, lo, hi), b)
+                    md.append(f"| {label} | {lo + 1} to {hi + 1} | {statistics.median(b[0]):.0f} | "
+                              f"{statistics.median(b[1]):.3f} | {statistics.median(b[2]):.3f} |" +
+                              (f" {statistics.median(b[3]):.1f} |" if bus else ""))
+        md.append("")
+    vs = list(data)
+    if len(vs) == 2:
+        a, b = vs
+        md += [f"## {b} {lab.get(b, '')} against {a} {lab.get(a, '')} (medians of {len(data[a])} and "
+               f"{len(data[b])} runs; positive = faster)", "",
+               "| tokens | prompt | first step | decode | results |", "|---|---|---|---|---|"]
+        for (v, n), x in [(k, m) for k, m in med.items() if len(k) == 2 and k[0] == a]:
+            y = med.get((b, n))
+            if not y:
+                continue
+            teacher = x["nll"] is not None and y["nll"] is not None
+            same = results(x, y, teacher)
+            if teacher:
+                if x["words"] != y["words"]:
+                    die(f"{label_of[n]} tokens: teacher-forced, but the two versions read different tokens")
+                same += (f"; nll {x['nll']:.4f} → {y['nll']:.4f} ({nll_change(x['nll'], y['nll'])}), "
+                         f"top1 {x['top1']:.3f} → {y['top1']:.3f}")
+            md.append(f"| {label_of[n]} | {verdict(x['prefill_tps'], y['prefill_tps'])} | "
+                      f"{verdict(x['gen_first_ms'], y['gen_first_ms'], False)} | "
+                      f"{verdict(x['gen_steady_tps'], y['gen_steady_tps'])} | {same} |")
+        rows = [(k, m) for k, m in med.items() if len(k) == 5 and k[1] == a]
+        if rows:
+            bus = steps_bus(steps[a]) and steps_bus(steps[b])
+            md += ["", f"| tokens | steps | {OPT_COLS['expert_miss'][0]} | decode | reads' s |" +
+                   " MB to the card |" * bus, "|---|---|---|---|---|" + "---|" * bus]
+            for (_, _, n, lo, hi), x in rows:
+                y = med.get(("steps", b, n, lo, hi))
+                if y:
+                    md.append(f"| {label_of[n]} | {lo + 1} to {hi + 1} | {statistics.median(x[0]):.0f} → "
+                              f"{statistics.median(y[0]):.0f} | {verdict(x[1], y[1])} | "
+                              f"{statistics.median(x[2]):.3f} → {statistics.median(y[2]):.3f} s |" +
+                              (f" {statistics.median(x[3]):.1f} → {statistics.median(y[3]):.1f} |" if bus else ""))
+
+
+def steps_bus(st):
+    """Whether a version's step files carry the MB to the card (a CUDA build's)."""
+    return all(g[3] is not None for s in st.values() for n in s.values() for g in n.values())
+
+
+def block_stats(st, n, lo, hi):
+    """Per run, over steps lo..hi of length (or turn) n: reads, tokens a second, reads' time, MB to the card."""
+    reads, tps, disk, bus = [], [], [], []
+    for s in st.values():
+        s = s[n]
+        reads.append(sum(s[g][0] for g in range(lo, hi + 1)))
+        disk.append(sum(s[g][1] for g in range(lo, hi + 1)))
+        tps.append((hi - lo + 1) / (sum(s[g][2] for g in range(lo, hi + 1)) / 1e3))
+        bus.append(sum(s[g][3] or 0 for g in range(lo, hi + 1)))
+    return reads, tps, disk, bus
+
+
+def session_time(rows):
+    """The time of all turns of a run: to the first token, the first step, the other steps."""
+    t = 0.0
+    for r in rows:
+        n, tps = int(r["gen_tokens"]), float(r["gen_steady_tps"])
+        t += float(r["prefill_s"]) + float(r["gen_first_ms"]) / 1e3 + ((n - 1) / tps if n > 1 and tps > 0 else 0)
+    return t
+
+
+def session_report(out, md, names, lab, data, steps):
+    for v, rs in data.items():
+        runs = list(rs.values())
+        nt = len(runs[0])
+        if any(len(r) != nt for r in runs):
+            die(f"{v}: the runs do not all have {nt} turns")
+        bus = "bus_mb" in runs[0][0]
+        md += [f"## {v} {lab.get(v, '')}: {len(runs)} run{'s' * (len(runs) > 1)} (median, min–max)", "",
+               "| turn | prompt | reused | read | to first token s | first step ms | decode tok/s | answer | nll | "
+               f"top1 | greedy same | tool calls exact | stops | RSS GB | {OPT_COLS['expert_miss'][0]} |" +
+               " MB to the card |" * bus, "|" + "---|" * (15 + bus)]
+        serve = runs[0][0].get("serve") == "1"   # SERVE=1 says no reuse (serve_session): «?», not a number
+        for i in range(nt):
+            col = lambda k: [float(r[i][k]) for r in runs]
+            r0 = runs[0][i]
+            md.append(f"| {i + 1} | {r0['ctx_tokens']} | {'?' if serve else r0['reused']} | "
+                      f"{'?' if serve else r0['prefill_tokens']} | "
+                      f"{cell(col('prefill_s'), 2)} | {cell(col('gen_first_ms'), 0)} | "
+                      f"{cell(col('gen_steady_tps'), 2)} | {r0['gen_tokens']} | {statistics.median(col('nll')):.4f} | "
+                      f"{statistics.median(col('top1')):.3f} | {r0['greedy_prefix']}/{r0['gen_tokens']} | "
+                      f"{r0['tool_calls_ok']}/{r0['tool_calls']} | {'yes' if r0['stop_ok'] == '1' else 'no'} | "
+                      f"{statistics.median(col('rss_gb')):.2f} | {statistics.median(col('expert_miss')):.0f} |" +
+                      (f" {statistics.median(col('bus_mb')):.1f} |" if bus else ""))
+        r0 = runs[0]
+        times = [session_time(r) for r in runs]
+        answer = sum(int(r["gen_tokens"]) for r in r0)
+        bad = [i + 1 for i in range(nt) if len({r[i]["fingerprint"] for r in runs}) > 1]
+        read = (f"prompts {sum(int(r['ctx_tokens']) for r in r0)} tokens (SERVE=1 does not say what the engine reused)"
+                if serve else f"prompts read {sum(int(r['prefill_tokens']) for r in r0)} tokens, reused "
+                              f"{sum(int(r['reused']) for r in r0)}")
+        md += ["", f"session: {nt} turns; {read}; all turns {cell(times, 1)} s; to first token in all "
+               f"{cell([sum(float(r['prefill_s']) for r in g) for g in runs], 1)} s; answers {answer} tokens, nll "
+               f"{sum(float(r['nll']) * int(r['gen_tokens']) for r in r0) / answer:.4f}, top1 "
+               f"{sum(float(r['top1']) * int(r['gen_tokens']) for r in r0) / answer:.3f}; tool calls exact "
+               f"{sum(int(r['tool_calls_ok']) for r in r0)} of {sum(int(r['tool_calls']) for r in r0)}; turns that "
+               f"stop {sum(r['stop_ok'] == '1' for r in r0)} of {nt}",
+               f"fingerprints equal in every run: {'yes' if not bad else f'NO, turns {bad}'}", ""]
+    vs = list(data)
+    if len(vs) == 2:
+        ga, gb = [list(data[v].values()) for v in vs]
+        if len(ga[0]) != len(gb[0]):
+            md.append("the two versions have different turns: no comparison")
+            return
+        serve = ga[0][0].get("serve") == "1"   # through SERVE=1: the answers are forced inside each next prompt
+        same = all((serve or ga[0][i]["tokens"] == gb[0][i]["tokens"]) and ga[0][i]["ctx_tokens"] == gb[0][i]["ctx_tokens"]
+                   for i in range(len(ga[0])))
+        md += [f"## {vs[1]} {lab.get(vs[1], '')} against {vs[0]} {lab.get(vs[0], '')} (medians of {len(ga)} and "
+               f"{len(gb)} runs; positive = faster)",
+               "", f"same prompts{' (through SERVE=1: the answers forced inside the next prompt)' if serve else ' and teacher-forced answers'}: "
+                   f"{'yes' if same else 'NO: no comparison'}"]
+        if not same:
+            return
+        md += ["", "| turn | to first token | first step | decode | nll | experts read | results |",
+               "|---|---|---|---|---|---|---|"]
+        for i in range(len(ga[0])):
+            col = lambda g, k: [float(r[i][k]) for r in g]
+            fa, fb = {r[i]["fingerprint"] for r in ga}, {r[i]["fingerprint"] for r in gb}
+            md.append(f"| {i + 1} | {verdict(col(ga, 'prefill_s'), col(gb, 'prefill_s'), False)} | "
+                      f"{verdict(col(ga, 'gen_first_ms'), col(gb, 'gen_first_ms'), False)} | "
+                      f"{verdict(col(ga, 'gen_steady_tps'), col(gb, 'gen_steady_tps'))} | "
+                      f"{statistics.median(col(gb, 'nll')) - statistics.median(col(ga, 'nll')):+.4f} | "
+                      f"{statistics.median(col(ga, 'expert_miss')):.0f} → "
+                      f"{statistics.median(col(gb, 'expert_miss')):.0f} | "
+                      f"{'same results' if len(fa) == 1 and fa == fb else 'logits differ'} |")
+        md += ["", f"all turns: {verdict([session_time(r) for r in ga], [session_time(r) for r in gb], False)}; "
+               f"to first token in all: "
+               f"{verdict([sum(float(r['prefill_s']) for r in g) for g in ga], [sum(float(r['prefill_s']) for r in g) for g in gb], False)}"]
+
+
+# ------------------------------------------------------------------------------------------------- manifest
+def manifest(a):
+    """The record for c/experiment_manifest.py: the prompt's or the decode's speed (--metric) at the longest length
+    in each run of each version, and the machine that measured (setup.txt's, not the one running this)."""
+    out = Path(a.out)
+    names, data = run_names(out), None
+    if len(names) != 2:
+        die("a manifest compares two versions")
+    data = {v: [read_csv(out / f"{r}.csv") for r in rs] for v, rs in names.items()}
+    if min(len(d) for d in data.values()) < MIN_VERDICT:
+        die(f"a manifest needs {MIN_VERDICT} runs a version: " + ", ".join(f"{v} has {len(d)}" for v, d in data.items()))
+    if len({len(rows) for d in data.values() for rows in d}) > 1:
+        die("the runs do not all have the same rows, one was cut short")
+    setup = (out / "setup.txt").read_text()
+    hw = re.search(r"^hardware: (.*)$", setup, re.M)
+    if not hw:
+        die("setup.txt has no hardware line (a measurement before 29/10): write the record's hardware by hand")
+    cfg = {}
+    for v in names:
+        m = re.search(rf"^{v} [^:\s]+: (.+?) \((.*)\); env: (.*)$", setup, re.M)
+        if not m:
+            die("setup.txt was not written by bench run")
+        env = {} if m.group(3) == "none" else dict(x.split("=", 1) for x in m.group(3).split())
+        cfg[v] = {"HARNESS": m.group(2), **env}
+    keys = sorted(set(cfg["v0"]) | set(cfg["v1"]))
+    changed = [k for k in keys if cfg["v0"].get(k) != cfg["v1"].get(k)]
+    if len(changed) != 1:
+        die(f"the two versions differ in {changed or 'nothing'}: a manifest changes one variable")
+    for v in cfg:
+        for k in keys:
+            cfg[v].setdefault(k, "unset")
+    n = max(int(r["ctx_tokens"]) for r in data["v0"][0])
+    col = {"prompt": "prefill_tps", "decode": "gen_steady_tps"}[a.metric]
+    s0, s1 = ([float(next(r for r in rows if int(r["ctx_tokens"]) == n)[col]) for rows in data[v]]
+              for v in ("v0", "v1"))
+    rows = range(len(data["v0"][0]))   # the same logits: each row one fingerprint in every run of both versions
+    if all(len({d[i]["fingerprint"] for v in data for d in data[v]}) == 1 for i in rows):
+        quality = "the fingerprint of every logit is the same in every run of both versions, at every length"
+    elif not a.quality:
+        die("the logits change between the versions: say how quality was checked, --quality \"...\"")
+    else:   # the person's check, and the numbers beside it
+        quality = a.quality
+        if "nll" in data["v0"][0][0] and float(data["v0"][0][0]["nll"]) > 0:
+            med = lambda v, i, k: statistics.median(float(d[i][k]) for d in data[v])
+            quality += "; teacher-forced (medians), " + ", ".join(
+                f"{data['v0'][0][i]['ctx_tokens']} tokens: nll {med('v0', i, 'nll'):.4f} → {med('v1', i, 'nll'):.4f}"
+                f", top1 {med('v0', i, 'top1'):.3f} → {med('v1', i, 'top1'):.3f}" for i in rows)
+    outcome = "improvement" if min(s1) > max(s0) else "regression" if max(s1) < min(s0) else "no-change"
+    ev = {"uri": a.evidence_uri or str(a.evidence), "sha256": sha256(a.evidence)}
+    model = re.search(r"^model (\S+);", setup, re.M).group(1)
+
+    def arm(v, s):
+        return {"config": cfg[v], "samples": {"tok_s": s}, "median_tok_s": statistics.median(s),
+                "quality": {"method": quality, "passed": True}, "evidence": ev}
+    rec = {"version": 1, "hypothesis": a.hypothesis, "commit": a.commit, "model": Path(model).name,
+           "metric": f"{a.metric} tok/s at {n} tokens",
+           "command": re.search(r"^v1 [^:\s]+: .*\n   command: (.*)$", setup, re.M).group(1),
+           "prompt_hash": re.search(r"sha256 ([0-9a-f]+)\)", setup).group(1) if "sha256" in setup else "session",
+           "hardware": json.loads(hw.group(1)), "warmup_runs": 1, "changed_variables": changed,
+           "baseline": arm("v0", s0), "trial": arm("v1", s1), "outcome": outcome}
+    print(json.dumps(rec, indent=2, ensure_ascii=False))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="bench", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build", help="the harness against a commit or a source directory")
+    b.add_argument("target"), b.add_argument("out")
+    for q in (b, r := sub.add_parser("run", help="warm-up, then runs in ABBA order, then the report")):
+        q.add_argument("--cuda", action="store_true", help="build with CUDA=1 (Linux)")
+        q.add_argument("--engine", default="qwen36", choices=sorted(ENGINES))
+        q.add_argument("--repo", help="the git repository of the commits (default: the one around cwd or bench)")
+        q.add_argument("--make", action="append", default=[], metavar="VAR=VAL", help="one more make variable")
+    r.add_argument("out"), r.add_argument("versions", nargs="+", metavar="version")
+    r.add_argument("--text", default="prose", help="prose, code, chat or a file (default prose)")
+    r.add_argument("--lengths", help="default 64,512,64: 64, 512, and the 64 after the 512 and its words")
+    r.add_argument("--gen", type=int, help="tokens generated after each length (default 32; 128 with --sweep)")
+    r.add_argument("--free", action="store_true", help="most likely token instead of the text's (ds4-bench's way)")
+    r.add_argument("--photo", action="store_true", help="each length continues the previous one")
+    r.add_argument("--sweep", action="store_true", help="ds4's context sweep: --photo from --ctx-start to --ctx-max")
+    r.add_argument("--ctx-max", type=int, help=f"the sweep's top, chosen with the user (at most {SWEEP_MAX})")
+    r.add_argument("--step", type=int,
+                   help="default: the smallest of 1024, 2048, 4096 giving at most 16 frontiers; another, chosen with the user")
+    r.add_argument("--ctx-start", type=int, help="default: the step")
+    r.add_argument("--session", nargs="?", const=True, help="replay a session file turn by turn (default: agent); a "
+                                                             "transcript .json: any engine, through its SERVE=1")
+    r.add_argument("--pause", type=int, default=0, help="seconds of idle engine between lengths or turns")
+    r.add_argument("--model"), r.add_argument("--accel", action="store_true", help="the guide's accelerated mode")
+    r.add_argument("--argv", help="the engine's positional arguments as coli passes them (a,b); qwen36 off "
+                                  "the Metal graph (its default: 256,4)")
+    r.add_argument("--env", action="append", default=[], metavar="VAR=VAL", help="for every version")
+    r.add_argument("--env-only", action="store_true",
+                   help="only --env's variables, as coli gives them to the engine: none of the engine's defaults")
+    r.add_argument("--runs", type=int), r.add_argument("--rest", type=int, default=60)
+    r.add_argument("--no-wait-cool", action="store_true"), r.add_argument("--max-temp", type=int, default=70)
+    r.add_argument("--threads", choices=("owner", "cores"), default="owner",
+                   help="Linux: owner = the owner's OMP_PROC_BIND=close alone (default); cores = OMP_PLACES=cores too, "
+                        "a thread a physical core")
+    r.add_argument("--gpu", type=int, help="Linux: the card the engine uses, which the bench reads (default 0; "
+                                           "needed with more than one)")
+    r.add_argument("--unread-ok", action="store_true",
+                   help="run a version whose binary never names one of its variables (the summary says so)")
+    r.add_argument("--chrome-ok", action="store_true")
+    sub.add_parser("report", help="summary.md from a measurement").add_argument("out")
+    ss = sub.add_parser("serve-session", help="(run's own) a session through an engine's SERVE=1")
+    ss.add_argument("engine_bin"), ss.add_argument("--model", required=True), ss.add_argument("--session", required=True)
+    ss.add_argument("--gen", type=int, default=32), ss.add_argument("--steps")
+    m = sub.add_parser("manifest", help="the experiment manifest of a two-version measurement")
+    m.add_argument("out"), m.add_argument("--commit", required=True), m.add_argument("--hypothesis", required=True)
+    m.add_argument("--evidence", required=True, help="the raw file the record publishes")
+    m.add_argument("--evidence-uri"), m.add_argument("--quality")
+    m.add_argument("--metric", required=True, choices=("prompt", "decode"),
+                   help="the speed the record carries, at the longest length")
+    a = p.parse_args()
+    if len(getattr(a, "versions", [])) > 2:
+        die("one or two versions")
+    {"build": lambda: build(a.target, a.out, a.engine, a.cuda, a.repo, a.make), "run": lambda: run(a),
+     "report": lambda: report(a.out), "manifest": lambda: manifest(a), "serve-session": lambda: serve_session(a)}[a.cmd]()
+
+
+if __name__ == "__main__":
+    main()

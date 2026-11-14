@@ -1,0 +1,49 @@
+{
+  "cpu": "Apple M1, MacBookAir10,1",
+  "ram_bytes": 8589934592,
+  "gpu_cores": 7,
+  "measurements_power": "AC attached, 80%, not charging; see per-run snapshots",
+  "observations": {
+    "macos": {
+      "command": [
+        "sw_vers"
+      ],
+      "returncode": 0,
+      "stdout": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n",
+      "stderr": ""
+    },
+    "clang": {
+      "command": [
+        "clang",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin25.6.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+      "stderr": ""
+    },
+    "sdk": {
+      "command": [
+        "xcrun",
+        "--show-sdk-version"
+      ],
+      "returncode": 0,
+      "stdout": "27.0\n",
+      "stderr": ""
+    },
+    "python": {
+      "command": [
+        "python3",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "Python 3.9.6\n",
+      "stderr": ""
+    }
+  },
+  "python_scope": {
+    "snapshot_default_python": "3.9.6",
+    "measurement_driver_executable": "/opt/homebrew/bin/python3.12",
+    "measurement_driver_version_observed_after_campaign": "3.12.15",
+    "evidence": "Saved per-block controller commands select python3.12; executable version checked after the campaign."
+  }
+}

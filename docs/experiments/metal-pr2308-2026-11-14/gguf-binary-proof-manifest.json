@@ -1,0 +1,227 @@
+[
+  {
+    "file": "real-gguf/A-exact/logits.bin",
+    "bytes": 3973172,
+    "sha256": "e9b0fa22c2da1220cde8daf3670e8f05501a71e7fd2ad91f938e7534b7965ca2"
+  },
+  {
+    "file": "real-gguf/A-fast/logits.bin",
+    "bytes": 3973172,
+    "sha256": "e96e116d444cbf78564686ba787c3156ede257cdc780bcf090de2a448e6a5fd5"
+  },
+  {
+    "file": "real-gguf/B-cpu/logits.bin",
+    "bytes": 3973172,
+    "sha256": "a3e20dbbde6154c539774e90e92bea2a8aa3a28fbaece8c742c2a16c4a299380"
+  },
+  {
+    "file": "real-gguf/B-exact/logits.bin",
+    "bytes": 3973172,
+    "sha256": "e9b0fa22c2da1220cde8daf3670e8f05501a71e7fd2ad91f938e7534b7965ca2"
+  },
+  {
+    "file": "real-gguf/B-fast/logits.bin",
+    "bytes": 3973172,
+    "sha256": "e96e116d444cbf78564686ba787c3156ede257cdc780bcf090de2a448e6a5fd5"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-0/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "aaea003117c016566c88c14a980fc4468c93bfa78e5cda0e4e5b751733c6ad9d"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-0/reference.layers.f32",
+    "bytes": 983040,
+    "sha256": "aaea003117c016566c88c14a980fc4468c93bfa78e5cda0e4e5b751733c6ad9d"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-0/reference.request.bin",
+    "bytes": 157,
+    "sha256": "7607c1da8dc61d25167044076729c633ab14fb95902cd475e40c27f28928c68f"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-0/wire.bin",
+    "bytes": 43804,
+    "sha256": "0a6598dd4dd65d6060cc13f3ef2f80c8f1d61415e84f5c751a071b830dff7a73"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-1/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "0c1781bdcfa7d5d2a7eb6bd794bc0946c5735a96cd7c1d5ef9b4846d2d6d78f6"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-1/reference.layers.f32",
+    "bytes": 983040,
+    "sha256": "0c1781bdcfa7d5d2a7eb6bd794bc0946c5735a96cd7c1d5ef9b4846d2d6d78f6"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-1/reference.request.bin",
+    "bytes": 234,
+    "sha256": "816e0f72afecbc339ca347199f5a93422a5e26e6290d37e0c4ed01aa20e95b8e"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-1/wire.bin",
+    "bytes": 43799,
+    "sha256": "3f7697e9dbb8d32ed41108c5b72c4665dac283cc99a8dcc60737618cb3db1e5a"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-2/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-2/reference.layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-2/reference.request.bin",
+    "bytes": 311,
+    "sha256": "96adaa0d977106af3c91ecb7735e062aa55f84994bc74e4f6f2b5563e85244fa"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-2/wire.bin",
+    "bytes": 43799,
+    "sha256": "c15f1960699de95fe0e9045be16dd44d62bbfd0348dd5996a880adab60ea0807"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-3/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "87bc47b5425f5b3d4e4bacccdf7cfd79eb597c2c20a4cbf798117cbe0bec3e43"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-3/reference.layers.f32",
+    "bytes": 983040,
+    "sha256": "87bc47b5425f5b3d4e4bacccdf7cfd79eb597c2c20a4cbf798117cbe0bec3e43"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-3/reference.request.bin",
+    "bytes": 106,
+    "sha256": "aa4c626ff38ffb2544840d11fc7c464012ae3189d0f9c5361a6b68813cdb5299"
+  },
+  {
+    "file": "real-gguf/stateful/fresh-3/wire.bin",
+    "bytes": 43799,
+    "sha256": "517d94445c91576a1bdcc89c6ab0c3c2470400756435f27330e58f784a6d57bd"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-0.layers.f32",
+    "bytes": 983040,
+    "sha256": "aaea003117c016566c88c14a980fc4468c93bfa78e5cda0e4e5b751733c6ad9d"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-0.request.bin",
+    "bytes": 154,
+    "sha256": "d251ce5f6b295d317195c41076dfa377e391f3d2da50d76cc5d8308cb65d4a75"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-1.layers.f32",
+    "bytes": 983040,
+    "sha256": "0c1781bdcfa7d5d2a7eb6bd794bc0946c5735a96cd7c1d5ef9b4846d2d6d78f6"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-1.request.bin",
+    "bytes": 231,
+    "sha256": "fb6e846ffc09e8ae04540eac6d256897b5bbbaa774d3134214e67af58d542e4f"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-2.layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-2.request.bin",
+    "bytes": 308,
+    "sha256": "fd39a30a98e78c28c7bea789d893d915993a2f98c6f48619168494e9cef55f8f"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-3.layers.f32",
+    "bytes": 983040,
+    "sha256": "87bc47b5425f5b3d4e4bacccdf7cfd79eb597c2c20a4cbf798117cbe0bec3e43"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-3.request.bin",
+    "bytes": 103,
+    "sha256": "653ece1a4924c655ed43adcc1c40d9c5a447171b820346ded41ac42dd6646cef"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-4.layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/turn-4.request.bin",
+    "bytes": 308,
+    "sha256": "627c91f5e275d2cb836ec42954c79e53deebb86ca9ac24358bcd3a749b64856c"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-0/wire.bin",
+    "bytes": 136773,
+    "sha256": "71a865efdd16f1389a38e2c5a63971a3716506a8dcbb550f51be4a74aea5b51f"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/last-layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-5.layers.f32",
+    "bytes": 983040,
+    "sha256": "aaea003117c016566c88c14a980fc4468c93bfa78e5cda0e4e5b751733c6ad9d"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-5.request.bin",
+    "bytes": 154,
+    "sha256": "7ffe40f3798566a0367a5fa3bd85e8a71640883a91a681f1a4705efe901107c9"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-6.layers.f32",
+    "bytes": 983040,
+    "sha256": "0c1781bdcfa7d5d2a7eb6bd794bc0946c5735a96cd7c1d5ef9b4846d2d6d78f6"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-6.request.bin",
+    "bytes": 231,
+    "sha256": "2694548662ad5a6708c474584bd189b2f9c531e3de3e790ae9cecfa2ba963901"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-7.layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-7.request.bin",
+    "bytes": 308,
+    "sha256": "416b8b360a8515f04431fc3809c3b211f7b4a892765a29560e31a04fde9fea01"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-8.layers.f32",
+    "bytes": 983040,
+    "sha256": "87bc47b5425f5b3d4e4bacccdf7cfd79eb597c2c20a4cbf798117cbe0bec3e43"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-8.request.bin",
+    "bytes": 103,
+    "sha256": "51c3247bde9951b99e736d621d574ad7d41844ab1d430ab004a29cf244f7361f"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-9.layers.f32",
+    "bytes": 983040,
+    "sha256": "c8b22afe16bc315a9cb37dda850131c75f6b031ed1a63c8af2236917e6e9e661"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/turn-9.request.bin",
+    "bytes": 308,
+    "sha256": "4c3bc81b5043b253db78929e5a70366492d0a2a0de62d06fc1092247b9e2a97c"
+  },
+  {
+    "file": "real-gguf/stateful/live-pin-1/wire.bin",
+    "bytes": 136773,
+    "sha256": "367e268e4870b9d0cae1352daff582c4e40f052111d11b41722c735d5f69d7c9"
+  }
+]
