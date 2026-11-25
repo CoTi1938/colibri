@@ -6,15 +6,11 @@ I contribute to colibri, Vincenzo Fornaro’s C inference engine for mixture-of-
 
 ## CUDA on eight NVIDIA GPUs
 
-The series starts with 13 optimizations on L4. Seven more PRs select which paths to run on each additional GPU for the same Qwen3.6-35B-A3B INT4 checkpoint. The maintainer also tested the integrated code on an RTX PRO 4000 Blackwell SFF Edition. A 9,870-token prompt took 2.4 seconds, down from 3.3, with the same generated text. [Start with PR #2979](https://github.com/JustVugg/colibri/pull/2979) · [Integration batch #3064](https://github.com/JustVugg/colibri/pull/3064)
-
-I compared the historical full stack (`da49a161`) with `dev` (`05245ef4`) on the same physical card for each pair, before the PRs were packaged for integration. **All 384 comparisons matched `dev` bit for bit** across 16 workloads, three repetitions and eight GPUs. Each comparison covered the full FP32 logits after the prompt and at every generation step. On the RTX PRO 4000, one cold 64-token run checked 129 vectors of 248,320 logits each (32,033,280 FP32 values). [RTX PRO 4000 logit comparison](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/correctness.txt)
-
-The separate perplexity check compared **128 continuation vectors on each GPU, 1,024 across the eight cards**. Each GPU’s “FP32 and PPL” link below gives its per-run vector counts and its perplexity result.
+I developed 13 CUDA optimizations on the L4 and added seven GPU profiles to select the execution paths on each additional card. All eight ran the same Qwen3.6-35B-A3B INT4 checkpoint. [Start with PR #2979](https://github.com/JustVugg/colibri/pull/2979) · [Integration batch #3064](https://github.com/JustVugg/colibri/pull/3064)
 
 ### Results by GPU
 
-Across all 16 workloads per GPU (fixed prompts from 64 to 16,384 tokens and an eight-turn chat), prefill improved in **128/128** cases (+21.5% to +210.4%) and steady generation in **127/128**. For the 16,384-token prompt, the table shows median tokens/s on `dev` → the full stack. The percentage is the median change across three paired runs after warm-up. Steady generation starts at the second decode step. Open a GPU’s report for the other 15 workloads.
+For a 16,384-token prompt, the table shows median throughput on `dev` → the full CUDA stack. Each percentage is the median of three paired changes after warm-up. Steady generation starts at the second decode step.
 
 | GPU | Prefill (tok/s) | Steady generation (tok/s) | Measurements |
 |---|---:|---:|---|
@@ -27,7 +23,15 @@ Across all 16 workloads per GPU (fixed prompts from 64 to 16,384 tokens and an e
 | RTX PRO 6000 Blackwell Server Edition | 11,747.75 → 20,490.22 (+74.38%) | 230.20 → 240.86 (+3.48%) | [16 workloads](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-19-rtx-pro-6000-server-2026-11-22/base.md) · [FP32 and PPL](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-19-rtx-pro-6000-server-2026-11-22/correctness.txt) |
 | L40S | 5,551.93 → 10,889.04 (+96.94%) | 135.39 → 148.29 (+9.51%) | [16 workloads](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-20-l40s-2026-11-22/base.md) · [FP32 and PPL](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-20-l40s-2026-11-22/correctness.txt) |
 
-The size of the gain depends on the workload. For example, on RTX PRO 4000 the full eighth chat turn finished faster even though steady generation on that turn dipped by 0.37%. [RTX PRO 4000 measurements](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/base.md)
+Across fixed prompts from 64 to 16,384 tokens and an eight-turn chat, prefill improved in **128 of 128** GPU–workload comparisons (+21.5% to +210.4%) and steady generation in **127 of 128**. On the RTX PRO 4000, steady generation dipped by 0.37% on the eighth chat turn, but the full turn still finished faster. [RTX PRO 4000 measurements](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/base.md)
+
+### How correctness was checked
+
+I compared the optimized build (`da49a161`) with `dev` (`05245ef4`) on the same physical GPU for each pair, before the PRs were packaged for integration. In **all 384 paired comparisons** (eight GPUs × 16 workloads × three runs), the full FP32 logits matched bit for bit after the prompt and at every generation step. A cold 64-token run on the RTX PRO 4000 alone checked 129 vectors of 248,320 logits each (32,033,280 FP32 values). [RTX PRO 4000 logit comparison](https://github.com/JustVugg/colibri/blob/e8b1c9b3f28c4724603e64a3a692f2e9d1141344/docs/experiments/qwen36-cuda-16-rtx-pro-4000-2026-11-22/correctness.txt)
+
+The separate perplexity check compared **128 continuation vectors per GPU, 1,024 across the eight cards**. The “FP32 and PPL” link in each table row gives that card’s vector counts and perplexity result.
+
+The maintainer independently tested the integrated code on an RTX PRO 4000 Blackwell SFF Edition. A 9,870-token prompt took 2.4 seconds, down from 3.3, with the same generated text. [Maintainer’s integration test](https://github.com/JustVugg/colibri/pull/3064)
 
 <a name="the-first-metal-graph"></a>
 
@@ -45,7 +49,7 @@ On a 512-token prompt, Metal read **111 tokens/s** and the CPU read **3.13 token
 - **One GPU transfer per output on the RTX PRO 4000.** Qwen3.6 wrote 248,320 separate scores across the bus at each decode step. Collecting them on the card and copying them together raised generation from **74.7 to 145.1 tokens/s** with the same logits. The extra copy cost 0.6–0.7% on the L4. [PR #2421](https://github.com/JustVugg/colibri/pull/2421) · [Decode runs](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-cuda-lmhead-device-2026-10-27/pro4000-normal.txt#L604-L654)
 - **Sampling a token on the M1.** The chat sampler used to sort all 248,320 probabilities at every draw. Sorting just the candidates brought the draw from **23.6 to 1.1 ms** (42.4 → 906.3 draws/s) on three Qwen3.6 replies at the gateway defaults. Every tested draw at those settings picked the same token as before. [PR #2012](https://github.com/JustVugg/colibri/pull/2012) · [Sampling benchmark](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-serve-sampler-2026-10-08/manifest.json)
 - **An eight-turn agent session on the T4.** Keeping the RAM copies in sync as experts moved on and off the GPU cut a replay with tool calls from **71.6 to 43.1 seconds**. A separate five-turn chat with short follow-up prompts took 37.3 seconds on both builds. [PR #2416](https://github.com/JustVugg/colibri/pull/2416) · [Session timings](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26/sessions.txt#L117-L173)
-- **Container cgroup memory limits on Linux.** `/proc/meminfo` reports the host’s RAM rather than a container’s quota (on a rented RTX PRO 4000 container, `MemAvailable` showed 195.7 GiB against a 120.7 GiB cgroup limit). Bounding the C memory reader by cgroup v2/v1 limits and counting reclaimable `active_file` cache kept engines and the planner from over-allocating or under-planning after `mmap` reads (24.18 vs 14.88 GB reported in a 24.22 GB container, 22.18 GB allocated with zero OOM kills). [C reader #2396](https://github.com/JustVugg/colibri/pull/2396) · [Planner #2397](https://github.com/JustVugg/colibri/pull/2397)
+- **Container memory limits on Linux.** In a container limited to 24.22 GB, colibri’s planner estimated 24.18 GB of available memory, up from 14.88 GB. A test process then allocated and touched 22.18 GB with zero OOM kills. The C memory reader now respects cgroup limits, and the planner counts reclaimable file cache after memory-mapped reads. [C reader #2396](https://github.com/JustVugg/colibri/pull/2396) · [Planner #2397](https://github.com/JustVugg/colibri/pull/2397)
 
 ## CUDA pull requests in order
 
