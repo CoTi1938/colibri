@@ -1,12 +1,12 @@
 # CoTi1938’s inference work in colibri
 
-I contribute to colibri, Vincenzo Fornaro’s C inference engine for mixture-of-experts models. Of my 65 merged PRs, 45 were in `main` by v2.2.0 and 20 went into the CUDA integration batch on `dev`. [All merged PRs](https://github.com/JustVugg/colibri/pulls?q=is%3Apr+author%3ACoTi1938+is%3Amerged) · [v2.2.0 merge](https://github.com/JustVugg/colibri/pull/2965) · [Integrated CUDA source](https://github.com/JustVugg/colibri/tree/e8b1c9b3f28c4724603e64a3a692f2e9d1141344)
+I contribute to colibri, Vincenzo Fornaro’s C inference engine for mixture-of-experts models, by directing AI coding agents under strict hardware benchmarks and bit-exact verification. Of my 65 merged PRs, 45 were in `main` by v2.2.0 and 20 went into the CUDA integration batch on `dev`. [All merged PRs](https://github.com/JustVugg/colibri/pulls?q=is%3Apr+author%3ACoTi1938+is%3Amerged) · [v2.2.0 merge](https://github.com/JustVugg/colibri/pull/2965) · [Integrated CUDA source](https://github.com/JustVugg/colibri/tree/e8b1c9b3f28c4724603e64a3a692f2e9d1141344)
 
 [Eight-GPU measurements](#results-by-gpu) · [20 CUDA PRs and their benchmarks](#cuda-pull-requests-in-order) · [Metal on an 8 GB M1](#qwen36-on-apple-silicon) · [More upstream contributions](#more-work-in-upstream-main)
 
 ## CUDA on eight NVIDIA GPUs
 
-I developed 13 CUDA optimizations on the L4 and added seven GPU profiles to select the execution paths on each additional card. All eight ran the same Qwen3.6-35B-A3B INT4 checkpoint. [Start with PR #2979](https://github.com/JustVugg/colibri/pull/2979) · [Integration batch #3064](https://github.com/JustVugg/colibri/pull/3064)
+This series combines 13 CUDA optimizations developed on the L4 with seven GPU profiles that select the fastest verified execution paths on each additional card. All eight ran the same Qwen3.6-35B-A3B INT4 checkpoint. [Start with PR #2979](https://github.com/JustVugg/colibri/pull/2979) · [Integration batch #3064](https://github.com/JustVugg/colibri/pull/3064)
 
 ### Results by GPU
 
@@ -37,7 +37,7 @@ The maintainer independently tested the integrated code on an RTX PRO 4000 Black
 
 ## Qwen3.6 on Apple Silicon
 
-I built colibri’s Metal inference graph for Qwen3.6 so the forward pass could run on Apple Silicon while the model’s routed experts stayed on disk. A bounded cache brings the experts into memory as the model needs them. That let me run the 35B model on a fanless MacBook Air M1 with 8 GB of unified memory. The graph, its kernels and its expert cache are all in `main`. [Graph PR](https://github.com/JustVugg/colibri/pull/2298) · [Metal implementation guide](https://github.com/JustVugg/colibri/blob/main/docs/qwen36-metal.md)
+This work added colibri’s Metal inference graph for Qwen3.6 so the forward pass could run on Apple Silicon while the model’s routed experts stayed on disk. A bounded cache brings the experts into memory as the model needs them. That let me run the 35B model on a fanless MacBook Air M1 with 8 GB of unified memory. The graph, its kernels and its expert cache are all in `main`. [Graph PR](https://github.com/JustVugg/colibri/pull/2298) · [Metal implementation guide](https://github.com/JustVugg/colibri/blob/main/docs/qwen36-metal.md)
 
 On a 512-token prompt, Metal read **111 tokens/s** and the CPU read **3.13 tokens/s**. The first decode step took **283 ms on Metal** and **1,032 ms on the CPU** (medians of four runs). The CPU and Metal runs produced different free-running outputs. In a separate test, both engines processed the same 1,024 continuation tokens one at a time. Metal ran at **8.79 tokens/s**, the CPU at **1.89**. Their mean negative log-likelihoods were 2.945 and 2.948 respectively. [Four-run timings](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/summary.txt) · [Same-text comparison](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/quality.txt)
 
