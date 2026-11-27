@@ -10,7 +10,7 @@ This series combines 13 CUDA optimizations developed on the L4 with 7 GPU profil
 
 ### Results by GPU
 
-For a 16,384-token prompt, the table shows median throughput on `dev` → the full CUDA stack. Each percentage is the median of three paired runs after warm-up. Steady generation starts at the second decode step.
+For a 16,384-token prompt, the table shows median throughput on `dev` → the full CUDA stack. Each percentage is the median of the three paired run-to-run changes after warm-up, so it can differ slightly from the ratio of the two medians shown. Steady generation starts at the second decode step.
 
 | GPU | Prefill (tok/s) | Steady generation (tok/s) | Measurements |
 |---|---:|---:|---|
@@ -37,7 +37,7 @@ The maintainer independently tested the integrated code on an RTX PRO 4000 Black
 
 This work added colibri’s Metal inference graph for Qwen3.6 so the forward pass could run on Apple Silicon while the model’s routed experts stayed on disk. A bounded cache brings the experts into memory as the model needs them. That let me run the 35B model on a fanless MacBook Air M1 with 8 GB of unified memory. The graph, its kernels, and its expert cache are all in `main`. [Graph PR](https://github.com/JustVugg/colibri/pull/2298) · [Metal implementation guide](https://github.com/JustVugg/colibri/blob/main/docs/qwen36-metal.md)
 
-On a 512-token prompt, Metal read **111 tokens/s** and the CPU read **3.13 tokens/s**. The first decode step took **283 ms on Metal** and **1,032 ms on the CPU** (medians of four runs). The CPU and Metal runs produced different free-running outputs. In a separate test, both engines processed the same 1,024 continuation tokens one at a time. Metal ran at **8.79 tokens/s**, the CPU at **1.89**. Their mean negative log-likelihoods were 2.945 and 2.948 respectively. [Four-run timings](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/summary.txt) · [Same-text comparison](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/quality.txt)
+Metal processed a 512-token prompt at **111 tokens/s**, against **3.13 tokens/s** on the CPU. The first decode step took **283 ms on Metal** and **1,032 ms on the CPU** (medians of four runs). The CPU and Metal runs produced different free-running outputs. In a separate test, both engines processed the same 1,024 continuation tokens one at a time. Metal ran at **8.79 tokens/s**, the CPU at **1.89**. Their mean negative log-likelihoods were 2.945 and 2.948 respectively. [Four-run timings](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/summary.txt) · [Same-text comparison](https://github.com/JustVugg/colibri/blob/e479104ae01bdc40ce81e675299b1d230891b321/docs/experiments/qwen36-metal-graph-2026-10-05/quality.txt)
 
 ## More work in upstream `main`
 
